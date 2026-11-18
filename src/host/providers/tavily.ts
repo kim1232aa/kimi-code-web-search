@@ -25,6 +25,24 @@ const TAVILY_SEARCH_URL = "https://api.tavily.com/search";
 const TAVILY_EXTRACT_URL = "https://api.tavily.com/extract";
 
 /**
+ * Tavily's `country` param takes a lowercase full name from its fixed enum
+ * (https://docs.tavily.com/documentation/api-reference/endpoint/search),
+ * never an ISO 3166-1 alpha-2 code. Unknown codes are omitted rather than
+ * sending a value the API will reject with 400.
+ */
+const TAVILY_COUNTRY_NAMES: Readonly<Record<string, string>> = {
+  US: "united states",
+  CN: "china",
+  JP: "japan",
+  GB: "united kingdom",
+  SG: "singapore",
+  DE: "germany",
+  FR: "france",
+  CA: "canada",
+};
+
+
+/**
  * Build the POST request body for Tavily's /search endpoint.
  * Supports:
  *  - search_depth: "basic" | "advanced" | "fast" | "ultra-fast"
@@ -86,9 +104,10 @@ export function buildTavilySearchBody(
     requestBody.exclude_domains = hints.domains.exclude;
   }
 
-  // 4. Country
-  if (hints?.locale?.country) {
-    requestBody.country = hints.locale.country;
+  // 4. Country: Tavily accepts lowercase full names (general topic only), not ISO codes.
+  if (hints?.locale?.country && requestBody.topic === undefined) {
+    const country = TAVILY_COUNTRY_NAMES[hints.locale.country.toUpperCase()];
+    if (country !== undefined) requestBody.country = country;
   }
 
   return requestBody;

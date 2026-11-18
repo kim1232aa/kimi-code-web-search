@@ -24,7 +24,6 @@ async function main() {
     typeof payload.session_id === "string" && payload.session_id.trim() ? payload.session_id.trim() : "global";
   const inputSession =
     payload.tool_input?.session_id ?? payload.tool_input?.sessionId;
-  const suppliedInput = payload.tool_input;
 
   // If the caller explicitly passed a non-empty session_id, it must match the current session
   if (
@@ -34,7 +33,8 @@ async function main() {
     inputSession.trim() !== "global"
   ) {
     process.stderr.write(`Session mismatch: pass session_id="${sessionId}" for this plugin's retrieval call.`);
-    process.exit(2);
+    process.exitCode = 2;
+    return;
   }
 
   const modeStatePath = path.join(webToolsDir(), "mode-state.json");
@@ -48,27 +48,30 @@ async function main() {
     }
 
     const sessionEntry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : {};
-    const input = payload.tool_input ?? {};
+    const turnRequired = (mode === "required" || (mode === "smart" && sessionEntry.turn?.required === true)) && !sessionEntry.turn?.exempted;
+    const suppliedInput = payload.tool_input;
+    const input = suppliedInput ?? {};
     const rawTurn = Object.hasOwn(input, "turn_id") ? input.turn_id : input.turnId;
     const turnId = positiveInteger(rawTurn, "turn_id");
 
-    if (mode === "required" && suppliedInput !== undefined) {
+    if (turnRequired && suppliedInput !== undefined) {
       if (typeof inputSession !== "string" || inputSession.trim() !== sessionId) {
         throw new Error(`Session mismatch: pass session_id="${sessionId}" for this plugin's retrieval call.`);
       }
-      if (sessionEntry.turn && turnId !== sessionEntry.turn.turn) {
-        throw new Error(`Pass turn_id=${sessionEntry.turn.turn} and session_id="${sessionId}" for the current turn.`);
+      if (turnId === undefined || (sessionEntry.turn && turnId !== sessionEntry.turn.turn)) {
+        throw new Error(`Pass turn_id=${sessionEntry.turn?.turn ?? 1} and session_id="${sessionId}" for the current turn.`);
       }
     } else if (turnId !== undefined && sessionEntry.turn && turnId !== sessionEntry.turn.turn) {
       throw new Error(`Pass turn_id=${sessionEntry.turn.turn} and session_id="${sessionId}" for the current turn.`);
     }
 
-    const pendingTools = Array.isArray(sessionEntry.pendingTools) ? [...sessionEntry.pendingTools] : [];
+    const currentEntry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : sessionEntry;
+    const pendingTools = Array.isArray(currentEntry.pendingTools) ? [...currentEntry.pendingTools] : [];
     pendingTools.push(`${kind}:${payload.tool_call_id || Date.now()}`);
     doc.activeSessionId = sessionId;
     Object.defineProperty(doc.sessions, sessionId, {
       value: {
-        ...sessionEntry,
+        ...currentEntry,
         pendingTools: pendingTools.slice(-20),
         updatedAt: Date.now(),
       },
@@ -80,7 +83,7 @@ async function main() {
 
   if (blocked) {
     process.stderr.write(WEB_DISABLED_DENIAL);
-    process.exit(2);
+    process.exitCode = 2;
   }
 }
 

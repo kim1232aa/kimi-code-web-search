@@ -12,6 +12,11 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import {
@@ -376,4 +381,32 @@ test("Security: isLoopbackUrl recognizes localhost and IPv4/IPv6 loopback", () =
   assert.equal(isLoopbackUrl("http://[::1]:8080/search"), true);
   assert.equal(isLoopbackUrl("https://192.168.1.10/search"), false);
   assert.equal(isLoopbackUrl("https://example.com/search"), false);
+});
+
+test("Security: the no-socket Host fallback is confined to real test runs, not arbitrary argv substrings", (t) => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const routesUrl = pathToFileURL(path.join(root, "src", "host", "routes.ts")).href;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-wt-argv-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const script = `const { configPlaneTrust } = await import(${JSON.stringify(routesUrl)});
+process.stdout.write(String(configPlaneTrust({ headers: { host: "127.0.0.1:3080" } })));`;
+  const run = (name: string) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, script);
+    return spawnSync(process.execPath, ["--experimental-strip-types", file], {
+      encoding: "utf8",
+      env: { ...process.env, NODE_ENV: "production" },
+    });
+  };
+
+  // A clean production argv (no test markers anywhere) must keep the
+  // Host-header fallback closed; a plain substring like "latest" never matched.
+  const production = run("case.mjs");
+  assert.equal(production.status, 0, production.stderr);
+  assert.equal(production.stdout.trim(), "false", "production argv must not unlock the Host fallback");
+
+  // A real test-run file path (.test.mjs suffix) keeps the fallback available.
+  const harness = run("case.test.mjs");
+  assert.equal(harness.status, 0, harness.stderr);
+  assert.equal(harness.stdout.trim(), "host");
 });

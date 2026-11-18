@@ -1,8 +1,8 @@
-﻿/**
+/**
  * dsh-web-tools — web-search mode selector mounted in `conversation.input.left`.
  *
  * One compact trigger plus a popover menu (the composer tool-picker pattern),
- * not three differently-shaped buttons. The mode lives in the HOST (single
+ * not differently-shaped buttons. The mode lives in the HOST (single
  * source of truth, shared with the `/search` command); this control is a thin
  * read/write over `/web-tools/api/search-mode`.
  *
@@ -20,7 +20,7 @@
  * @module
  */
 import { useEffect, useRef, useState } from "react";
-import { GlobeIcon, WifiOffIcon, EarthIcon, ChevronDownIcon, CheckIcon } from "./lucide-icons.tsx";
+import { GlobeIcon, WifiOffIcon, EarthIcon, SparklesIcon, ChevronDownIcon, CheckIcon } from "./lucide-icons.tsx";
 import { api, type SearchMode } from "./api.ts";
 import { searchModeCss, adoptSearchModeStyles } from "./SearchModeButton.css.ts";
 
@@ -28,33 +28,36 @@ import { searchModeCss, adoptSearchModeStyles } from "./SearchModeButton.css.ts"
 interface Props {
   sessionId: string;
   /** Copy for one mode: the row name and the one-line explanation. */
-  labels?: Record<SearchMode, string>;
-  descriptions?: Record<SearchMode, string>;
+  labels?: Partial<Record<SearchMode, string>>;
+  descriptions?: Partial<Record<SearchMode, string>>;
   /** Heading inside the menu. */
   menuLabel?: string;
   /** Shown instead of a mode name when no search provider is usable. */
   unavailableLabel?: string;
 }
 
-/** The three modes in menu order: default, forced, disabled. */
-const MODES: readonly SearchMode[] = ["auto", "required", "off"];
+/** The modes in menu order: agent-led, classified, forced, disabled. */
+const MODES: readonly SearchMode[] = ["auto", "smart", "required", "off"];
 
 /** Revalidation cadence while the page is visible. */
 const REVALIDATE_MS = 1000;
 
 const DEFAULT_LABELS: Record<SearchMode, string> = {
   auto: "智能联网",
+  smart: "Jev 判定",
   required: "始终联网",
   off: "关闭联网",
 };
 
 const DEFAULT_DESCRIPTIONS: Record<SearchMode, string> = {
   auto: "根据问题需要自动决定是否搜索",
+  smart: "每轮由 Jev 分类器判定是否必须先查后答",
   required: "每轮对话至少进行一次联网查询",
   off: "不使用联网搜索和网页读取工具",
 };
 
 function ModeIcon(props: { mode: SearchMode }) {
+  if (props.mode === "smart") return <SparklesIcon size={16} />;
   if (props.mode === "required") return <EarthIcon size={16} />;
   if (props.mode === "off") return <WifiOffIcon size={16} />;
   return <GlobeIcon size={16} />;
@@ -104,7 +107,10 @@ export function SearchModeButton({
         /* keep last known state */
       })
       .finally(() => {
-        if (generation.current === current) inFlight.current = false;
+        // Always release the lock: a generation change mid-flight must not
+        // leave inFlight stuck true, or the next session's refresh never runs.
+        // Stale UI writes are already gated by the generation check in then().
+        inFlight.current = false;
       });
   };
 
@@ -171,14 +177,17 @@ export function SearchModeButton({
       if (generation.current !== currentGeneration) return;
       setMode(previous); // rollback on failure
     } finally {
-      if (generation.current === currentGeneration) {
-        setPending(false);
-        pendingRef.current = false;
-      }
+      // Always release the lock: a generation change mid-flight must not
+      // leave the button permanently disabled. Stale UI writes are already
+      // gated by the generation checks in then/catch.
+      setPending(false);
+      pendingRef.current = false;
     }
   };
 
-  const shownLabel = !available ? unavailableLabel : labels[current];
+  const modeLabel = (value: SearchMode) => labels[value] ?? DEFAULT_LABELS[value];
+  const modeDescription = (value: SearchMode) => descriptions[value] ?? DEFAULT_DESCRIPTIONS[value];
+  const shownLabel = !available ? unavailableLabel : modeLabel(current);
 
   return (
     <div className={searchModeCss.wrap} ref={wrapRef}>
@@ -230,8 +239,8 @@ export function SearchModeButton({
                   <ModeIcon mode={candidate} />
                 </span>
                 <span className={searchModeCss.itemText}>
-                  <span className={searchModeCss.itemLabel}>{labels[candidate]}</span>
-                  <span className={searchModeCss.itemDescription}>{descriptions[candidate]}</span>
+                  <span className={searchModeCss.itemLabel}>{modeLabel(candidate)}</span>
+                  <span className={searchModeCss.itemDescription}>{modeDescription(candidate)}</span>
                 </span>
                 <span className={searchModeCss.itemCheck} aria-hidden>
                   {selected ? <CheckIcon size={16} /> : null}

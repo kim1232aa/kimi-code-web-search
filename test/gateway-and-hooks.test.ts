@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { startGatewayServer } from "../src/host/gateway-server.ts";
+import { LocalStorage } from "../src/host/local-storage.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -158,7 +159,7 @@ test("Kimi Code Hooks enforce off-mode gate and required-mode stop turn steer", 
       },
     );
     assert.equal(stopBeforeResearch.status, 2, "Stop hook must exit 2 when required research has not run");
-    assert.match(stopBeforeResearch.stderr, /Call web_search or web_fetch before finalizing/);
+    assert.match(stopBeforeResearch.stderr, /Call web_search before finalizing/);
 
     // Second Stop without research -> does not infinite-loop (correctionCount === 1)
     const stopSecondTime = spawnSync(
@@ -250,4 +251,24 @@ test("Stdio MCP Server responds to initialize and tools/list", async () => {
   } finally {
     child.kill();
   }
+});
+
+test("corrupt config and credentials files are backed up, then degrade safely", (t) => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-wt-corrupt-"));
+  t.after(() => fs.rmSync(tmpHome, { recursive: true, force: true }));
+  const dir = path.join(tmpHome, "web-tools");
+  const storage = new LocalStorage(dir);
+  storage.ensureDir();
+  fs.writeFileSync(path.join(dir, "config.json"), "{broken");
+  fs.writeFileSync(path.join(dir, "credentials.json"), "[1,2]");
+
+  assert.equal(typeof storage.readConfig(), "object", "a corrupt config must degrade to defaults, not throw");
+  assert.equal(storage.resolveCredential("WEB_TOOLS_UNLIKELY_TEST_REF"), undefined, "a corrupt credentials store must degrade to empty");
+
+  const backedUp = fs.readdirSync(dir).filter((f) => f.includes(".corrupt-"));
+  const configBackup = backedUp.find((f) => f.startsWith("config.json.corrupt-"));
+  const credentialsBackup = backedUp.find((f) => f.startsWith("credentials.json.corrupt-"));
+  assert.ok(configBackup, "the original corrupt config bytes must be preserved aside");
+  assert.ok(credentialsBackup, "the original corrupt credentials bytes must be preserved aside");
+  assert.equal(fs.readFileSync(path.join(dir, configBackup!), "utf8"), "{broken");
 });

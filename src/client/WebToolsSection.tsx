@@ -13,7 +13,7 @@
  * keeps its existing comma-joined credential string contract.
  * @module
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   Button,
   Input,
@@ -37,6 +37,10 @@ import {
   type SearchRoutingPolicy,
   type VersionCheckView,
   type PlatformStatusResponse,
+  type SmartClassifierProvider,
+  type SmartSearchSettings,
+  type SmartSearchTestView,
+  type PiImportView,
 } from "./api.ts";
 import { arePlatformStatusesEqual, getPlatformPollIntervalMs } from "./platform-polling.ts";
 import { applyRoutingResult, createReadSequencer, routingFields } from "./routing-state.ts";
@@ -428,6 +432,472 @@ function TestSearchBlock(props: { t: TFunc; config: ConfigView; onError: (msg: s
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function SmartSearchSettingsBlock(props: {
+  t: TFunc;
+  config: ConfigView;
+  onChanged: () => Promise<void>;
+}) {
+  const { t, config, onChanged } = props;
+  const settings = config.smartSearch;
+  const [provider, setProvider] = useState<SmartClassifierProvider>(settings?.provider ?? "typesafe");
+  const [model, setModel] = useState(settings?.model ?? "jev-latest");
+  const [baseUrl, setBaseUrl] = useState(settings?.baseUrl ?? "");
+  const [threshold, setThreshold] = useState(String(settings?.threshold ?? 0.5));
+  const [timeoutMs, setTimeoutMs] = useState(String(settings?.timeoutMs ?? 1500));
+  const [keyDraft, setKeyDraft] = useState("");
+  const [prompt, setPrompt] = useState("");
+  const [sessionId, setSessionId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [result, setResult] = useState<SmartSearchTestView | null>(null);
+  const busyRef = useRef(false);
+  const testingRef = useRef(false);
+  const fieldId = useId();
+  const thresholdId = `${fieldId}-threshold`;
+  const thresholdHintId = `${thresholdId}-hint`;
+  const timeoutId = `${fieldId}-timeout`;
+  const timeoutHintId = `${timeoutId}-hint`;
+
+  useEffect(() => {
+    setProvider(settings?.provider ?? "typesafe");
+    setModel(settings?.model ?? "jev-latest");
+    setBaseUrl(settings?.baseUrl ?? "");
+    setThreshold(String(settings?.threshold ?? 0.5));
+    setTimeoutMs(String(settings?.timeoutMs ?? 1500));
+  }, [settings?.provider, settings?.model, settings?.baseUrl, settings?.threshold, settings?.timeoutMs]);
+
+  const effective: SmartSearchSettings = {
+    enabled: settings?.enabled ?? true,
+    provider: settings?.provider ?? "typesafe",
+    model: settings?.model ?? "jev-latest",
+    baseUrl: settings?.baseUrl ?? "",
+    threshold: settings?.threshold ?? 0.5,
+    timeoutMs: settings?.timeoutMs ?? 1500,
+    failOpen: settings?.failOpen ?? true,
+    enableTranscriptContext: settings?.enableTranscriptContext ?? true,
+  };
+  const credentialProvider = provider === "typesafe" ? "smart-typesafe" : provider === "openrouter" ? "smart-openrouter" : "smart-classifier";
+  const providerChanged = provider !== effective.provider;
+  const locked = busy || testing;
+  const dirty = providerChanged || model !== effective.model || baseUrl !== effective.baseUrl || threshold !== String(effective.threshold) || timeoutMs !== String(effective.timeoutMs);
+
+  const persist = async (patch: Record<string, unknown>) => {
+    if (busyRef.current || testingRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setError("");
+    setSaved(false);
+    try {
+      await api.configSave(patch);
+      await onChanged();
+      setResult(null);
+      setSaved(true);
+    } catch {
+      setError(t("prefsSaveFailed"));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  };
+
+  const draftSettings = (): SmartSearchSettings | null => {
+    const value = baseUrl.trim();
+    if (value) {
+      try {
+        const url = new URL(value);
+        if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error();
+      } catch {
+        setError(t("smartSearchBaseUrlInvalid"));
+        return null;
+      }
+    }
+    const nextThreshold = Number(threshold);
+    const nextTimeout = Number(timeoutMs);
+    if (!model.trim() || !threshold.trim() || !timeoutMs.trim() || !Number.isFinite(nextThreshold) || nextThreshold < 0.1 || nextThreshold > 0.99 || !Number.isInteger(nextTimeout) || nextTimeout < 300 || nextTimeout > 10000) {
+      setError(t("smartSearchInvalidSettings"));
+      return null;
+    }
+    return { ...effective, provider, model: model.trim(), baseUrl: value, threshold: nextThreshold, timeoutMs: nextTimeout };
+  };
+
+  const saveSettings = () => {
+    const next = draftSettings();
+    if (next) void persist({ smartSearch: next });
+  };
+
+  const saveKey = async (clear: boolean) => {
+    if (busyRef.current || testingRef.current || providerChanged || (!clear && !keyDraft.trim())) return;
+    busyRef.current = true;
+    setBusy(true);
+    setError("");
+    setSaved(false);
+    try {
+      await api.credentialsSet(credentialProvider, clear ? "" : keyDraft.trim());
+      setKeyDraft("");
+      setResult(null);
+      await onChanged();
+      setSaved(true);
+    } catch {
+      setError(t("smartSearchKeySaveFailed"));
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  };
+
+  const runTest = async () => {
+    if (testingRef.current || busyRef.current || !prompt.trim()) return;
+    const next = draftSettings();
+    if (!next) return;
+    testingRef.current = true;
+    setTesting(true);
+    setError("");
+    setSaved(false);
+    setResult(null);
+    try {
+      setResult(await api.smartClassifierTest({
+        prompt: prompt.trim(),
+        sessionId: sessionId.trim() || undefined,
+        provider: next.provider,
+        model: next.model,
+        baseUrl: next.baseUrl,
+        timeoutMs: next.timeoutMs,
+        threshold: next.threshold,
+      }));
+    } catch {
+      setError(t("smartSearchTestFailed"));
+    } finally {
+      testingRef.current = false;
+      setTesting(false);
+    }
+  };
+
+  const fieldStyle = { display: "flex", flexDirection: "column", gap: 6, minWidth: 0, fontSize: 13, color: text.primary } as const;
+  const nativeInputStyle = { width: "100%", minHeight: 34, boxSizing: "border-box", padding: "6px 10px", borderRadius: 8, border: `1px solid ${surface.border}`, background: surface.layer2, color: text.primary, font: "inherit" } as const;
+  const probability = (value: number | undefined) => value !== undefined && Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : "—";
+  const configured = config.smartSearchConfigured === true;
+
+  return (
+    <section className="wt-smart-settings">
+      <style>{`
+        .wt-smart-settings input:focus-visible,
+        .wt-smart-settings select:focus-visible,
+        .wt-smart-settings button:focus-visible {
+          outline: 2px solid var(--dsw-alias-state-business-primary);
+          outline-offset: 2px;
+        }
+      `}</style>
+      <SettingsGroup title={<h3 style={{ margin: 0, font: "inherit" }}>{t("smartSearchTitle")}</h3>} dividers="full">
+        <SettingsRow
+          title={t("smartSearchEnabled")}
+          subtitle={t("smartSearchEnabledHint")}
+          trailing={<Switch checked={effective.enabled} disabled={locked} label={t("smartSearchEnabled")} onChange={(enabled) => void persist({ smartSearch: { ...effective, enabled } })} />}
+        />
+        <div style={{ display: "flex", flexDirection: "column", gap: 14, padding: "14px" }}>
+          <label style={fieldStyle}>
+            <span>{t("smartSearchProvider")}</span>
+            <select
+              name="smart-provider"
+              value={provider}
+              disabled={locked}
+              onChange={(event) => {
+                const next = event.target.value;
+                if (next !== "typesafe" && next !== "openrouter" && next !== "openai-compatible") return;
+                setProvider(next);
+                if (next === effective.provider) {
+                  setModel(effective.model);
+                  setBaseUrl(effective.baseUrl ?? "");
+                } else {
+                  setModel(next === "typesafe" ? "jev-latest" : next === "openrouter" ? "typesafe/jev-1.14" : "");
+                  setBaseUrl("");
+                }
+                setKeyDraft("");
+                setResult(null);
+                setSaved(false);
+              }}
+              style={nativeInputStyle}
+            >
+              <option value="typesafe">{t("smartSearchProviderTypesafe")}</option>
+              <option value="openrouter">{t("smartSearchProviderOpenRouter")}</option>
+              <option value="openai-compatible">{t("smartSearchProviderCompatible")}</option>
+            </select>
+          </label>
+          <label style={fieldStyle}>
+            <span>{t("smartSearchModel")}</span>
+            <Input value={model} disabled={locked} placeholder={t("smartSearchModelPlaceholder")} onChange={(event) => { setModel(event.target.value); setSaved(false); }} />
+          </label>
+          <label style={fieldStyle}>
+            <span>{t("smartSearchBaseUrl")}</span>
+            <span style={{ fontSize: 12, color: text.tertiary, lineHeight: 1.5 }}>{t("smartSearchBaseUrlHint")}</span>
+            <Input value={baseUrl} disabled={locked} type="url" placeholder={t("baseUrlPlaceholder")} onChange={(event) => { setBaseUrl(event.target.value); setSaved(false); }} />
+          </label>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
+            <div style={{ ...fieldStyle, flex: "1 1 180px" }}>
+              <label htmlFor={thresholdId}>{t("smartSearchThreshold")}</label>
+              <span id={thresholdHintId} style={{ fontSize: 12, color: text.tertiary }}>{t("smartSearchThresholdHint")}</span>
+              <input id={thresholdId} name="smart-threshold" type="number" min={0.1} max={0.99} step={0.01} value={threshold} disabled={locked} aria-describedby={thresholdHintId} onChange={(event) => { setThreshold(event.target.value); setSaved(false); }} style={nativeInputStyle} />
+            </div>
+            <div style={{ ...fieldStyle, flex: "1 1 180px" }}>
+              <label htmlFor={timeoutId}>{t("smartSearchTimeout")}</label>
+              <span id={timeoutHintId} style={{ fontSize: 12, color: text.tertiary }}>{t("smartSearchTimeoutHint")}</span>
+              <input id={timeoutId} name="smart-timeout" type="number" min={300} max={10000} step={1} value={timeoutMs} disabled={locked} aria-describedby={timeoutHintId} onChange={(event) => { setTimeoutMs(event.target.value); setSaved(false); }} style={nativeInputStyle} />
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+            <Button size="sm" variant="outline" disabled={locked || !dirty} onClick={saveSettings}>{busy ? t("saving") : t("smartSearchSaveSettings")}</Button>
+            {dirty && <span style={{ fontSize: 12, color: text.tertiary }}>{t("unsavedBadge")}</span>}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, paddingTop: 12, borderTop: `1px solid ${surface.border}` }}>
+            <label style={fieldStyle}>
+              <span>{t("smartSearchKey")}</span>
+              <span style={{ fontSize: 12, color: text.tertiary, lineHeight: 1.5 }}>{providerChanged ? t("smartSearchSaveProviderFirst") : t("smartSearchKeyHint")}</span>
+              <Input type="password" value={keyDraft} disabled={locked || providerChanged} placeholder={t("smartSearchKeyPlaceholder")} onChange={(event) => { setKeyDraft(event.target.value); setSaved(false); }} />
+            </label>
+            <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+              <Button size="sm" variant="outline" disabled={locked || providerChanged || !keyDraft.trim()} onClick={() => void saveKey(false)}>{t("smartSearchSaveKey")}</Button>
+              <Button size="sm" variant="ghost" disabled={locked || providerChanged || !configured} onClick={() => void saveKey(true)}>{t("smartSearchClearKey")}</Button>
+              {!providerChanged && (
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, color: text.secondary }}>
+                  <StateDot state={configured ? "done" : "idle"} size={6} />
+                  {configured ? t("connectionConfigured") : t("notConfigured")}
+                  {configured && config.smartSearchKeyHint && <code>{config.smartSearchKeyHint}</code>}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+        <SettingsRow
+          title={t("smartSearchTranscriptContext")}
+          subtitle={t("smartSearchTranscriptContextHint")}
+          trailing={<Switch checked={effective.enableTranscriptContext} disabled={locked} label={t("smartSearchTranscriptContext")} onChange={(enableTranscriptContext) => void persist({ smartSearch: { ...effective, enableTranscriptContext } })} />}
+        />
+        <SettingsRow
+          title={t("smartSearchExemptNoProvider")}
+          subtitle={t("smartSearchExemptNoProviderHint")}
+          trailing={<Switch checked={config.exemptWhenNoProvider ?? true} disabled={locked} label={t("smartSearchExemptNoProvider")} onChange={(exemptWhenNoProvider) => void persist({ exemptWhenNoProvider })} />}
+        />
+        <SettingsRow
+          title={t("smartSearchExternalTools")}
+          subtitle={t("smartSearchExternalToolsHint")}
+          trailing={<Switch checked={config.recognizeExternalWebTools ?? true} disabled={locked} label={t("smartSearchExternalTools")} onChange={(recognizeExternalWebTools) => void persist({ recognizeExternalWebTools })} />}
+        />
+        <SettingsRow
+          title={t("requiredEvidenceSearchOnly")}
+          subtitle={t("requiredEvidenceSearchOnlyHint")}
+          trailing={<Switch checked={(config.requiredEvidence ?? "search") === "search"} disabled={locked} label={t("requiredEvidenceSearchOnly")} onChange={(searchOnly) => void persist({ requiredEvidence: searchOnly ? "search" : "search-or-fetch" })} />}
+        />
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: "14px" }}>
+          <h4 style={{ margin: 0, fontSize: 13, fontWeight: 500, color: text.primary }}>{t("smartSearchTestTitle")}</h4>
+          <p style={{ margin: 0, fontSize: 12, color: text.tertiary, lineHeight: 1.5 }}>{t("smartSearchTestHint")}</p>
+          <label style={fieldStyle}>
+            <span>{t("smartSearchTestPrompt")}</span>
+            <Input value={prompt} disabled={locked} placeholder={t("smartSearchTestPlaceholder")} onChange={(event) => { setPrompt(event.target.value); setResult(null); }} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); void runTest(); } }} />
+          </label>
+          <label style={fieldStyle}>
+            <span>{t("smartSearchTestSession")}</span>
+            <Input value={sessionId} disabled={locked} placeholder={t("smartSearchTestSessionPlaceholder")} onChange={(event) => { setSessionId(event.target.value); setResult(null); }} />
+          </label>
+          <div>
+            <Button size="sm" variant="primary" disabled={locked || !prompt.trim()} onClick={() => void runTest()}>{testing ? t("smartSearchTesting") : t("smartSearchTestRun")}</Button>
+          </div>
+          <div role="status" aria-atomic="true" style={{ display: "flex", flexDirection: "column", gap: 8, fontSize: 13, overflowWrap: "anywhere" }}>
+            {error && <span style={{ color: stateColor.danger }}>{error}</span>}
+            {saved && !error && <span style={{ color: text.secondary }}>{t("saved")}</span>}
+            {result && (
+              <>
+                <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8, color: text.primary }}>
+                  <StateDot state={!result.ok || result.fallbackReason ? "warning" : "done"} size={8} />
+                  <strong>{t("smartSearchVerdict")}: {t(!result.ok || result.fallbackReason ? "smartSearchVerdictFailOpen" : result.escalated ? "smartSearchVerdictRequired" : "smartSearchVerdictOptional")}</strong>
+                  <span style={{ color: text.tertiary, fontSize: 12 }}>{t("smartSearchLatency", { ms: Math.round(result.latencyMs) })}</span>
+                </div>
+                <div style={{ color: text.tertiary, fontSize: 12 }}>{result.provider} · {result.model}</div>
+                {(result.error || result.fallbackReason) && (
+                  <div style={{ color: stateColor.warning, fontSize: 12 }}>{result.error || result.fallbackReason}</div>
+                )}
+                <dl style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: "6px 12px", margin: 0, color: text.secondary, fontSize: 12 }}>
+                  <dt>{t("smartSearchLookupProbability")} <code>(needs_external_lookup)</code></dt>
+                  <dd style={{ margin: 0 }}>{probability(result.probabilities?.needs_external_lookup)}</dd>
+                  <dt>{t("smartSearchClaimProbability")} <code>(involves_tool_or_config_claim)</code></dt>
+                  <dd style={{ margin: 0 }}>{probability(result.probabilities?.involves_tool_or_config_claim)}</dd>
+                </dl>
+              </>
+            )}
+          </div>
+        </div>
+      </SettingsGroup>
+    </section>
+  );
+}
+
+function PiImportSection(props: { t: TFunc; onChanged: () => Promise<void> }) {
+  const { t, onChanged } = props;
+  const [importing, setImporting] = useState(false);
+  const [summary, setSummary] = useState<PiImportView | null>(null);
+  const [error, setError] = useState("");
+  const runningRef = useRef(false);
+
+  const runImport = async () => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    setImporting(true);
+    setError("");
+    setSummary(null);
+    try {
+      const res = await api.importPi();
+      setSummary(res);
+      await onChanged();
+    } catch (err) {
+      setError(err instanceof Error && err.message ? err.message : t("piImportFailed"));
+    } finally {
+      runningRef.current = false;
+      setImporting(false);
+    }
+  };
+
+  const hasImported = Boolean(
+    summary &&
+      (summary.importedSearchProviders.length > 0 ||
+        summary.importedSmartProviders.length > 0 ||
+        summary.importedBaseUrls.length > 0 ||
+        summary.importedMode ||
+        summary.importedRouting ||
+        (summary.importedFetchOrder?.length ?? 0) > 0),
+  );
+
+  return (
+    <section>
+      <SettingsGroup>
+        <SettingsRow
+          title={t("piImportTitle")}
+          subtitle={t("piImportHint")}
+          trailing={
+            <Button size="sm" variant="outline" disabled={importing} onClick={() => void runImport()}>
+              {importing ? t("piImporting") : t("piImportButton")}
+            </Button>
+          }
+          isLast={!summary && !error}
+        />
+        {(summary || error) && (
+          <div role="status" aria-atomic="true" style={{ padding: "10px 14px", fontSize: 12, color: error ? stateColor.danger : text.secondary }}>
+            {error
+              ? error
+              : !hasImported && summary?.skipped.length === 0
+                ? t("piImportEmpty")
+                : (
+                  <>
+                    <div>
+                      {t("piImportDone", {
+                        search: summary?.importedSearchProviders.join(", ") || "—",
+                        smart: summary?.importedSmartProviders.join(", ") || "—",
+                        mode: summary?.importedMode ?? "—",
+                        skipped: summary?.skipped.length ?? 0,
+                      })}
+                    </div>
+                    {(summary?.importedFetchOrder?.length ?? 0) > 0 && (
+                      <div style={{ marginTop: 4, color: text.tertiary }}>
+                        {t("piImportFetchOrder", { fetchOrder: summary!.importedFetchOrder!.join(" → ") })}
+                      </div>
+                    )}
+                  </>
+                )}
+          </div>
+        )}
+      </SettingsGroup>
+    </section>
+  );
+}
+
+const SUPPORTED_FETCH_INPUT_SET = new Set(["http", "builtin-http", "exa", "tavily", "firecrawl", "parallel", "jina", "you"]);
+
+function FetchOrderBlock(props: { t: TFunc; config: ConfigView; onSaved: () => Promise<void> }) {
+  const { t, config, onSaved } = props;
+  const [draft, setDraft] = useState((config.fetchOrder ?? []).join(", "));
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+  const [savedOk, setSavedOk] = useState(false);
+
+  useEffect(() => {
+    setDraft((config.fetchOrder ?? []).join(", "));
+  }, [config.fetchOrder?.join(",")]);
+
+  const applyOrder = async (items: string[]) => {
+    setSaving(true);
+    setErr("");
+    setSavedOk(false);
+    try {
+      await api.configSave({ fetchOrder: items });
+      await onSaved();
+      setSavedOk(true);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const commitDraft = () => {
+    const tokens = draft
+      .split(/[,\s→>]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    const invalid = tokens.find((tok) => !SUPPORTED_FETCH_INPUT_SET.has(tok));
+    if (invalid) {
+      setErr(t("fetchOrderInvalid"));
+      setSavedOk(false);
+      return;
+    }
+    const deduped: string[] = [];
+    for (const tok of tokens) {
+      const normalized = tok === "builtin-http" ? "http" : tok;
+      if (!deduped.includes(normalized)) deduped.push(normalized);
+    }
+    void applyOrder(deduped);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8, paddingTop: 10, borderTop: `1px solid ${surface.border}` }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+        <span style={{ fontSize: 13, fontWeight: 500, color: text.primary }}>{t("fetchOrderTitle")}</span>
+        <span style={{ fontSize: 12, color: text.tertiary, lineHeight: 1.5 }}>{t("fetchOrderHint")}</span>
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <div style={{ flex: "1 1 220px", minWidth: 0 }}>
+          <Input
+            value={draft}
+            disabled={saving}
+            placeholder={t("fetchOrderPlaceholder")}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              setErr("");
+              setSavedOk(false);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitDraft();
+            }}
+          />
+        </div>
+        <Button size="sm" variant="outline" disabled={saving} onClick={commitDraft}>
+          {saving ? t("saving") : t("fetchOrderSave")}
+        </Button>
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <Button size="sm" variant="ghost" disabled={saving} onClick={() => void applyOrder(["exa", "http", "firecrawl", "jina"])}>
+          {t("fetchOrderPreset")}
+        </Button>
+        {(config.fetchOrder?.length ?? 0) > 0 && (
+          <Button size="sm" variant="ghost" disabled={saving} onClick={() => void applyOrder([])}>
+            {t("fetchOrderReset")}
+          </Button>
+        )}
+        {err && <span style={{ fontSize: 12, color: stateColor.danger }}>{err}</span>}
+        {savedOk && !err && <span style={{ fontSize: 12, color: text.secondary }}>{t("saved")}</span>}
+      </div>
     </div>
   );
 }
@@ -1125,6 +1595,9 @@ export function WebToolsSection(props: SectionProps) {
         </SettingsGroup>
       </section>
 
+      <SmartSearchSettingsBlock t={t} config={config} onChanged={load} />
+      <PiImportSection t={t} onChanged={load} />
+
       {/* 诊断与高级设置 */}
       <section style={{ marginTop: 4 }}>
         <SettingsGroup>
@@ -1177,6 +1650,9 @@ export function WebToolsSection(props: SectionProps) {
                 <span style={{ color: text.secondary, fontSize: 13 }}>{t("secondsUnit")}</span>
               </div>
             </div>
+
+            {/* Fetch chain order */}
+            <FetchOrderBlock t={t} config={config} onSaved={load} />
 
             {/* Test search */}
             <div style={{ display: "flex", flexDirection: "column", gap: 8, paddingTop: 10, borderTop: `1px solid ${surface.border}` }}>

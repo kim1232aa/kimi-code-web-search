@@ -6,6 +6,13 @@ import { SpecializedSourceRegistry } from "../src/host/sources/registry.ts";
 import type { SpecializedSource, SourceStatus, SourceSearchRequest, SourceSearchOutcome, SourceFetchOutcome } from "../src/host/sources/types.ts";
 import type { WebSearchProvider, WebFetchProvider } from "../src/host/types.ts";
 
+test("extractSearchHints does not treat the word 'usage' as the USA country hint", () => {
+  const hints = extractSearchHints("Tavily API credits usage remaining documentation");
+  assert.equal(hints.locale?.country, undefined, "substring 'usa' inside 'usage' must not set a country");
+  const usa = extractSearchHints("USA market outlook");
+  assert.equal(usa.locale?.country, "US", "a standalone USA token still sets the country");
+});
+
 test("P7.0 extractSearchHints: identifies Xiaohongshu queries and cleans query", () => {
   const hints1 = extractSearchHints("小红书最近 Gemini 3.7 的用户评价");
   assert.equal(hints1.platform, "xiaohongshu");

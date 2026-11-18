@@ -4,7 +4,7 @@
  * Mounts:
  *  - Password login gate when accessed over reverse-proxied public domains.
  *  - Topbar header with brand identity, Session/Global target selector,
- *    the exact `SearchModeButton` (智能联网 / 始终联网 / 关闭联网),
+ *    the exact `SearchModeButton` (智能联网 / Jev 判定 / 始终联网 / 关闭联网),
  *    language switch, and Light/Dark theme toggle.
  *  - Main body hosting the full `WebToolsSection` (provider cards, API keys,
  *    drag-and-drop routing order, Xiaohongshu / X browser login, custom sources).
@@ -436,11 +436,13 @@ export function StandaloneApp() {
             menuLabel={t("searchModeMenuLabel")}
             labels={{
               auto: t("searchModeAuto"),
+              smart: t("searchModeSmart"),
               required: t("searchModeRequired"),
               off: t("searchModeOff"),
             }}
             descriptions={{
               auto: t("searchModeAutoDesc"),
+              smart: t("searchModeSmartDesc"),
               required: t("searchModeRequiredDesc"),
               off: t("searchModeOffDesc"),
             }}

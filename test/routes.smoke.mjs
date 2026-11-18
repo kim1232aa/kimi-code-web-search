@@ -7,6 +7,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import { registerRoutes, API_PREFIX } from "../src/host/routes.ts";
 import { SpecializedSourceRegistry } from "../src/host/sources/registry.ts";
 
@@ -335,4 +336,178 @@ test("search-mode/set toggles and persists, rejecting invalid modes", async () =
   const invalid = await call("search-mode/set", { sessionId: "sess-2", mode: "banana" });
   assert.equal(invalid.status, 500);
   assert.equal(invalid.body.ok, false);
+});
+
+
+test("search-mode/set accepts smart and returns it on read-back", async () => {
+  const result = await call("search-mode/set", { sessionId: "sess-smart", mode: "smart" });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.ok, true);
+  assert.equal(result.body.value.mode, "smart");
+  const again = await call("search-mode/get", { sessionId: "sess-smart" });
+  assert.equal(again.body.value.mode, "smart");
+});
+
+test("config/get and config/save preserve smartSearch without exposing classifier secrets", async () => {
+  const original = {
+    enabled: true,
+    provider: "typesafe",
+    model: "test-classifier",
+    baseUrl: "https://example.org/v1",
+    timeoutMs: 1500,
+    threshold: 0.5,
+    failOpen: true,
+    enableTranscriptContext: true,
+  };
+  let config = { ...deps.readConfig(), smartSearch: original, exemptWhenNoProvider: true, recognizeExternalWebTools: false };
+  const localDeps = {
+    ...deps,
+    readConfig: () => config,
+    writeConfig: async (patch) => { config = { ...config, ...patch }; },
+    readCredential: async (ref) => ref === "WEB_TOOLS_TYPESAFE"
+      ? { configured: true, writable: true, value: "test-classifier-key" }
+      : deps.readCredential(ref),
+  };
+  const { server: localServer, getHandler: localHandler } = mockServer();
+  registerRoutes({ webServer: localServer, webRuntime: { trustedHosts: [] } }, localDeps);
+  const invoke = async (method, payload) => {
+    const { req, res } = fakeReqRes("POST", `${API_PREFIX}/${method}`, payload);
+    await localHandler()(req, res);
+    assert.equal(res.statusCode, 200, res.body);
+    const body = JSON.parse(res.body);
+    assert.equal(body.ok, true);
+    assert.ok(!res.body.includes("test-classifier-key"), "classifier key must not leak");
+    return body.value;
+  };
+  const initial = await invoke("config/get", {});
+  assert.deepEqual(initial.smartSearch, original);
+  assert.equal(initial.smartSearchConfigured, true);
+  assert.equal(initial.exemptWhenNoProvider, true);
+  assert.equal(initial.recognizeExternalWebTools, false);
+  const changed = { ...original, provider: "openai-compatible", model: "test-chat-classifier", threshold: 0.7, enableTranscriptContext: false };
+  const saved = await invoke("config/save", { smartSearch: changed, exemptWhenNoProvider: false, recognizeExternalWebTools: true });
+  assert.equal(saved.saved, true);
+  assert.deepEqual(config.smartSearch, changed);
+  const after = await invoke("config/get", {});
+  assert.deepEqual(after.smartSearch, changed);
+  assert.equal(after.exemptWhenNoProvider, false);
+  assert.equal(after.recognizeExternalWebTools, true);
+});
+
+test("smart-classifier/test returns a structured view from the configured classifier", async (t) => {
+  const requests = [];
+  const classifier = http.createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    requests.push({ url: req.url, body: JSON.parse(raw) });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ answers: {
+      needs_external_lookup: { noul: 0.8 },
+      involves_tool_or_config_claim: { noul: 0.1 },
+    } }));
+  });
+  await new Promise((resolve, reject) => {
+    classifier.once("error", reject);
+    classifier.listen(0, "127.0.0.1", () => {
+      classifier.off("error", reject);
+      resolve();
+    });
+  });
+  t.after(async () => {
+    classifier.closeAllConnections();
+    await new Promise((resolve, reject) => classifier.close((error) => error ? reject(error) : resolve()));
+  });
+  const address = classifier.address();
+  assert.ok(address && typeof address !== "string");
+  const smartSearch = {
+    enabled: true, provider: "typesafe", model: "test-classifier",
+    baseUrl: `http://127.0.0.1:${address.port}/v1`, timeoutMs: 1000,
+    threshold: 0.5, failOpen: true, enableTranscriptContext: false,
+  };
+  const localDeps = {
+    ...deps,
+    readConfig: () => ({ ...deps.readConfig(), smartSearch }),
+    readCredential: async (ref) => ref === "WEB_TOOLS_TYPESAFE"
+      ? { configured: true, writable: true, value: "test-classifier-key" }
+      : deps.readCredential(ref),
+  };
+  const { server: localServer, getHandler: localHandler } = mockServer();
+  registerRoutes({ webServer: localServer, webRuntime: { trustedHosts: [] } }, localDeps);
+  const { req, res } = fakeReqRes("POST", `${API_PREFIX}/smart-classifier/test`, {
+    prompt: "Verify the latest example package release.", sessionId: "classifier-route-test",
+  });
+  await localHandler()(req, res);
+  assert.equal(res.statusCode, 200, res.body);
+  const body = JSON.parse(res.body);
+  assert.equal(body.ok, true);
+  assert.equal(body.value.ok, true);
+  assert.equal(body.value.escalated, true);
+  assert.equal(body.value.provider, "typesafe");
+  assert.equal(body.value.model, "test-classifier");
+  assert.equal(body.value.threshold, 0.5);
+  assert.equal(typeof body.value.latencyMs, "number");
+  assert.deepEqual(body.value.probabilities, { needs_external_lookup: 0.8, involves_tool_or_config_claim: 0.1 });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/v1/systemone");
+  assert.ok(!res.body.includes("test-classifier-key"), "test response must not expose credentials");
+});
+
+for (const [label, baseUrl] of [
+  ["a private IPv4 address", "https://10.0.0.1/v1"],
+  ["non-loopback plaintext HTTP", "http://example.org/v1"],
+]) {
+  test(`smart-classifier/test rejects ${label} with HTTP 400 and makes no outbound call`, async (t) => {
+    const outbound = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (...args) => {
+      outbound.push(args[0]);
+      throw new Error("outbound request must not be attempted for a rejected base URL");
+    };
+    t.after(() => { globalThis.fetch = originalFetch; });
+    const localDeps = {
+      ...deps,
+      readConfig: () => ({ ...deps.readConfig(), smartSearch: { provider: "typesafe", model: "test-classifier" } }),
+      readCredential: async (ref) => ref === "WEB_TOOLS_TYPESAFE"
+        ? { configured: true, writable: true, value: "test-classifier-key" }
+        : deps.readCredential(ref),
+    };
+    const { server: localServer, getHandler: localHandler } = mockServer();
+    registerRoutes({ webServer: localServer, webRuntime: { trustedHosts: [] } }, localDeps);
+    const { req, res } = fakeReqRes("POST", `${API_PREFIX}/smart-classifier/test`, {
+      prompt: "Verify the latest example package release.",
+      provider: "typesafe",
+      model: "test-classifier",
+      baseUrl,
+    });
+    await localHandler()(req, res);
+    assert.equal(res.statusCode, 400, res.body);
+    assert.equal(JSON.parse(res.body).ok, false);
+    assert.deepEqual(outbound, [], "a rejected base URL must never be dialed");
+    assert.ok(!res.body.includes("test-classifier-key"), "rejection must not expose credentials");
+  });
+}
+
+test("config/save validates and persists fetchOrder while rejecting unknown fetch providers", async () => {
+  let config = { ...deps.readConfig() };
+  const localDeps = {
+    ...deps,
+    readConfig: () => config,
+    writeConfig: async (patch) => { config = { ...config, ...patch }; },
+  };
+  const { server: localServer, getHandler: localHandler } = mockServer();
+  registerRoutes({ webServer: localServer, webRuntime: { trustedHosts: [] } }, localDeps);
+
+  const saveOk = fakeReqRes("POST", `${API_PREFIX}/config/save`, { fetchOrder: ["exa", "builtin-http", "firecrawl", "jina"] });
+  await localHandler()(saveOk.req, saveOk.res);
+  assert.equal(saveOk.res.statusCode, 200, saveOk.res.body);
+  assert.deepEqual(config.fetchOrder, ["exa", "http", "firecrawl", "jina"]);
+
+  const getRes = fakeReqRes("POST", `${API_PREFIX}/config/get`, {});
+  await localHandler()(getRes.req, getRes.res);
+  assert.equal(getRes.res.statusCode, 200);
+  assert.deepEqual(JSON.parse(getRes.res.body).value.fetchOrder, ["exa", "http", "firecrawl", "jina"]);
+
+  const badRes = fakeReqRes("POST", `${API_PREFIX}/config/save`, { fetchOrder: ["exa", "not-a-provider"] });
+  await localHandler()(badRes.req, badRes.res);
+  assert.equal(badRes.res.statusCode, 400, badRes.res.body);
 });

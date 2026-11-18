@@ -12,6 +12,9 @@ import type { OutboundAuthorization } from "./custom-provider-types.ts";
 /** Search routing policy — how the host picks which provider to try first. */
 export type SearchRoutingPolicy = "ordered" | "round-robin" | "random";
 
+/** What settles a required turn: a real search only, or a search or URL read. */
+export type RequiredEvidence = "search" | "search-or-fetch";
+
 /** One provider as surfaced to the settings card. */
 export interface ProviderView {
   name: string;
@@ -57,14 +60,68 @@ export interface ProviderView {
   options?: ProviderOptionView;
 }
 
+export type SmartClassifierProvider = "typesafe" | "openrouter" | "openai-compatible";
+
+export interface SmartSearchSettings {
+  enabled: boolean;
+  provider: SmartClassifierProvider;
+  model: string;
+  baseUrl?: string;
+  timeoutMs: number;
+  threshold: number;
+  failOpen: boolean;
+  enableTranscriptContext: boolean;
+}
+
+export interface SmartTurnDecision {
+  escalated: boolean;
+  mode: "required" | "auto";
+  provider?: string;
+  model?: string;
+  probabilities?: { needs_external_lookup?: number; involves_tool_or_config_claim?: number };
+  latencyMs?: number;
+  fallbackReason?: string;
+  at: number;
+}
+
+export interface SmartSearchTestView {
+  ok: boolean;
+  escalated: boolean;
+  provider: string;
+  model: string;
+  latencyMs: number;
+  probabilities?: { needs_external_lookup?: number; involves_tool_or_config_claim?: number };
+  threshold: number;
+  fallbackReason?: string;
+  error?: string;
+}
+
+export interface PiImportView {
+  piDir: string;
+  importedSearchProviders: string[];
+  importedSmartProviders: string[];
+  importedBaseUrls: string[];
+  importedMode?: SearchMode;
+  importedRouting?: { defaultProvider?: string; fallbackOrder?: string[] };
+  importedFetchOrder?: string[];
+  skipped: Array<{ source: string; reason: string }>;
+}
+
 /** Full config snapshot for the card. */
 export interface ConfigView {
   enabled: boolean;
   defaultProvider: string;
   providerAttemptTimeoutMs: number;
   fallbackOrder: string[];
+  fetchOrder?: string[];
   providers: ProviderView[];
   platformEnabled?: Record<string, boolean>;
+  smartSearch?: SmartSearchSettings;
+  smartSearchConfigured?: boolean;
+  smartSearchKeyHint?: string;
+  exemptWhenNoProvider?: boolean;
+  recognizeExternalWebTools?: boolean;
+  requiredEvidence?: RequiredEvidence;
   /**
    * Proxy support state: whether a proxy is configured (env var or Windows
    * system proxy) and whether undici (the proxy engine) is loadable. When a
@@ -132,6 +189,7 @@ export interface CredentialsView {
 /**
  * "Web Search mode" per-session policy:
  *  - `auto`     — the agent decides whether to research.
+ *  - `smart`    — a classifier decides whether the turn requires research.
  *  - `required` — at least one completed web_search/web_fetch before the turn
  *                 may end (success OR failure counts as an attempt).
  *  - `off`      — web tools are withheld from the agent and any call is denied
@@ -139,15 +197,16 @@ export interface CredentialsView {
  *                 instead of merely dropping the requirement.
  * Host-owned state, so it survives browser refresh / relaunch.
  */
-export type SearchMode = "auto" | "required" | "off";
+export type SearchMode = "auto" | "smart" | "required" | "off";
 
 /**
  * The click/keyboard cycle shared by the button and the `/search` command:
- * auto → required → off → auto. Keeping it in one place means the UI cannot
- * disagree with the slash command about what the next state is.
+ * auto → smart → required → off → auto. Keeping it in one place means the UI
+ * cannot disagree with the slash command about what the next state is.
  */
 export function nextSearchMode(mode: SearchMode): SearchMode {
-  if (mode === "auto") return "required";
+  if (mode === "auto") return "smart";
+  if (mode === "smart") return "required";
   if (mode === "required") return "off";
   return "auto";
 }
@@ -157,6 +216,8 @@ export interface SearchModeView {
   mode: SearchMode;
   /** True when there is currently a usable search provider (button gray-out). */
   available: boolean;
+  smartEscalated?: boolean;
+  smartDecision?: SmartTurnDecision;
 }
 
 /** The full quota/describe response. */

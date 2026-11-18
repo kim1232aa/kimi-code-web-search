@@ -52,12 +52,14 @@ export async function call<T>(method: string, payload?: unknown): Promise<T> {
 import type {
   ConfigView,
   CredentialsView,
+  PiImportView,
   QuotaDescribeView,
   SearchMode,
   SearchModeView,
   TestProviderView,
   TestSearchView,
   SearchRoutingPolicy,
+  SmartSearchTestView,
   VersionCheckView,
 } from "../shared/api-types.ts";
 import type {
@@ -72,6 +74,7 @@ import type {
 export type {
   ConfigView,
   CredentialsView,
+  PiImportView,
   ProviderView,
   QuotaDescribeView,
   QuotaView,
@@ -80,6 +83,9 @@ export type {
   TestProviderView,
   TestSearchView,
   SearchRoutingPolicy,
+  SmartClassifierProvider,
+  SmartSearchSettings,
+  SmartSearchTestView,
   VersionCheckView,
 } from "../shared/api-types.ts";
 export type {
@@ -104,6 +110,9 @@ export const api = {
   credentialsRemoveKey: (provider: string, keyId: string) => call<{ configured: boolean; poolSize: number }>("credentials/remove-key", { provider, keyId }),
   testProvider: (provider: string, query?: string) => call<TestProviderView>("test/provider", { provider, query }),
   testSearch: (query: string) => call<TestSearchView>("test/search", { query }),
+  smartClassifierTest: (payload: { prompt: string; sessionId?: string; provider?: string; model?: string; baseUrl?: string; timeoutMs?: number; threshold?: number }) =>
+    call<SmartSearchTestView>("smart-classifier/test", payload),
+  importPi: () => call<PiImportView>("import/pi"),
   quotaDescribe: (force = false) => call<QuotaDescribeView>("quota/describe", { force }),
   versionCheck: () => call<VersionCheckView>("version/check"),
   searchModeGet: (sessionId: string) => call<SearchModeView>("search-mode/get", { sessionId }),

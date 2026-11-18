@@ -12,7 +12,8 @@
   },
   "bin": {
     "kimi-web-tools-gateway": "./bin/gateway-daemon.mjs",
-    "kimi-web-tools-mcp": "./bin/mcp-server.mjs"
+    "kimi-web-tools-mcp": "./bin/mcp-server.mjs",
+    "kimi-web-tools-import-pi": "./bin/import-pi.mjs"
   },
   "scripts": {
     "build:host": "tsc -p tsconfig.build.json",

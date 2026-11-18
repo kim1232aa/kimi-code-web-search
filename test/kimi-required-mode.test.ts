@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { LocalStorage } from "../src/host/local-storage.ts";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const ownSearch = "mcp__plugin-kimi-web-tools_web__web_search";
+const ownSearch = "mcp__plugin-web_s__web_search";
 
 function fixture(t: any) {
   const parent = path.join(root, "temp", "required-mode-tests");
@@ -51,15 +51,22 @@ test("pre-tool does not count a call as completed and rejects a different sessio
   assert.match(wrongSession.stderr, /session-a/);
 });
 
-test("mode changes take effect without stale frozen turn flags", (t) => {
+test("a mid-turn mode switch takes effect next turn; off blocks tools immediately", (t) => {
   const { storage, hook } = fixture(t);
   storage.setSessionMode("global", "auto");
   hook("user-prompt-submit.mjs", { session_id: "session-a" });
   storage.setSessionMode("global", "required");
-  assert.equal(hook("stop-turn-gate.mjs", { session_id: "session-a" }).status, 2);
+  // The requirement is frozen at turn start: a mid-turn switch to required is
+  // not enforced for the current turn.
+  assert.equal(hook("stop-turn-gate.mjs", { session_id: "session-a" }).status, 0);
+  hook("user-prompt-submit.mjs", { session_id: "session-a" });
   storage.setSessionMode("global", "off");
+  // off blocks this plugin's web tools immediately (pre-tool gate)...
   assert.equal(hook("pre-tool-gate.mjs", { session_id: "session-a", tool_name: ownSearch }).status, 2);
+  // ...but does not release the current turn's frozen Stop requirement.
+  assert.equal(hook("stop-turn-gate.mjs", { session_id: "session-a" }).status, 2);
   storage.setSessionMode("global", "auto");
+  hook("user-prompt-submit.mjs", { session_id: "session-a" });
   assert.equal(hook("stop-turn-gate.mjs", { session_id: "session-a" }).status, 0);
 });
 

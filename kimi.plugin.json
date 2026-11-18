@@ -1,5 +1,5 @@
 {
-  "name": "kimi-web-tools",
+  "name": "web",
   "version": "0.4.0",
   "description": "Multi-provider web search, web fetch, social platform research (Xiaohongshu & X), per-session Search Mode policy, and standalone Web UI Dashboard for Kimi Code.",
   "keywords": [
@@ -20,7 +20,7 @@
   "commands": "./commands/",
   "systemPromptPath": "./SYSTEM.md",
   "mcpServers": {
-    "web": {
+    "s": {
       "command": "node",
       "args": ["./bin/mcp-server.mjs"],
       "cwd": "./",
@@ -35,9 +35,42 @@
     },
     {
       "event": "PreToolUse",
-      "matcher": "^(web_search|web_fetch|mcp__(plugin-kimi-web-tools_)?web__(web_search|web_fetch))$",
+      "matcher": "^(web_search|web_fetch|mcp__(?:plugin-web_s|plugin-kimi-web-tools_web|web)__(web_search|web_fetch))$",
       "command": "node ./hooks/pre-tool-gate.mjs",
       "timeout": 10
+    },
+    {
+      "event": "PostToolUse",
+      "matcher": "(web|Web|search|Search|fetch|Fetch|url|URL|Url|scrape|Scrape|crawl|Crawl|extract|Extract|reader|Reader|browse|Browse|page|Page|source|Source|mcp|MCP|tavily|Tavily|firecrawl|Firecrawl|perplexity|Perplexity|jina|Jina|exa|Exa|serp|Serp|duckduckgo|DuckDuckGo|searxng|SearXNG|kagi|Kagi|linkup|Linkup|brave|Brave)",
+      "command": "node ./hooks/post-tool-receipt.mjs",
+      "timeout": 5
+    },
+    {
+      "event": "PostToolUseFailure",
+      "matcher": "(web|Web|search|Search|fetch|Fetch|url|URL|Url|scrape|Scrape|crawl|Crawl|extract|Extract|reader|Reader|browse|Browse|page|Page|source|Source|mcp|MCP|tavily|Tavily|firecrawl|Firecrawl|perplexity|Perplexity|jina|Jina|exa|Exa|serp|Serp|duckduckgo|DuckDuckGo|searxng|SearXNG|kagi|Kagi|linkup|Linkup|brave|Brave)",
+      "command": "node ./hooks/post-tool-receipt.mjs",
+      "timeout": 5
+    },
+    {
+      "event": "SubagentStart",
+      "command": "node ./hooks/subagent-activity.mjs",
+      "timeout": 5
+    },
+    {
+      "event": "SubagentStop",
+      "command": "node ./hooks/subagent-activity.mjs",
+      "timeout": 5
+    },
+    {
+      "event": "TurnStarted",
+      "matcher": "system_trigger",
+      "command": "node ./hooks/turn-start.mjs",
+      "timeout": 5
+    },
+    {
+      "event": "SessionEnd",
+      "command": "node ./hooks/session-end.mjs",
+      "timeout": 5
     },
     {
       "event": "Stop",

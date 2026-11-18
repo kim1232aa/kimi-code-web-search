@@ -15,7 +15,7 @@
  * @module
  */
 import type { WebToolsContext, WebToolsCommandDefinition, WebToolsCommandInvocation, WebToolsCommandResult } from "./context-types.ts";
-import type { SearchMode, SearchModeView } from "../shared/api-types.ts";
+import type { RequiredEvidence, SearchMode, SearchModeView, SmartTurnDecision } from "../shared/api-types.ts";
 import { nextSearchMode } from "../shared/api-types.ts";
 import type { LocalStorage } from "./local-storage.ts";
 
@@ -33,11 +33,20 @@ export interface TurnState {
   webFetchCompleted: boolean;
   webFetchSucceeded: boolean;
   correctionCount: number;
+  smartEscalated?: boolean;
+  exempted?: boolean;
+  externalWebCompleted?: boolean;
+  externalWebSucceeded?: boolean;
+  /** Written by the Kimi hooks; this DSH runtime keeps "search or fetch". */
+  requiredEvidence?: RequiredEvidence;
+  externalSearchCompleted?: boolean;
+  externalSearchSucceeded?: boolean;
+  smartDecision?: SmartTurnDecision;
 }
 
-/** Whether the turn has completed ANY web research (search OR fetch). */
+/** Whether the turn has completed any plugin or recognized external web research. */
 export function webResearchCompleted(state: TurnState): boolean {
-  return state.webSearchCompleted || state.webFetchCompleted;
+  return state.webSearchCompleted || state.webFetchCompleted || Boolean(state.externalWebCompleted);
 }
 
 /** The turn policy lines every required turn needs, regardless of platform routing. */
@@ -168,15 +177,17 @@ export class SearchModeRuntime {
     }
     const existing = this.turns.get(sessionId);
     if (existing?.turn === turn) return existing;
+    const mode = this.getMode(sessionId);
     const state: TurnState = {
       turn,
-      required: this.getMode(sessionId) === "required",
-      disabled: this.isOff(sessionId),
+      required: mode === "required",
+      disabled: mode === "off",
       webSearchCompleted: false,
       webSearchSucceeded: false,
       webFetchCompleted: false,
       webFetchSucceeded: false,
       correctionCount: 0,
+      ...(mode === "smart" ? { smartEscalated: false } : {}),
     };
     this.turns.set(sessionId, state);
     if (this.storage) {
@@ -249,6 +260,7 @@ export interface SearchModeMessages {
   required(): unknown;
   /** Step 1 (once per turn): search is allowed on demand (default mode). */
   auto(): unknown;
+  smart?(): unknown;
   /** Step 1 (once per turn): web search is switched off for this session. */
   disabled(): unknown;
   /** turn-stopping steer (one-shot notice). */
@@ -262,6 +274,9 @@ export const SEARCH_DISABLED_TEXT =
 /** One-shot policy injected on step 1 of an `auto` turn. */
 export const SEARCH_AUTO_TEXT =
   "Web search is available but not required. Call web_search (or web_fetch for a specific URL) when the answer needs current, external, or verifiable information; otherwise answer directly from the context you already have.";
+
+export const SEARCH_SMART_TEXT =
+  "Smart web search is enabled. This turn does not require web research. Answer directly from the available context unless current, external, or verifiable information is needed; use web_search or web_fetch when helpful. Do not claim web verification without a completed web tool call.";
 
 /**
  * Build the injected messages with `createUserMessage` ({ content, source }).
@@ -294,6 +309,7 @@ export function createSearchModeMessages(
   return {
     required: () => snapshot(policyText(), "web-search-mode"),
     auto: () => snapshot(SEARCH_AUTO_TEXT, "web-search-mode"),
+    smart: () => snapshot(SEARCH_SMART_TEXT, "web-search-mode"),
     disabled: () =>
       createUserMessage({
         content: [{ type: "text", text: SEARCH_DISABLED_TEXT }],
@@ -329,6 +345,7 @@ export function searchModeStepMessage(
   if (step !== 1) return undefined;
   if (state.disabled) return messages.disabled();
   if (state.required) return messages.required();
+  if (state.smartEscalated !== undefined || state.smartDecision) return messages.smart?.() ?? messages.auto();
   return messages.auto();
 }
 
@@ -478,8 +495,10 @@ function toggleCommandHandler(
   const text =
     next === "required"
       ? "联网搜索已开启（每轮强制搜索）"
-      : next === "off"
-        ? "联网搜索已关闭（不提供联网工具，Agent 不能搜索）"
-        : "联网搜索已恢复为自动（Agent 自行判断是否需要搜索）";
+      : next === "smart"
+        ? "联网搜索已切换为 Jev 判定（由分类器按轮判定是否需要强联网）"
+        : next === "off"
+          ? "联网搜索已关闭（不提供联网工具，Agent 不能搜索）"
+          : "联网搜索已恢复为自动（Agent 自行判断是否需要搜索）";
   return { kind: "success", text };
 }

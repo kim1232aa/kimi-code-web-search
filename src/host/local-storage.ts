@@ -41,7 +41,7 @@ export interface GatewayStateDocument {
 }
 
 function isValidMode(val: unknown): val is SearchMode {
-  return val === "auto" || val === "required" || val === "off";
+  return val === "auto" || val === "smart" || val === "required" || val === "off";
 }
 
 function writeAtomicSync(filePath: string, content: string, mode?: number): void {
@@ -50,13 +50,14 @@ function writeAtomicSync(filePath: string, content: string, mode?: number): void
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmpPath, content, { encoding: "utf8", ...(mode !== undefined ? { mode } : {}) });
-  if (mode !== undefined) {
-    try {
-      fs.chmodSync(tmpPath, mode);
-    } catch {
-      // Ignore chmod errors on platforms that do not support POSIX permissions
-    }
+  const out = fs.openSync(tmpPath, "w", mode);
+  try {
+    fs.writeFileSync(out, content, "utf8");
+    // Durability: fsync before rename so a crash cannot leave a truncated or
+    // empty file behind (rename alone only guarantees visibility).
+    fs.fsyncSync(out);
+  } finally {
+    fs.closeSync(out);
   }
   fs.renameSync(tmpPath, filePath);
   if (mode !== undefined) {
@@ -65,6 +66,31 @@ function writeAtomicSync(filePath: string, content: string, mode?: number): void
     } catch {
       // Ignore chmod errors on platforms that do not support POSIX permissions
     }
+  }
+  try {
+    const dirFd = fs.openSync(dir, "r");
+    try {
+      fs.fsyncSync(dirFd);
+    } finally {
+      fs.closeSync(dirFd);
+    }
+  } catch {
+    // Directory fsync is unsupported on some platforms; the file-level fsync
+    // above already covers the truncation risk.
+  }
+}
+
+/**
+ * An unreadable or unparseable state file must never be silently replaced by
+ * the next save: rename it aside so the original bytes stay recoverable
+ * before the caller falls back to defaults.
+ */
+function backupCorruptFile(filePath: string): void {
+  try {
+    fs.renameSync(filePath, `${filePath}.corrupt-${Date.now()}`);
+  } catch {
+    // Best effort: if the rename fails the next save still proceeds, but the
+    // common case (truncated JSON) preserves the original bytes.
   }
 }
 
@@ -101,6 +127,9 @@ export class LocalStorage {
       const raw = JSON.parse(fs.readFileSync(this.configPath, "utf8"));
       return validateWebToolsSettings(raw);
     } catch {
+      // A corrupt config must not be silently replaced by the next save;
+      // preserve the original bytes, then fall back to defaults.
+      backupCorruptFile(this.configPath);
       return validateWebToolsSettings(DEFAULT_SETTINGS);
     }
   }
@@ -122,7 +151,12 @@ export class LocalStorage {
     }
     try {
       const parsed = JSON.parse(fs.readFileSync(this.credentialsPath, "utf8"));
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        // Structurally valid JSON but not a credential map: back it up too,
+        // otherwise the next setCredential write would erase it entirely.
+        backupCorruptFile(this.credentialsPath);
+        return {};
+      }
       const out: Record<string, string> = {};
       for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
         if (typeof v === "string" && v.length > 0) {
@@ -131,6 +165,7 @@ export class LocalStorage {
       }
       return out;
     } catch {
+      backupCorruptFile(this.credentialsPath);
       return {};
     }
   }
@@ -226,7 +261,8 @@ export class LocalStorage {
     const doc = this.readModeState();
     const entry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
     const mode = entry?.mode ?? doc.globalMode;
-    if (mode === "required" && (!sessionId || sessionId === "global" || !entry?.turn || turnId === undefined)) {
+    const turnRequired = (mode === "required" || (mode === "smart" && entry?.turn?.required === true)) && !entry?.turn?.exempted;
+    if (turnRequired && (!sessionId || sessionId === "global" || !entry?.turn || turnId === undefined)) {
       throw new Error("Required mode needs session_id and turn_id from the current UserPromptSubmit hook.");
     }
     if (turnId !== undefined && turnId !== entry?.turn?.turn) {

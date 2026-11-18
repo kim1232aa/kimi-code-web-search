@@ -15,7 +15,8 @@ import { poolSummary, type PoolEntry } from "./pool.ts";
 import { buildPool, hintOf } from "./pool.ts";
 import { credRefOf, PROVIDER_LIST } from "./providers/index.ts";
 import type { QuotaSnapshot } from "./quota.ts";
-import type { ConfigView, ProviderView, SearchMode, SearchModeView, SearchRoutingPolicy, VersionCheckView } from "../shared/api-types.ts";
+import type { ConfigView, PiImportView, ProviderView, SearchMode, SearchModeView, SearchRoutingPolicy, SmartSearchSettings, SmartSearchTestView, VersionCheckView } from "../shared/api-types.ts";
+import { importFromPi } from "./pi-import.ts";
 import { buildProviderOptionView, sanitizeProviderOptions } from "./provider-options.ts";
 import { createHash } from "node:crypto";
 import { endpointViewOf, isForeignOverride, PROVIDER_ENDPOINTS } from "./endpoints.ts";
@@ -33,7 +34,8 @@ import {
   type CustomProviderConfig,
   type CustomSourceTestView,
 } from "../shared/custom-provider-types.ts";
-import { sanitizeBaseUrlOverrides } from "./config.ts";
+import { sanitizeBaseUrlOverrides, validateWebToolsSettings } from "./config.ts";
+import { classifySmartTurn, resolveSmartCredential } from "../../hooks/smart-classifier.mjs";
 import { isLocalOrPrivateHost, resolvesToPrivateIp, type LookupAllFn, type OutboundAuthorization } from "./provider-transport.ts";
 
 import type { BrowserPlatform } from "./browser/types.ts";
@@ -149,6 +151,8 @@ export interface RouteDeps {
   proxyStatus?: () => Promise<{ configured: boolean; degraded: boolean }>;
   /** Cached, failure-tolerant GitHub release check. */
   checkVersion?: () => Promise<VersionCheckView>;
+  checkSmartClassifier?: typeof classifySmartTurn;
+  importPi?: () => Promise<PiImportView>;
   /** Search-Mode runtime access (see search-mode-runtime.ts). */
   searchMode?: {
     view(sessionId: string): SearchModeView;
@@ -311,6 +315,9 @@ export function isDirectLoopbackRequest(req: WebToolsHttpRequest): boolean {
   return false;
 }
 
+/** Test-runner invocation marker: a test/ directory segment or a *.test.[cm][jt]s file path. */
+const TEST_RUN_ARG = /(^|[\\/])tests?([\\/]|$)|\.test\.[cm]?[jt]s$/;
+
 /**
  * Whether this request may touch the configuration plane.
  *
@@ -330,11 +337,12 @@ export function configPlaneTrust(req: WebToolsHttpRequest): "peer" | "host" | fa
   }
   // In production DSH environments, every real connection carries req.socket.
   // Fallback to Host header is strictly confined to automated test runs
-  // (where mock req objects lack sockets).
+  // (where mock req objects lack sockets): an explicit --test flag, NODE_ENV,
+  // or a test-runner file path — never a bare substring like "latest".
   const isTest = typeof process !== "undefined" && (
     process.env.NODE_ENV === "test" ||
-    process.argv.some((a) => a.includes("test")) ||
-    process.execArgv.some((a) => a.includes("test"))
+    process.argv.some((a) => a === "--test" || TEST_RUN_ARG.test(a)) ||
+    process.execArgv.includes("--test")
   );
   if (!isTest) return false;
   return isLoopbackHost(authorityHost(req.headers?.host)) ? "host" : false;
@@ -377,8 +385,57 @@ function isNotCrossSite(req: WebToolsHttpRequest): boolean {
 // endpoint implementations
 // ---------------------------------------------------------------------------
 
+/** Stored credential refs each classifier backend may use; never another vendor's. */
+export const SMART_CREDENTIAL_REFS: Record<SmartSearchSettings["provider"], readonly string[]> = {
+  typesafe: ["WEB_TOOLS_TYPESAFE", "WEB_TOOLS_JEV"],
+  openrouter: ["WEB_TOOLS_OPENROUTER"],
+  "openai-compatible": ["WEB_TOOLS_SMART_CLASSIFIER"],
+};
+
+const SMART_LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+async function readSmartCredentials(
+  deps: RouteDeps,
+  provider: SmartSearchSettings["provider"],
+): Promise<Record<string, string | undefined>> {
+  const refs = SMART_CREDENTIAL_REFS[provider];
+  return Object.fromEntries(await Promise.all(refs.map(async (ref) => [ref, (await deps.readCredential(ref)).value])));
+}
+
+/**
+ * Guard for a user-supplied smart classifier endpoint. Loopback targets may use
+ * http or https (local inference servers); everything else must be https and
+ * must not point at, or resolve to, a private or metadata address.
+ */
+async function assertSafeSmartBaseUrl(deps: RouteDeps, baseUrl: string): Promise<void> {
+  const value = baseUrl.trim();
+  if (!value) return;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new RouteError("invalid-url", "Smart classifier endpoint must be an absolute http(s) URL", 400);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new RouteError("invalid-url", "Smart classifier endpoint must use the http or https scheme", 400);
+  }
+  if (url.username || url.password) {
+    throw new RouteError("invalid-url", "Smart classifier endpoint must not embed credentials", 400);
+  }
+  const host = url.hostname.toLowerCase();
+  if (SMART_LOOPBACK_HOSTS.has(host)) return;
+  if (url.protocol !== "https:") {
+    throw new RouteError("invalid-url", "Non-loopback smart classifier endpoint must use HTTPS", 400);
+  }
+  if (isLocalOrPrivateHost(host) || (await resolvesToPrivateIp(host, deps.lookupAll))) {
+    throw new RouteError("forbidden", "Access to private or metadata IP addresses is blocked", 400);
+  }
+}
+
 async function handleConfigGet(deps: RouteDeps): Promise<ConfigView> {
   const cfg = deps.readConfig();
+  const { smartSearch, exemptWhenNoProvider, recognizeExternalWebTools, requiredEvidence, fetchOrder } = validateWebToolsSettings(cfg);
+  const smartCredential = resolveSmartCredential(smartSearch, await readSmartCredentials(deps, smartSearch.provider));
   const enabled = cfg.enabled !== false;
   const defaultProvider = (cfg.defaultProvider as string) ?? "tavily";
   const enabledMap = (cfg.providerEnabled as Record<string, boolean>) ?? {};
@@ -460,21 +517,50 @@ async function handleConfigGet(deps: RouteDeps): Promise<ConfigView> {
     defaultProvider,
     providerAttemptTimeoutMs: (cfg.providerAttemptTimeoutMs as number) ?? 10000,
     fallbackOrder: (cfg.fallbackOrder as string[]) ?? [],
+    fetchOrder,
     proxy: deps.proxyStatus ? await deps.proxyStatus() : undefined,
     searchRoutingPolicy: (cfg.searchRoutingPolicy as SearchRoutingPolicy) ?? "ordered",
     platformEnabled,
+    smartSearch,
+    smartSearchConfigured: Boolean(smartCredential.apiKey),
+    smartSearchKeyHint: smartCredential.apiKey ? hintOf(smartCredential.apiKey) : undefined,
+    exemptWhenNoProvider,
+    recognizeExternalWebTools,
+    requiredEvidence,
     providers,
     outboundAuthorizations: (cfg.outboundAuthorizations as OutboundAuthorization[]) ?? [],
   };
 }
 
+const VALID_FETCH_PROVIDERS = new Set([
+  "http",
+  ...PROVIDER_LIST.filter((meta) => meta.fetchCapable).map((meta) => meta.name),
+]);
+
 async function handleConfigSave(deps: RouteDeps, payload: unknown) {
   const p = (payload ?? {}) as Record<string, unknown>;
   const patch: Record<string, unknown> = {};
+  // Validate the classifier endpoint before any side effect below is applied.
+  if (p.smartSearch && typeof p.smartSearch === "object" && !Array.isArray(p.smartSearch)) {
+    const cfg = deps.readConfig();
+    const current = validateWebToolsSettings(cfg).smartSearch;
+    const incoming = p.smartSearch as Record<string, unknown>;
+    if (typeof incoming.baseUrl === "string") await assertSafeSmartBaseUrl(deps, incoming.baseUrl);
+    patch.smartSearch = validateWebToolsSettings({ ...cfg, smartSearch: { ...current, ...incoming } }).smartSearch;
+  }
   if (typeof p.enabled === "boolean") patch.enabled = p.enabled;
   if (typeof p.defaultProvider === "string") patch.defaultProvider = p.defaultProvider;
   if (typeof p.providerAttemptTimeoutMs === "number") patch.providerAttemptTimeoutMs = p.providerAttemptTimeoutMs;
   if (Array.isArray(p.fallbackOrder)) patch.fallbackOrder = p.fallbackOrder;
+  if (Array.isArray(p.fetchOrder)) {
+    const normalizedFetch = validateWebToolsSettings({ fetchOrder: p.fetchOrder }).fetchOrder;
+    for (const item of normalizedFetch) {
+      if (!VALID_FETCH_PROVIDERS.has(item)) {
+        throw new RouteError("config", `unknown fetch provider "${item}"`, 400);
+      }
+    }
+    patch.fetchOrder = normalizedFetch;
+  }
   if (p.providerBaseUrls && typeof p.providerBaseUrls === "object") {
     // Normalize on the way in: a malformed entry is dropped (restoring the
     // official endpoint) instead of being persisted and failing at request time.
@@ -485,6 +571,9 @@ async function handleConfigSave(deps: RouteDeps, payload: unknown) {
     patch.platformEnabled = p.platformEnabled;
     deps.sourceRegistry.setPlatformEnabled(p.platformEnabled as Record<string, boolean>);
   }
+  if (typeof p.exemptWhenNoProvider === "boolean") patch.exemptWhenNoProvider = p.exemptWhenNoProvider;
+  if (typeof p.recognizeExternalWebTools === "boolean") patch.recognizeExternalWebTools = p.recognizeExternalWebTools;
+  if (p.requiredEvidence === "search" || p.requiredEvidence === "search-or-fetch") patch.requiredEvidence = p.requiredEvidence;
   if (Array.isArray(p.outboundAuthorizations)) patch.outboundAuthorizations = p.outboundAuthorizations;
   if (p.providerOptions && typeof p.providerOptions === "object") patch.providerOptions = p.providerOptions;
   await deps.writeConfig(patch); // persist BEFORE reporting success
@@ -527,6 +616,9 @@ async function handleRoutingSet(deps: RouteDeps, payload: unknown) {
 }
 
 function resolveProviderRef(deps: RouteDeps, provider: string): string {
+  if (provider === "smart-typesafe") return "WEB_TOOLS_TYPESAFE";
+  if (provider === "smart-openrouter") return "WEB_TOOLS_OPENROUTER";
+  if (provider === "smart-classifier") return "WEB_TOOLS_SMART_CLASSIFIER";
   const customRef = deps.sourceRefs?.(provider)?.key;
   if (customRef) return customRef;
   const isBuiltIn = PROVIDER_LIST.some((m) => m.name === provider);
@@ -597,6 +689,50 @@ async function handleTestSearch(deps: RouteDeps, payload: unknown) {
   return deps.testFullSearch(p.query);
 }
 
+async function handleSmartClassifierTest(deps: RouteDeps, payload: unknown): Promise<SmartSearchTestView> {
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const prompt = typeof p.prompt === "string" ? p.prompt.trim() : "";
+  if (!prompt) throw new RouteError("config", "prompt is required", 400);
+  const cfg = deps.readConfig();
+  const current = validateWebToolsSettings(cfg).smartSearch;
+  if (p.provider !== undefined && p.provider !== "typesafe" && p.provider !== "openrouter" && p.provider !== "openai-compatible") {
+    throw new RouteError("config", "invalid smart classifier provider", 400);
+  }
+  const smartSearch = validateWebToolsSettings({
+    ...cfg,
+    smartSearch: {
+      ...current,
+      ...(typeof p.provider === "string" ? { provider: p.provider } : {}),
+      ...(typeof p.model === "string" ? { model: p.model } : {}),
+      ...(typeof p.baseUrl === "string" ? { baseUrl: p.baseUrl } : {}),
+      ...(typeof p.timeoutMs === "number" ? { timeoutMs: p.timeoutMs } : {}),
+      ...(typeof p.threshold === "number" ? { threshold: p.threshold } : {}),
+    },
+  }).smartSearch;
+  if (typeof p.baseUrl === "string") await assertSafeSmartBaseUrl(deps, p.baseUrl);
+  await assertSafeSmartBaseUrl(deps, smartSearch.baseUrl ?? "");
+  const credentials = await readSmartCredentials(deps, smartSearch.provider);
+  const started = Date.now();
+  try {
+    return await (deps.checkSmartClassifier ?? classifySmartTurn)({
+      promptText: prompt,
+      sessionId: typeof p.sessionId === "string" ? p.sessionId.trim() : undefined,
+      config: { smartSearch },
+      credentials,
+    });
+  } catch {
+    return {
+      ok: false,
+      escalated: false,
+      provider: smartSearch.provider,
+      model: smartSearch.model,
+      latencyMs: Date.now() - started,
+      threshold: smartSearch.threshold,
+      error: "Smart classifier test failed",
+    };
+  }
+}
+
 async function handleQuotaDescribe(deps: RouteDeps, payload: unknown) {
   const force = (payload as { force?: boolean } | undefined)?.force === true;
   return { quotas: await deps.describeQuotas(force) };
@@ -619,7 +755,7 @@ async function handleSearchModeSet(deps: RouteDeps, payload: unknown) {
   const sessionId = String(p.sessionId ?? "");
   const mode = p.mode;
   if (!sessionId) throw new Error("missing sessionId");
-  if (mode !== "auto" && mode !== "required" && mode !== "off") throw new Error("invalid mode");
+  if (mode !== "auto" && mode !== "smart" && mode !== "required" && mode !== "off") throw new Error("invalid mode");
   if (!deps.searchMode) throw new Error("search-mode runtime unavailable");
   return deps.searchMode.set(sessionId, mode);
 }
@@ -1223,6 +1359,17 @@ const ENDPOINTS: Record<string, (deps: RouteDeps, payload: unknown) => Promise<u
   "credentials/describe": (deps) => handleCredentialDescribe(deps),
   "test/provider": (deps, payload) => handleTestProvider(deps, payload),
   "test/search": (deps, payload) => handleTestSearch(deps, payload),
+  "smart-classifier/test": (deps, payload) => handleSmartClassifierTest(deps, payload),
+  "import/pi": async (deps) => {
+    if (deps.importPi) return deps.importPi();
+    return importFromPi({
+      readConfig: deps.readConfig,
+      writeConfig: deps.writeConfig,
+      readCredential: (ref) => deps.readCredential(ref),
+      writeCredential: (ref, value) => deps.writeCredential(ref, value),
+      setGlobalMode: deps.searchMode ? (mode) => { deps.searchMode!.set("global", mode); } : undefined,
+    });
+  },
   "quota/describe": (deps, payload) => handleQuotaDescribe(deps, payload),
   "version/check": (deps) => handleVersionCheck(deps),
   "search-mode/get": (deps, payload) => handleSearchModeGet(deps, payload),

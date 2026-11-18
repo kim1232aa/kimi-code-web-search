@@ -7,7 +7,7 @@
  *  - Exposes 4 tools:
  *    1. `web_search` — Multi-provider web & social platform (Xiaohongshu / X) search
  *    2. `web_fetch`  — Full-page & social post/comment content extraction
- *    3. `web_mode`   — View or switch Search Mode (`auto`, `required`, `off`)
+ *    3. `web_mode`   — View or switch Search Mode (`auto`, `smart`, `required`, `off`)
  *    4. `web_status` — Inspect gateway, providers, quotas, and platform login state
  */
 import readline from "node:readline";
@@ -40,6 +40,10 @@ const TOOLS = [
           maximum: 20,
           pattern: "^[1-9][0-9]*$",
           description: "Maximum number of results to return (default: 8, max: 20).",
+        },
+        provider: {
+          type: "string",
+          description: "Optional configured provider name or custom source ID to override routing for cross-verification.",
         },
         session_id: {
           type: "string",
@@ -85,7 +89,7 @@ const TOOLS = [
   {
     name: "web_mode",
     description:
-      "Get, set, or toggle the Web Search Mode (`auto` = 智能联网, `required` = 始终联网, `off` = 关闭联网) for the current session or globally.",
+      "Get, set, or toggle the Web Search Mode (`auto` = 智能联网, `smart` = Jev 判定, `required` = 始终联网, `off` = 关闭联网) for the current session or globally.",
     inputSchema: {
       type: "object",
       properties: {
@@ -96,8 +100,8 @@ const TOOLS = [
         },
         mode: {
           type: "string",
-          enum: ["auto", "required", "off"],
-          description: "Target mode when action is `set` (`auto`, `required`, or `off`).",
+          enum: ["auto", "smart", "required", "off"],
+          description: "Target mode when action is `set` (`auto`, `smart`, `required`, or `off`).",
         },
         session_id: {
           type: "string",
@@ -188,6 +192,7 @@ function formatFetchOutput(value) {
 function formatModeOutput(value) {
   const modeNames = {
     auto: "auto (智能联网 — model decides when to search)",
+    smart: "smart (Jev 判定 — Jev classifier decides per turn whether lookup is required)",
     required: "required (始终联网 — at least one web_search or web_fetch required per turn)",
     off: "off (关闭联网 — web tools disabled and blocked)",
   };
@@ -214,8 +219,31 @@ function formatStatusOutput(value) {
     const chain = [value.config.defaultProvider, ...(value.config.fallbackOrder || [])].filter(Boolean);
     lines.push(`- Routing Policy: ${value.config.searchRoutingPolicy || "ordered"}`);
     lines.push(`- Active Chain: ${chain.join(" -> ") || "none"}`);
+    const fetchChain = Array.isArray(value.config.fetchOrder) && value.config.fetchOrder.length > 0
+      ? value.config.fetchOrder.join(" -> ")
+      : "(follows search chain -> builtin-http)";
+    lines.push(`- Fetch Chain: ${fetchChain}`);
     lines.push(`- Attempt Timeout: ${value.config.providerAttemptTimeoutMs}ms`);
+    if (value.config.exemptWhenNoProvider !== undefined) {
+      lines.push(`- Exempt When No Provider: ${value.config.exemptWhenNoProvider}`);
+    }
+    if (value.config.recognizeExternalWebTools !== undefined) {
+      lines.push(`- Recognize External Web Tools: ${value.config.recognizeExternalWebTools}`);
+    }
+    if (value.config.requiredEvidence !== undefined) {
+      lines.push(`- Required Evidence: ${value.config.requiredEvidence}`);
+    }
   }
+  const smart = value?.smartSearch ?? value?.config?.smartSearch ?? {};
+  lines.push("\n## Smart Classifier");
+  lines.push(`- Enabled: ${smart.enabled ?? "unknown"}`);
+  lines.push(`- Provider: ${smart.provider ?? "unknown"}`);
+  lines.push(`- Model: ${smart.model || "not configured"}`);
+  lines.push(`- Configured: ${value?.config?.smartSearchConfigured ?? smart.configured ?? "unknown"}`);
+  lines.push(`- Threshold: ${smart.threshold ?? "unknown"}`);
+  lines.push(`- Timeout: ${smart.timeoutMs === undefined ? "unknown" : `${smart.timeoutMs}ms`}`);
+  const lastSmartDecision = value?.lastSmartDecision ?? value?.mode?.lastSmartDecision ?? smart.lastSmartDecision;
+  lines.push(`- Last Smart Decision (${value?.mode?.sessionId ?? "global"}): ${lastSmartDecision ? JSON.stringify(lastSmartDecision) : "none"}`);
   if (Array.isArray(value?.providers)) {
     lines.push(`\n## Providers (${value.providers.length})`);
     for (const p of value.providers) {
@@ -250,7 +278,8 @@ async function runTool(params) {
       const query = typeof args.query === "string" ? args.query.trim() : "";
       if (!query) throw new Error("Missing required argument: query");
       const maxResults = positiveInteger(Object.hasOwn(args, "max_results") ? args.max_results : args.maxResults, "max_results", 20) ?? 8;
-      const result = await callGatewayMcp("search", { query, maxResults, sessionId, turnId });
+      if (args.provider !== undefined && typeof args.provider !== "string") throw new Error("provider must be a string");
+      const result = await callGatewayMcp("search", { query, maxResults, provider: args.provider, sessionId, turnId });
       return { content: [{ type: "text", text: formatSearchOutput(result) }] };
     }
 
@@ -337,6 +366,11 @@ async function dispatch(message) {
 }
 
 function start() {
+  // The host can close our stdout mid-shutdown while a response is still in
+  // flight; a lost pipe is a normal exit, not an unhandled crash.
+  process.stdout.on("error", (err) => {
+    if (err?.code === "EPIPE") process.exit(0);
+  });
   const rl = readline.createInterface({ input: process.stdin });
   rl.on("line", (line) => {
     const trimmed = line.trim();

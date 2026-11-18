@@ -25,7 +25,7 @@ import { buildYouSearchBody } from "./providers/you.ts";
 import { buildBraveLlmContextBody } from "./providers/brave.ts";
 import { buildExaSearchBody } from "./providers/exa.ts";
 import { buildSearxngUrl, buildSearxngAuth } from "./providers/searxng.ts";
-import { createSearchProvider } from "./registry.ts";
+import { createPoolStore, createSearchProvider, selfHealPool } from "./registry.ts";
 
 test("buildPool splits on comma/whitespace/newline and dedupes empties", () => {
   const p = buildPool("k1, k2\nk3;k4  ,, k5");
@@ -65,6 +65,23 @@ test("resetHealth restores the pool", () => {
   markUnhealthy(p, 1);
   resetHealth(p);
   assert.equal(selectIndex(p), 0);
+});
+
+test("selfHealPool resets an all-unhealthy pool once per backoff window, per provider", async () => {
+  const pools = createPoolStore(async () => "k1,k2");
+  const exa = await pools.poolOf("exa");
+  markUnhealthy(exa, 0);
+  markUnhealthy(exa, 1);
+  assert.equal(selfHealPool(pools, "exa", exa), true, "an all-unhealthy pool is reset once");
+  assert.ok(exa.every((entry) => entry.healthy));
+  markUnhealthy(exa, 0);
+  markUnhealthy(exa, 1);
+  assert.equal(selfHealPool(pools, "exa", exa), false, "a second reset within the backoff window is refused");
+  assert.ok(exa.every((entry) => !entry.healthy), "a refused reset leaves the pool unhealthy");
+  const tavily = await pools.poolOf("tavily");
+  markUnhealthy(tavily, 0);
+  markUnhealthy(tavily, 1);
+  assert.equal(selfHealPool(pools, "tavily", tavily), true, "the backoff window is tracked per provider");
 });
 
 test("hintOf masks keys", () => {
@@ -368,6 +385,26 @@ test("buildTavilySearchBody maps the native finance topic", () => {
   assert.equal(body.topic, "finance");
 });
 
+test("buildTavilySearchBody converts ISO country codes to Tavily full names on general topics only", () => {
+  const hints = extractSearchHints("美国市场");
+  assert.equal(hints.locale?.country, "US");
+  const body = buildTavilySearchBody("美国市场", 5, undefined, hints);
+  assert.equal(body.country, "united states", "Tavily rejects ISO codes; it needs lowercase full names");
+  assert.equal(body.topic, undefined);
+
+  const newsHints = extractSearchHints("OpenAI breaking news this week");
+  assert.equal(newsHints.topic, "news");
+  const newsBody = buildTavilySearchBody("OpenAI breaking news this week", 5, undefined, newsHints);
+  assert.equal(newsBody.topic, "news");
+  assert.equal(newsBody.country, undefined, "Tavily only honors country on general topics");
+
+  const newsWithCountry = buildTavilySearchBody("x", 5, undefined, { ...hints, topic: "news" } as any);
+  assert.equal(newsWithCountry.country, undefined, "country must be omitted whenever a non-general topic is sent");
+
+  const unknown = buildTavilySearchBody("x", 5, undefined, { ...hints, locale: { country: "ZZ" } } as any);
+  assert.equal(unknown.country, undefined, "unknown ISO codes must be omitted instead of failing the request");
+});
+
 test("buildTavilySearchBody maps topic news, freshness week, and domains", () => {
   const hints = extractSearchHints("site:reuters.com -site:spam.com OpenAI breaking news this week", new Date("2026-08-23T12:00:00Z"));
   const body = buildTavilySearchBody("site:reuters.com -site:spam.com OpenAI breaking news this week", 5, { searchDepth: "basic", chunksPerSource: 2 }, hints);
@@ -496,6 +533,55 @@ test("createSearchProvider: keyless self-hosted SearXNG executes without configu
   assert.equal(res.sources.length, 1);
   assert.equal(res.sources[0].title, "SearXNG Result");
   assert.equal(executedApiKey, "");
+});
+
+test("createSearchProvider coalesces identical concurrent searches into one upstream call", async () => {
+  let calls = 0;
+  const mock = {
+    name: "fake",
+    needsBaseUrl: false,
+    fetchCapable: false,
+    async search() {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return { sources: [{ url: "https://example.test/1", title: "Result" }] };
+    },
+    async fetch() {
+      throw new Error("no fetch");
+    },
+  };
+
+  const provider = createSearchProvider(
+    () => ({
+      enabled: true,
+      defaultProvider: "fake",
+      providerAttemptTimeoutMs: 5000,
+      fallbackOrder: [],
+      providerBaseUrls: {},
+      enabledProviders: { fake: true },
+    }),
+    async () => "test-key",
+    { record: () => {} },
+    { fake: mock as any },
+  );
+
+  const [a, b] = await Promise.all([
+    provider.search({ query: "same query" }),
+    provider.search({ query: "same query" }),
+  ]);
+  assert.equal(calls, 1, "identical overlapping searches must share one upstream call");
+  assert.equal(a.sources[0]?.url, b.sources[0]?.url);
+
+  await provider.search({ query: "same query" });
+  assert.equal(calls, 2, "a settled search must not be served from the coalescing map");
+
+  const [c, d] = await Promise.all([
+    provider.search({ query: "same query" }),
+    provider.search({ query: "same query", maxResults: 3 }),
+  ]);
+  assert.equal(calls, 4, "different parameters must not be coalesced");
+  assert.equal(c.sources.length, 1);
+  assert.equal(d.sources.length, 1);
 });
 
 test("parseParallelSearchResults: normalizes url/title/excerpts/publish_date", () => {

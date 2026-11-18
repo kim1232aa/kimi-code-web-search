@@ -16,7 +16,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { apply } from "./index.ts";
 import {
@@ -25,16 +25,12 @@ import {
   markGatewayAuthenticated,
   API_PREFIX,
 } from "./routes.ts";
-import { LocalStorage } from "./local-storage.ts";
+import { LocalStorage, type ModeSessionRecord, type ModeStateDocument } from "./local-storage.ts";
 import { positiveInteger } from "../../hooks/mode-state.mjs";
 import { CURRENT_VERSION } from "../shared/version.ts";
-import { nextSearchMode, type SearchMode } from "../shared/api-types.ts";
+import { nextSearchMode, type SearchMode, type SmartTurnDecision } from "../shared/api-types.ts";
 import {
   WEB_DISABLED_DENIAL,
-  REQUIRED_SEARCH_CORRECTION_TEXT,
-  SEARCH_DISABLED_TEXT,
-  SEARCH_AUTO_TEXT,
-  requiredSearchText,
 } from "./search-mode-runtime.ts";
 import type {
   WebToolsContext,
@@ -124,8 +120,79 @@ function safeEqual(a: string, b: string): boolean {
   return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
 }
 
-function deriveSessionToken(password: string): string {
-  return createHmac("sha256", password).update("kimi-web-tools-session-v1").digest("hex");
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_LOCK_BASE_MS = 60_000;
+const LOGIN_LOCK_MAX_MS = 15 * 60_000;
+
+/**
+ * Server-side session store: random, revocable tokens instead of a
+ * deterministic password-derived cookie, plus per-client login rate limiting.
+ * State is per gateway process; a restart invalidates issued cookies (users
+ * simply log in again) — the price of logout actually revoking access.
+ */
+class GatewaySessions {
+  private readonly tokens = new Map<string, number>();
+  private readonly failures = new Map<string, { count: number; lockedUntil: number }>();
+
+  issue(): string {
+    const now = Date.now();
+    for (const [token, createdAt] of this.tokens) {
+      if (now - createdAt > SESSION_TTL_MS) this.tokens.delete(token);
+    }
+    const token = randomUUID().replaceAll("-", "") + randomUUID().replaceAll("-", "");
+    this.tokens.set(token, now);
+    return token;
+  }
+
+  isValid(token: string | undefined): boolean {
+    if (typeof token !== "string" || token.length === 0) return false;
+    const createdAt = this.tokens.get(token);
+    if (createdAt === undefined) return false;
+    if (Date.now() - createdAt > SESSION_TTL_MS) {
+      this.tokens.delete(token);
+      return false;
+    }
+    return true;
+  }
+
+  revoke(token: string | undefined): void {
+    if (typeof token === "string" && token.length > 0) this.tokens.delete(token);
+  }
+
+  /** Remaining lockout in ms for a client key; 0 when login is allowed. */
+  lockoutRemainingMs(key: string): number {
+    const entry = this.failures.get(key);
+    if (!entry) return 0;
+    const remaining = entry.lockedUntil - Date.now();
+    return remaining > 0 ? remaining : 0;
+  }
+
+  recordFailure(key: string): void {
+    const entry = this.failures.get(key) ?? { count: 0, lockedUntil: 0 };
+    entry.count += 1;
+    if (entry.count >= LOGIN_MAX_FAILURES) {
+      const exponent = Math.min(entry.count - LOGIN_MAX_FAILURES, 5);
+      entry.lockedUntil = Date.now() + Math.min(LOGIN_LOCK_BASE_MS * 2 ** exponent, LOGIN_LOCK_MAX_MS);
+    }
+    this.failures.set(key, entry);
+  }
+
+  recordSuccess(key: string): void {
+    this.failures.delete(key);
+  }
+}
+
+/** Rate-limit key: trust X-Forwarded-For only when the TCP peer is loopback. */
+function loginRateKey(req: http.IncomingMessage): string {
+  const peer = req.socket.remoteAddress ?? "unknown";
+  if (peer === "127.0.0.1" || peer === "::1" || peer === "::ffff:127.0.0.1") {
+    const xff = req.headers["x-forwarded-for"];
+    const first = Array.isArray(xff) ? xff[0] : xff;
+    const client = typeof first === "string" ? first.split(",")[0].trim() : "";
+    if (client) return client;
+  }
+  return peer;
 }
 
 function parseCookies(cookieHeader: string | undefined): Record<string, string> {
@@ -161,19 +228,22 @@ function resolveGatewayPassword(explicit: string | undefined, baseDir: string): 
   return undefined;
 }
 
-function hasValidPasswordAuth(req: http.IncomingMessage, password: string): boolean {
+function hasValidPasswordAuth(req: http.IncomingMessage, password: string, sessions: GatewaySessions): boolean {
   const auth = req.headers.authorization;
   if (typeof auth === "string" && auth.slice(0, 7).toLowerCase() === "bearer ") {
     const token = auth.slice(7).trim();
     if (token && safeEqual(token, password)) return true;
   }
   const cookies = parseCookies(req.headers.cookie);
-  const cookieToken = cookies[AUTH_COOKIE_NAME];
-  if (typeof cookieToken === "string" && cookieToken.length > 0) {
-    const expected = deriveSessionToken(password);
-    if (safeEqual(cookieToken, expected)) return true;
-  }
-  return false;
+  return sessions.isValid(cookies[AUTH_COOKIE_NAME]);
+}
+
+/** The session's current smart decision, falling back to the last recorded one after a turn reset. */
+function smartDecisionOf(doc: ModeStateDocument, sessionId: string): SmartTurnDecision | undefined {
+  const record: (ModeSessionRecord & { lastSmartDecision?: SmartTurnDecision }) | undefined = Object.hasOwn(doc.sessions, sessionId)
+    ? doc.sessions[sessionId]
+    : undefined;
+  return record?.turn?.smartDecision ?? record?.lastSmartDecision;
 }
 
 export async function startGatewayServer(options: GatewayServerOptions = {}): Promise<GatewayServerHandle> {
@@ -187,13 +257,14 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
   storage.ensureDir();
 
   const routes: WebToolsWebRoute[] = [];
+  const gatewaySessions = new GatewaySessions();
   const disposers: Array<() => void> = [];
 
   let searchProvider: {
     id: string;
     available(): boolean;
     search(
-      request: { query: string; maxResults?: number },
+      request: { query: string; maxResults?: number; provider?: string },
       signal?: AbortSignal,
     ): Promise<{
       content?: string;
@@ -330,6 +401,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           writeJson(res, 404, { ok: false, error: { code: "not-found", message: "index.html not found" } });
           return;
         }
+        const htmlBody = fs.readFileSync(htmlPath);
         res.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
           "cache-control": "no-cache",
@@ -338,7 +410,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           res.end();
           return;
         }
-        res.end(fs.readFileSync(htmlPath));
+        res.end(htmlBody);
         return;
       }
 
@@ -351,6 +423,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           });
           return;
         }
+        const jsBody = fs.readFileSync(jsPath);
         res.writeHead(200, {
           "content-type": "application/javascript; charset=utf-8",
           "cache-control": "no-cache",
@@ -359,7 +432,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           res.end();
           return;
         }
-        res.end(fs.readFileSync(jsPath));
+        res.end(jsBody);
         return;
       }
 
@@ -371,15 +444,32 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           writeJson(res, 404, { ok: false, error: { code: "not-found", message: "asset not found" } });
           return;
         }
+        const assetBody = fs.readFileSync(safePath);
         res.writeHead(200, { "content-type": contentTypeFor(safePath) });
-        res.end(fs.readFileSync(safePath));
+        res.end(assetBody);
+        return;
+      }
+
+      // Liveness probe: intentionally UNAUTHENTICATED so the daemon health check
+      // keeps working under KIMI_WEB_TOOLS_REQUIRE_AUTH=1; it exposes only
+      // pid/version/availability, never configuration or credentials.
+      if (req.method === "GET" && (pathname === "/health" || pathname === "/web-tools/health")) {
+        writeJson(res, 200, {
+          ok: true,
+          value: {
+            status: "healthy",
+            version: CURRENT_VERSION,
+            pid: process.pid,
+            available: searchProvider?.available() ?? false,
+          },
+        });
         return;
       }
 
       // 2. Authentication state & login/logout endpoints (`/web-tools/auth/*`)
       const password = resolveGatewayPassword(options.password, storage.baseDir);
       const directLocal = isDirectLoopbackRequest(wtReq) && process.env.KIMI_WEB_TOOLS_REQUIRE_AUTH !== "1";
-      const passwordAuthed = password ? hasValidPasswordAuth(req, password) : false;
+      const passwordAuthed = password ? hasValidPasswordAuth(req, password, gatewaySessions) : false;
       const isAuthed = directLocal || passwordAuthed;
 
       if (pathname === "/web-tools/auth/session" && (req.method === "GET" || req.method === "POST")) {
@@ -402,16 +492,29 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           });
           return;
         }
+        const rateKey = loginRateKey(req);
+        const lockoutMs = gatewaySessions.lockoutRemainingMs(rateKey);
+        if (lockoutMs > 0) {
+          writeJson(
+            res,
+            429,
+            { ok: false, error: { code: "rate-limited", message: "Too many failed login attempts; retry later" } },
+            { "retry-after": String(Math.ceil(lockoutMs / 1000)) },
+          );
+          return;
+        }
         const body = await readJsonBody(req).catch(() => ({} as Record<string, unknown>));
         const candidate = typeof body.password === "string" ? body.password.trim() : "";
         if (!candidate || !safeEqual(candidate, password)) {
+          gatewaySessions.recordFailure(rateKey);
           writeJson(res, 401, {
             ok: false,
             error: { code: "unauthorized", message: "访问密码错误" },
           });
           return;
         }
-        const token = deriveSessionToken(password);
+        gatewaySessions.recordSuccess(rateKey);
+        const token = gatewaySessions.issue();
         const isHttps = req.headers["x-forwarded-proto"] === "https";
         const cookie = `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${isHttps ? "; Secure" : ""}`;
         writeJson(res, 200, { ok: true, value: { authenticated: true } }, { "set-cookie": cookie });
@@ -419,6 +522,8 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
       }
 
       if (pathname === "/web-tools/auth/logout" && req.method === "POST") {
+        const cookies = parseCookies(req.headers.cookie);
+        gatewaySessions.revoke(cookies[AUTH_COOKIE_NAME]);
         const cookie = `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
         writeJson(res, 200, { ok: true, value: { authenticated: false } }, { "set-cookie": cookie });
         return;
@@ -450,19 +555,6 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
         return;
       }
 
-      if (req.method === "GET" && (pathname === "/health" || pathname === "/web-tools/health")) {
-        writeJson(res, 200, {
-          ok: true,
-          value: {
-            status: "healthy",
-            version: CURRENT_VERSION,
-            pid: process.pid,
-            available: searchProvider?.available() ?? false,
-          },
-        });
-        return;
-      }
-
       // 4. Internal MCP Execution Endpoints (`/web-tools/mcp/*`)
       if (pathname.startsWith("/web-tools/mcp/")) {
         const mcpAction = pathname.slice("/web-tools/mcp/".length);
@@ -474,6 +566,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
               writeJson(res, 403, { ok: false, error: { code: "mode-off", message: WEB_DISABLED_DENIAL } });
               return;
             }
+            payload.sessionId = sessionId;
             payload.turnId = storage.bindToolTurn(sessionId, positiveInteger(payload.turnId, "turn_id"));
             if (mcpAction === "search") payload.maxResults = positiveInteger(payload.maxResults, "max_results", 20) ?? 8;
           } catch (error) {
@@ -506,7 +599,11 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
 
           try {
             const started = Date.now();
-            const outcome = await searchProvider.search({ query, maxResults });
+            const outcome = await searchProvider.search({
+              query,
+              maxResults,
+              provider: typeof payload.provider === "string" ? payload.provider.trim() : undefined,
+            });
             storage.completeTool(sessionId, "web_search", true, turnId);
             writeJson(res, 200, {
               ok: true,
@@ -581,14 +678,11 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           const sessionId = typeof payload.sessionId === "string" && payload.sessionId.trim() ? payload.sessionId.trim() : "global";
           const action = typeof payload.action === "string" ? payload.action : payload.mode !== undefined ? "set" : "get";
           const available = searchProvider?.available() ?? false;
-          const cfg = storage.readConfig();
-          const platformsEnabled =
-            cfg.platformEnabled?.xiaohongshu !== false || cfg.platformEnabled?.x !== false;
 
           if (action === "set") {
             const nextMode = payload.mode;
-            if (nextMode !== "auto" && nextMode !== "required" && nextMode !== "off") {
-              writeJson(res, 400, { ok: false, error: { code: "bad-request", message: "mode must be auto, required, or off" } });
+            if (nextMode !== "auto" && nextMode !== "smart" && nextMode !== "required" && nextMode !== "off") {
+              writeJson(res, 400, { ok: false, error: { code: "bad-request", message: "mode must be auto, smart, required, or off" } });
               return;
             }
             storage.setSessionMode(sessionId, nextMode);
@@ -625,46 +719,18 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
             return;
           }
 
-          if (action === "begin-turn") {
-            const turnNum = typeof payload.turn === "number" ? payload.turn : Date.now();
-            const mode = storage.getEffectiveSessionMode(sessionId);
-            const turnState = {
-              turn: turnNum,
-              required: mode === "required",
-              disabled: mode === "off",
-              webSearchCompleted: false,
-              webSearchSucceeded: false,
-              webFetchCompleted: false,
-              webFetchSucceeded: false,
-              correctionCount: 0,
-            };
-            storage.setTurnState(sessionId, turnState);
-            const policyText =
-              mode === "off"
-                ? SEARCH_DISABLED_TEXT
-                : mode === "required"
-                  ? requiredSearchText(platformsEnabled)
-                  : SEARCH_AUTO_TEXT;
-            writeJson(res, 200, {
-              ok: true,
-              value: {
-                sessionId,
-                mode,
-                available,
-                turnState,
-                policyText,
-                correctionText: REQUIRED_SEARCH_CORRECTION_TEXT,
-              },
-            });
-            return;
-          }
-
           const doc = storage.readModeState();
-          const sessions = Object.entries(doc.sessions).map(([id, rec]) => ({
-            id,
-            mode: rec.mode ?? doc.globalMode,
-            updatedAt: rec.updatedAt,
-          }));
+          const smartDecision = smartDecisionOf(doc, sessionId);
+          // Only sessions with an explicit per-session override are meaningful
+          // scope choices. Listing every session that merely has turn state
+          // turns the selector into an unbounded wall of raw ids.
+          const sessions = Object.entries(doc.sessions)
+            .filter(([, rec]) => typeof rec.mode === "string")
+            .map(([id, rec]) => ({
+              id,
+              mode: rec.mode ?? doc.globalMode,
+              updatedAt: rec.updatedAt,
+            }));
           writeJson(res, 200, {
             ok: true,
             value: {
@@ -673,6 +739,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
               globalMode: doc.globalMode,
               available,
               sessions,
+              ...(smartDecision ? { smartDecision } : {}),
             },
           });
           return;
@@ -689,6 +756,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
               ? ((await callInternalApi("quota/describe").catch(() => ({ quotas: {} }))) as { quotas?: Record<string, unknown> })
               : undefined;
           const doc = storage.readModeState();
+          const smartDecision = smartDecisionOf(doc, sessionId);
           const addr = server.address();
           const boundPort = typeof addr === "object" && addr ? addr.port : requestedPort;
 
@@ -707,15 +775,23 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
                 mode: storage.getEffectiveSessionMode(sessionId),
                 globalMode: doc.globalMode,
                 available: searchProvider?.available() ?? false,
+                ...(smartDecision ? { smartDecision } : {}),
               },
               config: {
                 enabled: configView.enabled,
                 defaultProvider: configView.defaultProvider,
                 fallbackOrder: configView.fallbackOrder,
+                fetchOrder: configView.fetchOrder,
                 searchRoutingPolicy: configView.searchRoutingPolicy,
                 providerAttemptTimeoutMs: configView.providerAttemptTimeoutMs,
                 platformEnabled: configView.platformEnabled,
+                smartSearch: configView.smartSearch,
+                smartSearchConfigured: configView.smartSearchConfigured,
+                exemptWhenNoProvider: configView.exemptWhenNoProvider,
+                recognizeExternalWebTools: configView.recognizeExternalWebTools,
+                requiredEvidence: configView.requiredEvidence,
               },
+              lastSmartDecision: smartDecision,
               providers: configView.providers,
               platforms: platformStatus.platforms ?? {},
               ...(quotaView ? { quotas: quotaView.quotas } : {}),
@@ -745,6 +821,13 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
 
       writeJson(res, 404, { ok: false, error: { code: "not-found", message: `Not found: ${pathname}` } });
     } catch (err) {
+      // A handler may have already sent headers (e.g. an error thrown after
+      // writeHead); writing another response would throw ERR_HTTP_HEADERS_SENT
+      // and crash the daemon as an unhandled rejection.
+      if (res.headersSent) {
+        res.destroy(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
       writeJson(res, 500, {
         ok: false,
         error: { code: "internal", message: err instanceof Error ? err.message : String(err) },

@@ -95,11 +95,13 @@ export function apply(ctx: any) {
       menuLabel: t("searchModeMenuLabel"),
       labels: {
         auto: t("searchModeAuto"),
+        smart: t("searchModeSmart"),
         required: t("searchModeRequired"),
         off: t("searchModeOff"),
       },
       descriptions: {
         auto: t("searchModeAutoDesc"),
+        smart: t("searchModeSmartDesc"),
         required: t("searchModeRequiredDesc"),
         off: t("searchModeOffDesc"),
       },

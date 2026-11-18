@@ -2,7 +2,7 @@
  * dsh-web-tools — Search Mode selector styles.
  *
  * A single lightweight trigger plus a popover menu, the way composer tool
- * pickers usually look: one compact control, three named modes, no per-state
+ * pickers usually look: one compact control, four named modes, no per-state
  * button chrome. DSH client plugins inject their own CSS at runtime (a
  * `<style>` tag with a stable id, HMR-safe) instead of emitting a separate
  * `.css` bundle — the web shell only loads the single `client.js`.
@@ -47,8 +47,14 @@ const CSS = `
 .wt-sm-trigger:focus-visible {
   box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);
 }
-/* "always search" is the one non-default mode that behaves differently for
-   every turn, so it gets the light blue treatment instead of plain text. */
+.wt-sm-trigger[data-mode="smart"] {
+  color: var(--dsw-alias-state-success-primary);
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 10%, transparent);
+}
+.wt-sm-trigger[data-mode="smart"]:hover:not(:disabled),
+.wt-sm-trigger[data-mode="smart"][data-open="true"] {
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 16%, transparent);
+}
 .wt-sm-trigger[data-mode="required"] {
   background: transparent;
   color: var(--dsw-alias-state-business-primary);
@@ -142,6 +148,9 @@ const CSS = `
   justify-content: center;
   height: 20px;
   color: var(--dsw-alias-label-secondary);
+}
+.wt-sm-item[data-mode="smart"] .wt-sm-item-icon {
+  color: var(--dsw-alias-state-success-primary);
 }
 .wt-sm-item[data-mode="required"] .wt-sm-item-icon {
   color: var(--dsw-alias-state-business-primary);

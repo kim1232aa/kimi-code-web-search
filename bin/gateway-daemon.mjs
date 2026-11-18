@@ -142,6 +142,15 @@ export async function ensureGatewayDaemon(host = DEFAULT_HOST, port = DEFAULT_PO
   const dataDir = getWebToolsDir();
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const logPath = path.join(dataDir, "gateway.log");
+  // Rotate the daemon log once it exceeds 10MB so it cannot grow unbounded.
+  try {
+    const stat = fs.statSync(logPath);
+    if (stat.size > 10 * 1024 * 1024) {
+      fs.renameSync(logPath, `${logPath}.1`);
+    }
+  } catch {
+    // Missing log file is the normal first-run case.
+  }
   const outFd = fs.openSync(logPath, "a");
 
   const compiledEntry = path.join(PROJECT_ROOT, "lib", "host", "gateway-server.js");
@@ -175,6 +184,11 @@ export async function ensureGatewayDaemon(host = DEFAULT_HOST, port = DEFAULT_PO
     const ready = await checkGatewayHealth(host, port);
     if (ready) return { status: "spawned", ...ready };
     if (child.exitCode !== null || child.signalCode !== null) {
+      // Concurrent starters race for the port; our child may have lost the
+      // bind (EADDRINUSE) while the winner is already healthy. Re-check once
+      // before failing so a concurrent ensure does not surface as an error.
+      const winner = await checkGatewayHealth(host, port);
+      if (winner) return { status: "spawned", ...winner };
       throw new Error(`Gateway exited before becoming healthy (exit code ${child.exitCode}, signal ${child.signalCode}); log: ${logPath}`);
     }
   }
@@ -182,20 +196,80 @@ export async function ensureGatewayDaemon(host = DEFAULT_HOST, port = DEFAULT_PO
   throw new Error(`Gateway daemon failed to become healthy on http://${host}:${port} within 8s; log: ${logPath}`);
 }
 
-async function stopGatewayDaemon() {
-  const saved = readGatewayJson();
-  if (saved?.pid) {
-    try {
-      process.kill(saved.pid, "SIGTERM");
-    } catch {}
-  }
+function removeGatewayJson() {
   const gwPath = getGatewayJsonPath();
   if (fs.existsSync(gwPath)) {
     try {
       fs.unlinkSync(gwPath);
     } catch {}
   }
-  return { status: "stopped", pid: saved?.pid ?? null };
+}
+
+async function stopGatewayDaemon() {
+  const saved = readGatewayJson();
+  const pid = saved?.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 1) {
+    removeGatewayJson();
+    return { status: "stopped", pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null };
+  }
+
+  // Verify identity before signaling: the saved PID may belong to a recycled
+  // unrelated process. Confirm via the health endpoint's PID, or on Linux via
+  // /proc/<pid>/cmdline mentioning gateway-daemon.mjs.
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    if (err?.code === "ESRCH") {
+      // The recorded process is already gone; the state file is stale.
+      removeGatewayJson();
+      return { status: "stopped", pid };
+    }
+  }
+  // A gateway can never be this stop CLI process itself; /proc/<pid>/cmdline
+  // would match gateway-daemon.mjs and "verify" the wrong process.
+  let verified = pid !== process.pid;
+  if (verified) {
+    const health = await checkGatewayHealth(saved?.host || DEFAULT_HOST, saved?.port || DEFAULT_PORT);
+    verified = health?.pid === pid;
+    if (!verified && process.platform !== "win32") {
+      try {
+        verified = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").includes("gateway-daemon.mjs");
+      } catch {}
+    }
+  }
+  if (!verified) {
+    // Never signal a live process we cannot confirm is ours; keep the state
+    // file for diagnosis.
+    return { status: "unverified", pid };
+  }
+
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (err) {
+    if (err?.code !== "ESRCH") return { status: "error", pid, error: err?.message };
+    removeGatewayJson();
+    return { status: "stopped", pid };
+  }
+  // Wait for a graceful exit before removing the state file; escalate to
+  // SIGKILL after the grace window.
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (err) {
+      if (err?.code === "ESRCH") {
+        removeGatewayJson();
+        return { status: "stopped", pid };
+      }
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {}
+  removeGatewayJson();
+  return { status: "stopped", pid, forced: true };
 }
 
 async function main() {

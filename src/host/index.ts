@@ -16,7 +16,8 @@ import { createSearchProvider, createFetchProvider, createPoolStore, PROVIDER_ID
 import { registerRoutes } from "./routes.ts";
 import { Stats } from "./stats.ts";
 import { CURRENT_VERSION, compareVersions } from "../shared/version.ts";
-import type { VersionCheckView } from "../shared/api-types.ts";
+import type { SearchMode, VersionCheckView } from "../shared/api-types.ts";
+import { importFromPi } from "./pi-import.ts";
 import { buildPool, selectIndex, markUsed, markUnhealthy, resetHealth } from "./pool.ts";
 import { credRefOf, getProvider, PROVIDER_LIST, quotaOf } from "./providers/index.ts";
 import { seedBraveQuota, setBraveQuotaPersist } from "./providers/brave.ts";
@@ -113,6 +114,19 @@ export function toRoutedFetchResponse(url: string, outcome: SourceFetchOutcome) 
     body: { kind: "text" as const, content },
     truncated: false,
   };
+}
+
+/**
+ * Web engines must not receive raw platform routing markers ("X:", "小红书:").
+ * `cleanQuery` also drops explicit `site:` operators, so those are re-attached.
+ */
+function withoutPlatformMarker(query: string, hints: ReturnType<typeof extractSearchHints>): string {
+  if (!hints.platform || !hints.cleanQuery || hints.cleanQuery === hints.rawQuery) return query;
+  const operators = [
+    ...(hints.domains?.include ?? []).map((domain) => `site:${domain}`),
+    ...(hints.domains?.exclude ?? []).map((domain) => `-site:${domain}`),
+  ];
+  return [hints.cleanQuery, ...operators].join(" ");
 }
 
 /** Release lookup is best-effort: startup and settings must work offline. */
@@ -222,6 +236,7 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
       defaultProvider: cfg.defaultProvider,
       providerAttemptTimeoutMs: cfg.providerAttemptTimeoutMs,
       fallbackOrder: cfg.fallbackOrder,
+      fetchOrder: cfg.fetchOrder,
       searchRoutingPolicy: cfg.searchRoutingPolicy,
       providerBaseUrls: cfg.providerBaseUrls,
       enabledProviders: cfg.providerEnabled,
@@ -316,10 +331,19 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
   const routedSearchProvider = {
     id: PROVIDER_ID,
     available: () => generalSearchProvider.available(),
-    search: async (request: { query: string; maxResults?: number }, signal?: AbortSignal) => {
+    search: async (request: { query: string; maxResults?: number; provider?: string }, signal?: AbortSignal) => {
+      const requestedProvider = typeof request.provider === "string" ? request.provider.trim().toLowerCase() : "";
+      const hints = extractSearchHints(request.query);
+      const explicitPlatform = requestedProvider === "xiaohongshu" || requestedProvider === "x" ? requestedProvider : undefined;
+      if (requestedProvider && !explicitPlatform) {
+        return generalSearchProvider.search({ ...request, query: withoutPlatformMarker(request.query, hints) }, signal);
+      }
       const outcome = await sourceRegistry.search(
         request.query,
-        { maxResults: request.maxResults, hints: extractSearchHints(request.query) },
+        {
+          maxResults: request.maxResults,
+          hints: explicitPlatform ? { ...hints, platform: explicitPlatform, platformExplicit: true } : hints,
+        },
         signal,
       );
       if (outcome.error) {
@@ -587,7 +611,7 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
   // The routes expose the same runtime map to the button / slash commands.
   const searchMode = {
     view: (sessionId: string) => searchModeRuntime.view(sessionId),
-    set: (sessionId: string, mode: "auto" | "required" | "off") => {
+    set: (sessionId: string, mode: SearchMode) => {
       searchModeRuntime.setMode(sessionId, mode);
       return searchModeRuntime.view(sessionId);
     },
@@ -836,6 +860,23 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
         testSource,
         revokeSourceCredentials: (sourceId) => revokeSourceCredentials(sourceId),
         forgetSource: (sourceId) => forgetSource(sourceId),
+        importPi: () =>
+          importFromPi({
+            readConfig: () => readConfig() as unknown as Record<string, unknown>,
+            writeConfig: async (patch) => {
+              await configHandle.write(patch as Partial<WebToolsSettings>);
+              syncGlobalOutboundAuthorizations();
+            },
+            readCredential: async (ref) => {
+              // Local-only read: an env-sourced secret must never be merged
+              // into the on-disk credential store by the import (mirrors
+              // bin/import-pi.mjs).
+              const resolved = await readCredential(ctx, ref);
+              return { value: resolved.source === "local" ? resolved.value : undefined };
+            },
+            writeCredential: (ref, value) => writeCredential(ctx, ref, value),
+            setGlobalMode: (mode) => searchModeRuntime.setMode("global", mode),
+          }),
       }),
     "dsh-web-tools: /web-tools/api routes",
   );

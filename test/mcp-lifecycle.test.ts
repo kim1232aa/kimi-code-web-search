@@ -197,10 +197,69 @@ test("a live lock is not stolen just because it is old", (t) => {
   assert.equal(fs.readFileSync(lock, "utf8"), String(process.pid));
 });
 
+test("an unowned empty lock is reclaimed only after the grace period", (t) => {
+  const home = fixture(t);
+  const dir = path.join(home, "web-tools");
+  fs.mkdirSync(dir);
+  const statePath = path.join(dir, "mode-state.json");
+  fs.writeFileSync(statePath, JSON.stringify({ globalMode: "auto", sessions: {}, updatedAt: 0 }));
+
+  const lock = `${statePath}.lock`;
+  fs.writeFileSync(lock, "");
+  const fresh = spawnSync(process.execPath, [path.join(root, "hooks/user-prompt-submit.mjs")], {
+    env: { ...process.env, KIMI_CODE_HOME: home }, input: '{"session_id":"fresh"}', encoding: "utf8",
+  });
+  assert.equal(fresh.status, 2, "a fresh empty lock may still be mid-creation");
+  assert.match(fresh.stderr, /Timed out/);
+  assert.equal(fs.existsSync(lock), true);
+
+  fs.utimesSync(lock, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+  const stale = spawnSync(process.execPath, [path.join(root, "hooks/user-prompt-submit.mjs")], {
+    env: { ...process.env, KIMI_CODE_HOME: home }, input: '{"session_id":"stale"}', encoding: "utf8",
+  });
+  assert.equal(stale.status, 0, stale.stderr);
+  assert.equal(fs.existsSync(lock), false, "an old unowned empty lock must be reclaimed");
+  const doc = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(doc.sessions["stale"].turn.turn, 1);
+});
+
+test("stop refuses to signal an unverified live PID and keeps the state file", async (t) => {
+  const home = fixture(t);
+  const dir = path.join(home, "web-tools");
+  fs.mkdirSync(dir, { recursive: true });
+  // gateway.json pointing at a live, unrelated process (this test process):
+  // no health endpoint answers this port and its cmdline is not the gateway.
+  const gwPath = path.join(dir, "gateway.json");
+  fs.writeFileSync(gwPath, JSON.stringify({ pid: process.pid, host: "127.0.0.1", port: 1 }));
+  const result = await runNode(["bin/gateway-daemon.mjs", "stop"], { ...process.env, KIMI_CODE_HOME: home });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, "unverified");
+  assert.equal(fs.existsSync(gwPath), true, "an unverified state file is kept for diagnosis");
+  assert.doesNotThrow(() => process.kill(process.pid, 0), "the unrelated process must not have been signaled");
+});
+
+test("stop cleans the state file when the recorded PID is already dead", async (t) => {
+  const home = fixture(t);
+  const dir = path.join(home, "web-tools");
+  fs.mkdirSync(dir, { recursive: true });
+  const dead = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  const pid = dead.pid!;
+  await once(dead, "exit");
+  const gwPath = path.join(dir, "gateway.json");
+  fs.writeFileSync(gwPath, JSON.stringify({ pid, host: "127.0.0.1", port: 1 }));
+  const result = await runNode(["bin/gateway-daemon.mjs", "stop"], { ...process.env, KIMI_CODE_HOME: home });
+  assert.equal(result.code, 0, result.stderr);
+  const res = JSON.parse(result.stdout);
+  assert.equal(res.status, "stopped");
+  assert.equal(res.pid, pid);
+  assert.equal(fs.existsSync(gwPath), false);
+});
+
 test("gateway requires explicit current-turn binding without borrowing another session", async (t) => {
   const home = fixture(t);
   const handle = await startGatewayServer({ host: "127.0.0.1", port: 0, baseDir: path.join(home, "web-tools"), projectRoot: root });
   t.after(() => handle.close());
+  handle.storage.setCredential("WEB_TOOLS_EXA", "test-exa-key");
   handle.storage.setSessionMode("global", "required");
   const env = { ...process.env, KIMI_CODE_HOME: home, KIMI_WEB_TOOLS_PORT: String(handle.port) };
   for (const session_id of ["session-a", "session-b"]) {

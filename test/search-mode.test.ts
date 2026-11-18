@@ -1,4 +1,4 @@
-﻿/**
+/**
  * dsh-web-tools — Search Mode runtime state model tests (pure, no DSH/pnpm).
  *
  * Covers the behavior table demanded by the "联网搜索" feature: auto leaves the
@@ -266,10 +266,60 @@ test("a disabled turn is never corrected at turn-stopping", () => {
   assert.equal(webResearchCompleted(turn), false);
 });
 
-test("nextSearchMode cycles auto -> required -> off -> auto", () => {
-  assert.equal(nextSearchMode("auto"), "required");
+test("nextSearchMode cycles auto -> smart -> required -> off -> auto", () => {
+  assert.equal(nextSearchMode("auto"), "smart");
+  assert.equal(nextSearchMode("smart"), "required");
   assert.equal(nextSearchMode("required"), "off");
   assert.equal(nextSearchMode("off"), "auto");
+});
+
+test("smart mode persists without requiring research before classification", () => {
+  const r = runtime();
+  r.setMode("s-smart", "smart");
+  assert.equal(r.getMode("s-smart"), "smart");
+  assert.deepEqual(r.view("s-smart"), { mode: "smart", available: true });
+  assert.equal(r.isOff("s-smart"), false);
+  const turn = r.beginTurn("s-smart", 1);
+  assert.equal(turn.required, false);
+  assert.equal(turn.disabled, false);
+  assert.equal(webResearchCompleted(turn), false);
+  r.setMode("s-smart", "required");
+  assert.equal(r.beginTurn("s-smart", 1).required, false, "the in-flight policy stays frozen");
+  assert.equal(r.beginTurn("s-smart", 2).required, true);
+});
+
+test("smart message is a snapshot explaining optional research and evidence limits", () => {
+  const { calls, createUserMessage } = captureFactory();
+  const messages = createSearchModeMessages(createUserMessage);
+  assert.equal(typeof messages.smart, "function");
+  messages.smart!();
+  assert.equal(calls.length, 1);
+  const input = calls[0];
+  assert.match(input.content[0].text, /Smart/i);
+  assert.match(input.content[0].text, /does not require web research/i);
+  assert.match(input.content[0].text, /web_search/);
+  assert.match(input.content[0].text, /web_fetch/);
+  assert.match(input.content[0].text, /Do not claim web verification/i);
+  assert.equal(input.source.form, "snapshot");
+  assert.equal(input.source.sections[0].name, "web-search-mode");
+  assert.equal(input.source.sections[0].text, input.content[0].text);
+});
+
+test("smart turn step 1 selects optional or required policy from its frozen decision", () => {
+  const messages = createSearchModeMessages((input) => input);
+  const optional = turnState({ required: false, smartEscalated: false });
+  const optionalMessage = searchModeStepMessage(optional, 1, messages) as {
+    content: Array<{ text: string }>;
+  };
+  assert.match(optionalMessage.content[0].text, /Smart/i);
+  assert.equal(searchModeStepMessage(optional, 2, messages), undefined);
+
+  const escalated = turnState({ required: true, smartEscalated: true });
+  const requiredMessage = searchModeStepMessage(escalated, 1, messages) as {
+    content: Array<{ text: string }>;
+  };
+  assert.equal(requiredMessage.content[0].text, REQUIRED_SEARCH_TEXT);
+  assert.equal(searchModeStepMessage(escalated, 2, messages), undefined);
 });
 
 

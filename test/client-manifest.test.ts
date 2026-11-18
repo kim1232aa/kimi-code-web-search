@@ -4,8 +4,8 @@
  * Verifies:
  *  - `package.json` declares `kimi-web-tools` v0.4.0 (`type: "module"`) with zero
  *    `@deepseek-ai/*` dependencies or peerDependencies.
- *  - `kimi.plugin.json` declares the `web` MCP server (`./bin/mcp-server.mjs`),
- *    the three lifecycle hooks (`UserPromptSubmit`, `PreToolUse`, `Stop`),
+ *  - `kimi.plugin.json` declares the `s` MCP server (`./bin/mcp-server.mjs`) under plugin `web`,
+ *    the lifecycle hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`),
  *    `./commands/`, `./skills/`, and `./SYSTEM.md`.
  *  - `dist/client/app.js` (once built) is completely self-contained and never
  *    references `@deepseek-ai/*`.
@@ -46,16 +46,96 @@ test("package.json declares kimi-web-tools 0.4.0 with zero @deepseek-ai/* depend
 
 test("kimi.plugin.json declares MCP server, hooks, commands, skills, and SYSTEM.md", () => {
   const manifest = readPluginManifest();
-  assert.equal(manifest.name, "kimi-web-tools");
+  assert.equal(manifest.name, "web");
   assert.equal(manifest.version, "0.4.0");
   assert.equal(manifest.skills, "./skills/");
   assert.equal(manifest.commands, "./commands/");
   assert.equal(manifest.systemPromptPath, "./SYSTEM.md");
-  assert.equal(manifest.mcpServers?.web?.command, "node");
-  assert.deepEqual(manifest.mcpServers?.web?.args, ["./bin/mcp-server.mjs"]);
+  assert.equal(manifest.mcpServers?.s?.command, "node");
+  assert.deepEqual(manifest.mcpServers?.s?.args, ["./bin/mcp-server.mjs"]);
+
+  const preHook = (manifest.hooks ?? []).find((h: any) => h.event === "PreToolUse");
+  assert.ok(preHook, "missing PreToolUse hook");
+  const preRe = new RegExp(preHook.matcher);
+  for (const name of [
+    "web_search",
+    "web_fetch",
+    "mcp__plugin-web_s__web_search",
+    "mcp__plugin-web_s__web_fetch",
+    "mcp__plugin-kimi-web-tools_web__web_search",
+  ]) {
+    assert.ok(preRe.test(name), `PreToolUse matcher must match ${name}`);
+  }
+  for (const name of ["mcp__plugin-web_s__web_mode", "mcp__plugin-web_s__web_status", "FetchURL", "Read"]) {
+    assert.ok(!preRe.test(name), `PreToolUse matcher must skip ${name}`);
+  }
 
   const events = (manifest.hooks ?? []).map((h: any) => h.event);
-  assert.deepEqual(events, ["UserPromptSubmit", "PreToolUse", "Stop"]);
+  assert.deepEqual(events, [
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "SubagentStart",
+    "SubagentStop",
+    "TurnStarted",
+    "SessionEnd",
+    "Stop",
+  ]);
+});
+
+test("PostToolUse prefilter covers every recognized web tool and skips local tools", () => {
+  const manifest = readPluginManifest();
+  for (const event of ["PostToolUse", "PostToolUseFailure"]) {
+    const hook = (manifest.hooks ?? []).find((h: any) => h.event === event);
+    assert.ok(hook, `missing ${event} hook`);
+    assert.equal(typeof hook.matcher, "string", `${event} must declare a matcher to avoid spawning a process per tool call`);
+    const re = new RegExp(hook.matcher);
+    for (const name of [
+      // this plugin's own MCP tools
+      "web_search",
+      "web_fetch",
+      "mcp__plugin-web_s__web_search",
+      "mcp__plugin-web_s__web_fetch",
+      "mcp__plugin-kimi-web-tools_web__web_search",
+      "mcp__plugin-kimi-web-tools_web__web_fetch",
+      // Kimi built-ins
+      "FetchURL",
+      "WebSearch",
+      // exact external names recognized by the receipt hook
+      "SearchWeb",
+      "websearch",
+      "webfetch",
+      "search_web",
+      "fetch_web",
+      "fetch_content",
+      "fetch_url",
+      "fetch_urls",
+      "fetch_markdown",
+      "fetch_webpage",
+      "read_url",
+      "read_website",
+      "web_url_read",
+      "source_check",
+      "get_page_text",
+      // MCP proxies and vendor tools
+      "mcp",
+      "mcp__agy_websearch",
+      "tavily-search",
+      "firecrawl_scrape",
+      "brave_web_search",
+      "mcp__exa__web_search_exa",
+      "mcp__perplexity__perplexity_ask",
+      "mcp__fetch__fetch",
+      "mcp__serpapi__search",
+      "agy-websearch_search_web",
+    ]) {
+      assert.ok(re.test(name), `${event} matcher must match ${name}`);
+    }
+    for (const name of ["Read", "Edit", "Write", "Glob", "Grep", "Bash", "TodoList", "TaskList", "TaskOutput", "NotifyUser", "Skill", "Agent", "CronCreate", "WaitFor"]) {
+      assert.ok(!re.test(name), `${event} matcher must skip local tool ${name}`);
+    }
+  }
 });
 
 test("built dist/client/app.js never references @deepseek-ai/* packages", () => {

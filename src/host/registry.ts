@@ -10,7 +10,7 @@
  */
 import { classifyFailure, fallbackChain } from "./fallback.ts";
 import { resolveSearchChain, type SearchRoutingPolicy, type SearchRoutingState } from "./routing-policy.ts";
-import { buildPool, markUnhealthy, markUsed, reserveKey, releaseKey, selectIndex, PoolEntry } from "./pool.ts";
+import { buildPool, markUnhealthy, markUsed, reserveKey, releaseKey, resetHealth, selectIndex, PoolEntry } from "./pool.ts";
 import { PROVIDERS } from "./providers/index.ts";
 import type { ProviderError, ProviderErrorCode } from "./providers/types.ts";
 import { isKeylessSelfHosted } from "./providers/types.ts";
@@ -27,7 +27,7 @@ export const PROVIDER_ID = "dsh-web-tools";
 export interface WebSearchProviderLike {
   id: string;
   available(): boolean;
-  search(request: { query: string; maxResults?: number }, signal?: AbortSignal): Promise<{
+  search(request: { query: string; maxResults?: number; provider?: string }, signal?: AbortSignal): Promise<{
     content?: string;
     sources: Array<{ url: string; title?: string; snippet?: string; publishedAt?: string }>;
     truncated: boolean;
@@ -66,6 +66,8 @@ export interface WebToolsRuntimeConfig {
   /** Per-attempt budget for ONE provider call (the DSH tool owns the overall timeout). */
   providerAttemptTimeoutMs: number;
   fallbackOrder: string[];
+  /** Optional dedicated fetch provider chain (may include `"http"` / `"builtin-http"`). */
+  fetchOrder?: string[];
   /** Search routing policy — how the runtime picks the starting provider per query. */
   searchRoutingPolicy?: SearchRoutingPolicy;
   providerBaseUrls: Record<string, string>;
@@ -131,6 +133,34 @@ export function createPoolStore(resolveKeys: (providerName: string) => Promise<s
 
 export type PoolStore = ReturnType<typeof createPoolStore>;
 
+/**
+ * Backoff state for pool health self-heal, keyed by pool store so the search
+ * and fetch providers sharing one store share one backoff per provider.
+ */
+const poolResetState = new WeakMap<PoolStore, Map<string, number>>();
+const POOL_RESET_BACKOFF_MS = 60_000;
+
+/**
+ * When every key in a pool is unhealthy, reset the pool at most once per
+ * backoff window: a genuinely invalid key is not retried on every request,
+ * while a transient auth glitch (CDN/WAF 403 misclassified as auth) self-heals
+ * within a minute instead of disabling the provider until a manual probe.
+ */
+export function selfHealPool(pools: PoolStore, providerName: string, entries: PoolEntry[]): boolean {
+  if (entries.some((e) => e.healthy)) return false;
+  let byProvider = poolResetState.get(pools);
+  if (!byProvider) {
+    byProvider = new Map();
+    poolResetState.set(pools, byProvider);
+  }
+  const now = Date.now();
+  const last = byProvider.get(providerName) ?? 0;
+  if (now - last < POOL_RESET_BACKOFF_MS) return false;
+  byProvider.set(providerName, now);
+  resetHealth(entries);
+  return true;
+}
+
 /** Structural subset of a provider adapter the executor needs (injectable). */
 export interface ProviderAdapterLike {
   name: string;
@@ -161,6 +191,15 @@ export function createSearchProvider(
 ): WebSearchProviderLike {
   const pools = poolStore ?? createPoolStore(resolveKeys);
   const routingState: SearchRoutingState = { nextRoundRobinIndex: 0 };
+
+  /**
+   * Coalesce identical concurrent searches so duplicate tool calls (for example
+   * two subagents asking the same question) do not double-bill providers.
+   * Only overlapping calls share a promise; once it settles, the next call
+   * runs a fresh search, so result freshness is unchanged. The initiating
+   * caller's AbortSignal governs the shared upstream attempt.
+   */
+  const inflightSearches = new Map<string, ReturnType<WebSearchProviderLike["search"]>>();
 
   /** Adapter for one source id, preferring the live snapshot. */
   const adapterFor = (sourceId: string, snapshot?: ProviderSnapshot): ProviderAdapterLike | undefined => {
@@ -206,158 +245,183 @@ export function createSearchProvider(
       });
     },
 
-    async search(request: { query: string; maxResults?: number }, signal?: AbortSignal) {
-      const cfg = resolveConfig();
-      if (!cfg.enabled) throw new WebToolsWebError("web search is disabled");
-      // ONE snapshot for the whole request (see the doc comment above).
-      const snapshot = resolveSnapshot?.();
-      // maxResults is owned by the DSH tool layer (it always passes its own);
-      // the plugin does not override it.
-      const maxResults = request.maxResults;
-      const baseChain = fallbackChain({
-        defaultProvider: cfg.defaultProvider,
-        fallbackOrder: cfg.fallbackOrder,
-      });
-      const chain = resolveSearchChain(
-        baseChain,
-        cfg.searchRoutingPolicy ?? "ordered",
-        routingState,
-      );
-
-      const attempts: Array<{ provider: string; outcome: string; latencyMs?: number }> = [];
-      let lastError: ProviderError | undefined;
-      const searchHints = extractSearchHints(request.query);
-
-      for (const providerName of chain) {
-        if (cfg.enabledProviders[providerName] === false) continue;
-        const entryInfo: CatalogEntry | undefined = snapshot?.get(providerName);
-        if (entryInfo?.config && entryInfo.config.enabled === false) {
-          attempts.push({ provider: providerName, outcome: "skipped-disabled" });
-          continue;
-        }
-        const adapter = adapterFor(providerName, snapshot);
-        if (!adapter) {
-          attempts.push({ provider: providerName, outcome: "skipped-no-adapter" });
-          continue;
-        }
-        let entries = await pools.poolOf(providerName);
-        const keyless = keylessOf(providerName, adapter, snapshot);
-        if (entries.length === 0 && keyless) {
-          // Keyless sources (self-hosted SearXNG, or a custom source with auth
-          // mode "none") execute with an empty key.
-          entries = [new PoolEntry("", 0)];
-        } else if (entries.length === 0) {
-          attempts.push({ provider: providerName, outcome: "skipped-no-keys" });
-          continue;
-        }
-
-        // Auth-invalid keys stay unhealthy until the credential actually
-        // changes (refreshPool preserves healthy=false for persisted keys).
-        // If the whole pool is unusable, skip this provider — do NOT reset.
-        let usable = entries.filter((e) => e.healthy);
-        if (usable.length === 0) {
-          attempts.push({ provider: providerName, outcome: "skipped-no-healthy-keys" });
-          continue;
-        }
-
-        // Provider-level cooldown (Retry-After). The store uses its own clock
-        // (injectable for tests) — zero HTTP when cooling down.
-        if (healthStore?.isCoolingDown(providerName)) {
-          attempts.push({ provider: providerName, outcome: "skipped-cooldown" });
-          continue;
-        }
-
-        // Provider-internal key failover: on AUTH failures only, try the next
-        // healthy key in the SAME provider before falling back to another
-        // provider. Non-auth failures (429/5xx/network/timeout) do not rotate
-        // keys — they fall through to the next provider directly.
-        let providerLevelDecision: "next-provider" | "break" | "terminal" | null = null;
-        // Base URL from the request snapshot, so an override edit mid-request
-        // cannot make one attempt dial a different host than another.
-        const searchBaseUrl = entryInfo?.builtIn
-          ? entryInfo.endpoint?.effectiveBaseUrl
-          : cfg.providerBaseUrls[providerName];
-        while (usable.length > 0) {
-          const index = selectIndex(entries);
-          const entry = entries[index];
-          if (entry) reserveKey(entries, index);
-          const started = Date.now();
-          const providerOptions = cfg.providerOptions?.[providerName as keyof StoredProviderOptions];
-          try {
-            const outcome = await runWithTimeout(
-              (s) =>
-                adapter.search(request.query, maxResults, entry?.key ?? "", searchBaseUrl, {
-                  signal: s,
-                  options: providerOptions,
-                  hints: searchHints,
-                }),
-              cfg.providerAttemptTimeoutMs,
-              signal,
-            );
-            if (entry) markUsed(entries, index);
-            const latencyMs = Date.now() - started;
-            attempts.push({ provider: providerName, outcome: "success", latencyMs });
-            stats.record({ provider: providerName, outcome: "success", latencyMs });
-            return {
-              ...outcome,
-              truncated: false,
-              attempts,
-              backend: providerName,
-            };
-          } catch (error) {
-            const err = toProviderError(error);
-            const latencyMs = Date.now() - started;
-            const decision = classifyFailure(err);
-            // Caller cancellation terminates the whole chain — never fall back.
-            if (decision === "terminal") {
-              providerLevelDecision = "terminal";
-              lastError = err;
-              attempts.push({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
-              stats.record({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
-              break;
-            }
-            if (decision === "non-retryable") {
-              providerLevelDecision = "break";
-              lastError = err;
-              attempts.push({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
-              stats.record({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
-              break;
-            }
-            // retryable:
-            if (err.code === "auth") {
-              // key indicted → mark unhealthy, try the next key in this pool
-              markUnhealthy(entries, index);
-              attempts.push({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
-              stats.record({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
-              usable = entries.filter((e) => e.healthy);
-              continue;
-            }
-            // non-auth retryable (429/5xx/network/timeout) → next provider
-            lastError = err;
-            // Only rate-limit errors carry a server-requested cooldown.
-            if (err.code === "rate-limit" && typeof err.retryAfterMs === "number" && err.retryAfterMs > 0) {
-              healthStore?.cooldownFor(providerName, err.retryAfterMs, "rate-limit");
-            }
-            attempts.push({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
-            stats.record({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
-            providerLevelDecision = "next-provider";
-            break;
-          } finally {
-            if (entry) releaseKey(entries, index);
+    async search(request: { query: string; maxResults?: number; provider?: string }, signal?: AbortSignal) {
+      const inflightKey = `${request.provider ?? ""}\u0000${request.maxResults ?? ""}\u0000${request.query}`;
+      const shared = inflightSearches.get(inflightKey);
+      if (shared !== undefined) return shared;
+      const pending = (async () => {
+        const cfg = resolveConfig();
+        if (!cfg.enabled) throw new WebToolsWebError("web search is disabled");
+        // ONE snapshot for the whole request (see the doc comment above).
+        const snapshot = resolveSnapshot?.();
+        // maxResults is owned by the DSH tool layer (it always passes its own);
+        // the plugin does not override it.
+        const maxResults = request.maxResults;
+        const baseChain = fallbackChain({
+          defaultProvider: cfg.defaultProvider,
+          fallbackOrder: cfg.fallbackOrder,
+        });
+        let chain = resolveSearchChain(
+          baseChain,
+          cfg.searchRoutingPolicy ?? "ordered",
+          routingState,
+        );
+        const requested = typeof request.provider === "string" ? request.provider.trim().toLowerCase() : "";
+        if (requested) {
+          if (!adapterFor(requested, snapshot)) {
+            throw new WebToolsWebError(`Unknown search provider: "${requested}"`);
           }
+          if (cfg.enabledProviders[requested] === false || snapshot?.get(requested)?.config?.enabled === false) {
+            throw new WebToolsWebError(`Search provider "${requested}" is disabled`);
+          }
+          chain = [requested, ...chain.filter((name) => name !== requested)];
         }
 
-        if (providerLevelDecision === "terminal") throw toWebError(lastError);
-        if (providerLevelDecision === "break") break;
-        // else fall through to the next provider in the chain
-      }
+        const attempts: Array<{ provider: string; outcome: string; latencyMs?: number }> = [];
+        let lastError: ProviderError | undefined;
+        const searchHints = extractSearchHints(request.query);
 
-      const reason = lastError
-        ? `${lastError.code}: ${lastError.message}`
-        : "no usable provider";
-      const err = new WebToolsWebError(`web search failed after ${attempts.length} attempt(s): ${reason}`);
-      err.attempts = attempts;
-      throw err;
+        for (const providerName of chain) {
+          if (cfg.enabledProviders[providerName] === false) continue;
+          const entryInfo: CatalogEntry | undefined = snapshot?.get(providerName);
+          if (entryInfo?.config && entryInfo.config.enabled === false) {
+            attempts.push({ provider: providerName, outcome: "skipped-disabled" });
+            continue;
+          }
+          const adapter = adapterFor(providerName, snapshot);
+          if (!adapter) {
+            attempts.push({ provider: providerName, outcome: "skipped-no-adapter" });
+            continue;
+          }
+          let entries = await pools.poolOf(providerName);
+          const keyless = keylessOf(providerName, adapter, snapshot);
+          if (entries.length === 0 && keyless) {
+            // Keyless sources (self-hosted SearXNG, or a custom source with auth
+            // mode "none") execute with an empty key.
+            entries = [new PoolEntry("", 0)];
+          } else if (entries.length === 0) {
+            attempts.push({ provider: providerName, outcome: "skipped-no-keys" });
+            continue;
+          }
+
+          // Auth-invalid keys stay unhealthy until the credential actually
+          // changes (refreshPool preserves healthy=false for persisted keys).
+          // When the whole pool is unhealthy, self-heal with a per-provider
+          // backoff (see selfHealPool) instead of skipping until a manual probe.
+          let usable = entries.filter((e) => e.healthy);
+          if (usable.length === 0 && selfHealPool(pools, providerName, entries)) {
+            usable = entries.filter((e) => e.healthy);
+          }
+          if (usable.length === 0) {
+            attempts.push({ provider: providerName, outcome: "skipped-no-healthy-keys" });
+            continue;
+          }
+
+          // Provider-level cooldown (Retry-After). The store uses its own clock
+          // (injectable for tests) — zero HTTP when cooling down.
+          if (healthStore?.isCoolingDown(providerName)) {
+            attempts.push({ provider: providerName, outcome: "skipped-cooldown" });
+            continue;
+          }
+
+          // Provider-internal key failover: on AUTH failures only, try the next
+          // healthy key in the SAME provider before falling back to another
+          // provider. Non-auth failures (429/5xx/network/timeout) do not rotate
+          // keys — they fall through to the next provider directly.
+          let providerLevelDecision: "next-provider" | "break" | "terminal" | null = null;
+          // Base URL from the request snapshot, so an override edit mid-request
+          // cannot make one attempt dial a different host than another.
+          const searchBaseUrl = entryInfo?.builtIn
+            ? entryInfo.endpoint?.effectiveBaseUrl
+            : cfg.providerBaseUrls[providerName];
+          while (usable.length > 0) {
+            const index = selectIndex(entries);
+            const entry = entries[index];
+            if (entry) reserveKey(entries, index);
+            const started = Date.now();
+            const providerOptions = cfg.providerOptions?.[providerName as keyof StoredProviderOptions];
+            try {
+              const outcome = await runWithTimeout(
+                (s) =>
+                  adapter.search(request.query, maxResults, entry?.key ?? "", searchBaseUrl, {
+                    signal: s,
+                    options: providerOptions,
+                    hints: searchHints,
+                  }),
+                cfg.providerAttemptTimeoutMs,
+                signal,
+              );
+              if (entry) markUsed(entries, index);
+              const latencyMs = Date.now() - started;
+              attempts.push({ provider: providerName, outcome: "success", latencyMs });
+              stats.record({ provider: providerName, outcome: "success", latencyMs });
+              return {
+                ...outcome,
+                truncated: false,
+                attempts,
+                backend: providerName,
+              };
+            } catch (error) {
+              const err = toProviderError(error);
+              const latencyMs = Date.now() - started;
+              const decision = classifyFailure(err);
+              // Caller cancellation terminates the whole chain — never fall back.
+              if (decision === "terminal") {
+                providerLevelDecision = "terminal";
+                lastError = err;
+                attempts.push({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
+                stats.record({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
+                break;
+              }
+              if (decision === "non-retryable") {
+                providerLevelDecision = "break";
+                lastError = err;
+                attempts.push({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
+                stats.record({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
+                break;
+              }
+              // retryable:
+              if (err.code === "auth") {
+                // key indicted → mark unhealthy, try the next key in this pool
+                markUnhealthy(entries, index);
+                attempts.push({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
+                stats.record({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
+                usable = entries.filter((e) => e.healthy);
+                continue;
+              }
+              // non-auth retryable (429/5xx/network/timeout) → next provider
+              lastError = err;
+              // Only rate-limit errors carry a server-requested cooldown.
+              if (err.code === "rate-limit" && typeof err.retryAfterMs === "number" && err.retryAfterMs > 0) {
+                healthStore?.cooldownFor(providerName, err.retryAfterMs, "rate-limit");
+              }
+              attempts.push({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
+              stats.record({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
+              providerLevelDecision = "next-provider";
+              break;
+            } finally {
+              if (entry) releaseKey(entries, index);
+            }
+          }
+
+          if (providerLevelDecision === "terminal") throw toWebError(lastError);
+          if (providerLevelDecision === "break") break;
+          // else fall through to the next provider in the chain
+        }
+
+        const reason = lastError
+          ? `${lastError.code}: ${lastError.message}`
+          : "no usable provider";
+        const err = new WebToolsWebError(`web search failed after ${attempts.length} attempt(s): ${reason}`);
+        err.attempts = attempts;
+        throw err;
+      })();
+      inflightSearches.set(inflightKey, pending);
+      try {
+        return await pending;
+      } finally {
+        if (inflightSearches.get(inflightKey) === pending) inflightSearches.delete(inflightKey);
+      }
     },
   };
 }
@@ -390,124 +454,191 @@ export function createFetchProvider(
     async fetch(request: { url: string }, signal?: AbortSignal) {
       const cfg = resolveConfig();
       const snapshot = resolveSnapshot?.();
-      const chain = fallbackChain({
-        defaultProvider: cfg.defaultProvider,
-        fallbackOrder: cfg.fallbackOrder,
-      });
+      const configuredFetch = Array.isArray(cfg.fetchOrder)
+        ? cfg.fetchOrder
+            .map((name) => (typeof name === "string" ? name.trim().toLowerCase() : ""))
+            .filter(Boolean)
+            .map((name) => (name === "builtin-http" ? "http" : name))
+        : [];
+      const baseChain = configuredFetch.length > 0
+        ? configuredFetch
+        : fallbackChain({
+            defaultProvider: cfg.defaultProvider,
+            fallbackOrder: cfg.fallbackOrder,
+          }).map((name) => (name === "builtin-http" ? "http" : name));
+      const steps: string[] = [];
+      for (const name of baseChain) {
+        if (!steps.includes(name)) steps.push(name);
+      }
+      // An explicit fetch order is authoritative. Built-in HTTP is appended only
+      // to the legacy search-derived chain, preserving DSH's last-resort fallback.
+      if (configuredFetch.length === 0 && !steps.includes("http")) steps.push("http");
+
       const attempts: Array<{ provider: string; outcome: string }> = [];
       let lastNativeError: ProviderError | undefined;
-      void lastNativeError; // retained for debugging inspection if native chain fails
+      let lastGenericError: WebToolsWebError | undefined;
+      let lastExecutedError: Error | undefined;
+      let chainTerminated = false;
+      let httpAttempted = false;
+      const terminalGenericCodes = new Set(["WEB_INVALID_URL", "WEB_FETCH_BLOCKED", "WEB_ABORTED"]);
 
-      // 1. Attempt native fetch from configured, enabled, fetch-capable providers
-      for (const providerName of chain) {
+      const runBuiltinHttp = async (isFinalStep: boolean) => {
+        httpAttempted = true;
+        if (signal?.aborted) {
+          const abortErr = new WebToolsWebError("web fetch aborted by caller");
+          abortErr.code = "WEB_ABORTED";
+          abortErr.attempts = attempts;
+          throw abortErr;
+        }
+        try {
+          const res = await genericFetcher(request.url, {
+            signal,
+            timeoutMs: cfg.providerAttemptTimeoutMs,
+          });
+          attempts.push({ provider: "builtin-http", outcome: "success" });
+          return {
+            url: res.finalUrl,
+            statusCode: res.statusCode,
+            body: { kind: "text" as const, content: res.content },
+            truncated: res.truncated,
+            backend: res.backend,
+            metadata: {
+              title: res.title,
+              author: res.author,
+              publishedAt: res.publishedAt,
+              description: res.description,
+            },
+          };
+        } catch (genErr: unknown) {
+          if (genErr instanceof GenericFetchError) {
+            attempts.push({ provider: "builtin-http", outcome: `failed:${genErr.code}` });
+            const webErr = new WebToolsWebError(`web fetch failed: ${genErr.message}`);
+            webErr.code = genErr.code;
+            webErr.attempts = attempts;
+            lastExecutedError = webErr;
+            if (isFinalStep || terminalGenericCodes.has(genErr.code)) {
+              throw webErr;
+            }
+            lastGenericError = webErr;
+            return undefined;
+          }
+          attempts.push({ provider: "builtin-http", outcome: "failed:network" });
+          const fallbackErr = new WebToolsWebError(
+            `web fetch failed: ${genErr instanceof Error ? genErr.message : String(genErr)}`,
+          );
+          fallbackErr.attempts = attempts;
+          lastExecutedError = fallbackErr;
+          if (isFinalStep) throw fallbackErr;
+          lastGenericError = fallbackErr;
+          return undefined;
+        }
+      };
+
+      for (let stepIdx = 0; stepIdx < steps.length; stepIdx++) {
+        const providerName = steps[stepIdx];
+        if (providerName === "http") {
+          if (cfg.enabledProviders.http === false || cfg.enabledProviders["builtin-http"] === false) continue;
+          const result = await runBuiltinHttp(stepIdx === steps.length - 1);
+          if (result) return result;
+          continue;
+        }
         if (cfg.enabledProviders[providerName] === false) continue;
         const nativeEntry = snapshot?.get(providerName);
         if (nativeEntry?.config && nativeEntry.config.enabled === false) continue;
         const adapter = (nativeEntry?.adapter as ProviderAdapterLike | undefined) ?? adapterRegistry[providerName];
-        // Custom sources are search-only (fetchCapable=false), so they are
-        // skipped here by construction and page fetching keeps using the
-        // built-in generic fetcher below.
-        if (!adapter || !adapter.fetchCapable) continue; // not a native fetch backend, skip
+        if (!adapter || !adapter.fetchCapable) continue;
         const entries = await pools.poolOf(providerName);
-        if (entries.length === 0) continue; // no credentials for this backend
-        const usable = entries.filter((e) => e.healthy);
-        if (usable.length === 0) continue; // all keys auth-unhealthy, skip provider
-        // Provider cooldown (Retry-After): skip without HTTP call.
+        if (entries.length === 0) continue;
+        let usable = entries.filter((e) => e.healthy);
+        if (usable.length === 0 && selfHealPool(pools, providerName, entries)) {
+          usable = entries.filter((e) => e.healthy);
+        }
+        if (usable.length === 0) continue;
         if (healthStore?.isCoolingDown(providerName)) continue;
-        const index = selectIndex(entries);
-        const entry = entries[index];
-        if (entry) reserveKey(entries, index);
         const providerOptions = cfg.providerOptions?.[providerName as keyof StoredProviderOptions];
-        // Native fetch endpoints stay on the official host: the base-URL
-        // override applies to SEARCH only (see endpoints.ts), because a gateway
-        // that proxies search may not proxy extraction.
         const fetchBaseUrl = cfg.providerBaseUrls[providerName];
+        // Key failover mirrors the search path: on AUTH failures try the next
+        // healthy key in this provider's pool before moving down the chain.
+        let index = selectIndex(entries);
+        let entry = entries[index];
+        if (entry) reserveKey(entries, index);
         try {
-          const { text } = await runWithTimeout(
-            (sig) =>
-              adapter.fetch(request.url, entry?.key ?? "", fetchBaseUrl, {
-                signal: sig,
-                options: providerOptions,
-              }),
-            cfg.providerAttemptTimeoutMs,
-            signal,
-          );
-          if (entry) markUsed(entries, index);
-          attempts.push({ provider: providerName, outcome: "success" });
-          return {
-            url: request.url,
-            statusCode: 200,
-            body: { kind: "text" as const, content: text },
-            truncated: false,
-            backend: providerName,
-          };
-        } catch (error) {
-          const err = toProviderError(error);
-          if (err.code === "auth") markUnhealthy(entries, index);
-          if (err.code === "rate-limit" && typeof err.retryAfterMs === "number" && err.retryAfterMs > 0) {
-            healthStore?.cooldownFor(providerName, err.retryAfterMs, "rate-limit");
+          while (entry) {
+            try {
+              const { text } = await runWithTimeout(
+                (sig) =>
+                  adapter.fetch(request.url, entry.key, fetchBaseUrl, {
+                    signal: sig,
+                    options: providerOptions,
+                  }),
+                cfg.providerAttemptTimeoutMs,
+                signal,
+              );
+              markUsed(entries, index);
+              attempts.push({ provider: providerName, outcome: "success" });
+              return {
+                url: request.url,
+                statusCode: 200,
+                body: { kind: "text" as const, content: text },
+                truncated: false,
+                backend: providerName,
+              };
+            } catch (error) {
+              const err = toProviderError(error);
+              const decision = classifyFailure(err);
+              if (err.code !== "auth" || decision === "terminal" || decision === "non-retryable") {
+                if (err.code === "auth") markUnhealthy(entries, index);
+                if (err.code === "rate-limit" && typeof err.retryAfterMs === "number" && err.retryAfterMs > 0) {
+                  healthStore?.cooldownFor(providerName, err.retryAfterMs, "rate-limit");
+                }
+                lastNativeError = err;
+                attempts.push({ provider: providerName, outcome: `failed:${err.code}` });
+                const mappedErr = toWebError(error);
+                mappedErr.attempts = attempts;
+                lastExecutedError = mappedErr;
+                if (decision === "terminal") {
+                  throw mappedErr;
+                }
+                if (decision === "non-retryable") {
+                  chainTerminated = true;
+                  break;
+                }
+                break;
+              }
+              // auth retryable: rotate to the next healthy key in this pool
+              markUnhealthy(entries, index);
+              attempts.push({ provider: providerName, outcome: `failed:${err.code}` });
+              usable = entries.filter((e) => e.healthy);
+              releaseKey(entries, index);
+              index = selectIndex(entries);
+              entry = entries[index];
+              if (entry) reserveKey(entries, index);
+            }
           }
-          lastNativeError = err;
-          attempts.push({ provider: providerName, outcome: `failed:${err.code}` });
-          const decision = classifyFailure(err);
-          // Caller cancellation or terminal URL/SSRF errors should abort immediately without fallback
-          if (decision === "terminal") {
-            const terminalErr = toWebError(error);
-            terminalErr.attempts = attempts;
-            throw terminalErr;
-          }
-          if (decision === "non-retryable") break;
-          // retryable → try next fetch-capable provider in the chain
         } finally {
           if (entry) releaseKey(entries, index);
         }
+        // A non-retryable native failure stops the whole chain — builtin HTTP
+        // must not run after the configured providers gave a definitive no.
+        if (chainTerminated) break;
       }
 
-      // If caller aborted, do not proceed to built-in generic fetch
-      if (signal?.aborted) {
-        const abortErr = new WebToolsWebError("web fetch aborted by caller");
-        abortErr.code = "WEB_ABORTED";
-        abortErr.attempts = attempts;
-        throw abortErr;
+      if (
+        configuredFetch.length === 0 &&
+        !chainTerminated &&
+        !httpAttempted &&
+        cfg.enabledProviders.http !== false &&
+        cfg.enabledProviders["builtin-http"] !== false
+      ) {
+        const result = await runBuiltinHttp(true);
+        if (result) return result;
       }
 
-      // 2. Fallback to built-in generic HTTP fetcher (Defuddle + linkedom)
-      try {
-        const res = await genericFetcher(request.url, {
-          signal,
-          timeoutMs: cfg.providerAttemptTimeoutMs,
-        });
-        attempts.push({ provider: "builtin-http", outcome: "success" });
-        return {
-          url: res.finalUrl,
-          statusCode: res.statusCode,
-          body: { kind: "text" as const, content: res.content },
-          truncated: res.truncated,
-          backend: res.backend,
-          metadata: {
-            title: res.title,
-            author: res.author,
-            publishedAt: res.publishedAt,
-            description: res.description,
-          },
-        };
-      } catch (genErr: unknown) {
-        if (genErr instanceof GenericFetchError) {
-          attempts.push({ provider: "builtin-http", outcome: `failed:${genErr.code}` });
-          const webErr = new WebToolsWebError(
-            `web fetch failed: ${genErr.message}`,
-          );
-          webErr.code = genErr.code;
-          webErr.attempts = attempts;
-          throw webErr;
-        }
-
-        const fallbackErr = new WebToolsWebError(
-          `web fetch failed: ${genErr instanceof Error ? genErr.message : String(genErr)}`,
-        );
-        fallbackErr.attempts = attempts;
-        throw fallbackErr;
-      }
+      if (lastExecutedError) throw lastExecutedError;
+      if (lastGenericError) throw lastGenericError;
+      const finalErr = toWebError(lastNativeError ?? new Error("web fetch failed"));
+      finalErr.attempts = attempts;
+      throw finalErr;
     },
   };
 }

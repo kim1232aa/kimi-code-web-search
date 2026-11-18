@@ -162,7 +162,7 @@ const GLOBAL_SCOPE_INDICATORS = [
 
 // Country indicators (only assign country when explicitly mentioned in the query)
 const EXPLICIT_COUNTRY_PATTERNS: Array<{ re: RegExp; country: string }> = [
-  { re: /(?:美国|美股|美联储|United States|USA|\bUS\b)/i, country: "US" },
+  { re: /(?:美国|美股|美联储|United States|\bUSA\b|\bUS\b)/i, country: "US" },
   { re: /(?:中国|国内|A股|China|\bCN\b)/i, country: "CN" },
   { re: /(?:日本|日经|Japan|\bJP\b)/i, country: "JP" },
   { re: /(?:英国|United Kingdom|\bUK\b|\bGB\b)/i, country: "GB" },
