@@ -37,7 +37,7 @@
 在 Kimi Code TUI 中：
 
 ```
-/plugins install https://github.com/kim1232aa/kimi-web-tools
+/plugins install https://github.com/kim1232aa/kimi-code-web-search
 /reload
 ```
 
@@ -48,8 +48,8 @@
 ### 方式 B —— 本地构建后按路径安装
 
 ```bash
-git clone https://github.com/kim1232aa/kimi-web-tools.git
-cd kimi-web-tools
+git clone https://github.com/kim1232aa/kimi-code-web-search.git
+cd kimi-code-web-search
 npm install
 npm run build
 ```
@@ -57,7 +57,7 @@ npm run build
 然后在 Kimi Code TUI 中：
 
 ```
-/plugins install /绝对路径/kimi-web-tools
+/plugins install /绝对路径/kimi-code-web-search
 /reload
 ```
 
@@ -174,11 +174,11 @@ node ./bin/gateway-daemon.mjs stop
 curl http://127.0.0.1:18492/health
 ```
 
-包导出：`kimi-web-tools`（宿主 API）、`kimi-web-tools/gateway`、`kimi-web-tools/storage`。可执行入口：`kimi-web-tools-gateway`、`kimi-web-tools-mcp`、`kimi-web-tools-import-pi`。
+包导出：`kimi-code-web-search`（宿主 API）、`kimi-code-web-search/gateway`、`kimi-code-web-search/storage`。可执行入口：`kimi-code-web-search-gateway`、`kimi-code-web-search-mcp`、`kimi-code-web-search-import-pi`。
 
 ## 已知限制
 
-- **工具改名与老会话。** Kimi Code 在会话开始时冻结工具声明清单。插件工具名变更后（v0.4.0 曾把 `kimi-web-tools` 改为 `web`），改名*之前*开的会话仍声明旧名；模型若调用新名，可能被严格校验函数名的上游网关拒绝。更新插件后请新开会话。
+- **工具改名与老会话。** Kimi Code 在会话开始时冻结工具声明清单。插件工具名变更后（v0.4.0 曾把 `kimi-code-web-search` 改为 `web`），改名*之前*开的会话仍声明旧名；模型若调用新名，可能被严格校验函数名的上游网关拒绝。更新插件后请新开会话。
 - **必搜模式依赖钩子加载。** 安装/更新后先 `/reload` 或新开会话再依赖强制执行。钩子执行出错时放行（fail open）。
 - **Stop 门预算。** Kimi Code 每轮只给一次续写机会；第二次 Stop 一定放行。失败的研究如实报告为未验证，不会无限重试。
 - **平台会话**（小红书 / X）依赖本地浏览器且可能过期，需要时在仪表盘重新登录。

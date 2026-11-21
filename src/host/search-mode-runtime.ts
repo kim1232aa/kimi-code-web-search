@@ -1,5 +1,5 @@
 /**
- * kimi-web-tools — "Web Research mode" per-session turn policy (Search Mode).
+ * kimi-code-web-search — "Web Research mode" per-session turn policy (Search Mode).
  *
  * The layer sits ABOVE the provider layer: providers only execute web tools;
  * this module decides whether a turn must complete a web research call

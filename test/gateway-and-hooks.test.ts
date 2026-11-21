@@ -1,5 +1,5 @@
 /**
- * kimi-web-tools — End-to-End Integration Tests for Gateway Server, MCP Server, and Hooks.
+ * kimi-code-web-search — End-to-End Integration Tests for Gateway Server, MCP Server, and Hooks.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -243,7 +243,7 @@ test("Stdio MCP Server responds to initialize and tools/list", async () => {
 
     assert.equal(responses.length, 2);
     assert.equal(responses[0].id, 1);
-    assert.equal(responses[0].result.serverInfo.name, "kimi-web-tools");
+    assert.equal(responses[0].result.serverInfo.name, "kimi-code-web-search");
 
     assert.equal(responses[1].id, 2);
     const toolNames = responses[1].result.tools.map((t: any) => t.name);

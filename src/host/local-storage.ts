@@ -1,5 +1,5 @@
 /**
- * kimi-web-tools — Local filesystem persistence for standalone gateway & Kimi Code plugin.
+ * kimi-code-web-search — Local filesystem persistence for standalone gateway & Kimi Code plugin.
  *
  * Manages files under `$KIMI_CODE_HOME/web-tools/` (fallback `~/.kimi-code/web-tools/`):
  *  - `config.json`: non-secret WebToolsSettings

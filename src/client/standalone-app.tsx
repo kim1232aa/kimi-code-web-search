@@ -1,5 +1,5 @@
 /**
- * kimi-web-tools — Standalone Web UI Dashboard Application.
+ * kimi-code-web-search — Standalone Web UI Dashboard Application.
  *
  * Mounts:
  *  - Password login gate when accessed over reverse-proxied public domains.

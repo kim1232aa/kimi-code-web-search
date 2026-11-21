@@ -1,5 +1,5 @@
 /**
- * kimi-web-tools — Standalone HTTP Gateway Server & Dashboard Host.
+ * kimi-code-web-search — Standalone HTTP Gateway Server & Dashboard Host.
  *
  * Responsibilities:
  *  - Hosts the standalone Web UI Dashboard (`GET /`, `GET /app.js`, `GET /assets/*`).

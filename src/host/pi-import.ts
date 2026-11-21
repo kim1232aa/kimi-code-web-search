@@ -1,5 +1,5 @@
 /**
- * kimi-web-tools — Import credentials, provider endpoints, routing, and search mode
+ * kimi-code-web-search — Import credentials, provider endpoints, routing, and search mode
  * from a local Pi agent directory (`$PI_CODING_AGENT_DIR` or `~/.pi/agent`).
  *
  * Reads:

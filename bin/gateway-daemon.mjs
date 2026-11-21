@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * kimi-web-tools — Gateway Daemon CLI & Lifecycle Manager.
+ * kimi-code-web-search — Gateway Daemon CLI & Lifecycle Manager.
  *
  * Usage:
  *   node ./bin/gateway-daemon.mjs              # Start in foreground (default)
@@ -311,7 +311,7 @@ async function main() {
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   main().catch((err) => {
-    console.error("[kimi-web-tools gateway-daemon]", err instanceof Error ? err.message : String(err));
+    console.error("[kimi-code-web-search gateway-daemon]", err instanceof Error ? err.message : String(err));
     process.exit(1);
   });
 }

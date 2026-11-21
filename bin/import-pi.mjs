@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * kimi-web-tools — Import Pi (`always-search.ts` & `pi-web-access`) config and API keys.
+ * kimi-code-web-search — Import Pi (`always-search.ts` & `pi-web-access`) config and API keys.
  *
  * Usage:
  *   node ./bin/import-pi.mjs [--pi-dir <path>]
@@ -65,6 +65,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("[kimi-web-tools import-pi]", err instanceof Error ? err.message : String(err));
+  console.error("[kimi-code-web-search import-pi]", err instanceof Error ? err.message : String(err));
   process.exit(1);
 });

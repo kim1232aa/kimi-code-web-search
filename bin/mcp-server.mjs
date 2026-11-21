@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * kimi-web-tools — Stdio JSON-RPC 2.0 MCP Server for Kimi Code.
+ * kimi-code-web-search — Stdio JSON-RPC 2.0 MCP Server for Kimi Code.
  *
  * Implements MCP protocol over stdin/stdout:
  *  - Auto-starts the standalone gateway daemon (`127.0.0.1:18492`) if not running.
@@ -327,7 +327,7 @@ async function handleRequest(message) {
       return {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: {} },
-        serverInfo: { name: "kimi-web-tools", version: VERSION },
+        serverInfo: { name: "kimi-code-web-search", version: VERSION },
       };
     case "ping":
       return {};

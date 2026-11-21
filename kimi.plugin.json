@@ -35,7 +35,7 @@
     },
     {
       "event": "PreToolUse",
-      "matcher": "^(web_search|web_fetch|mcp__(?:plugin-web_s|plugin-kimi-web-tools_web|web)__(web_search|web_fetch))$",
+      "matcher": "^(web_search|web_fetch|mcp__(?:plugin-web_s|plugin-kimi-code-web-search_web|web)__(web_search|web_fetch))$",
       "command": "node ./hooks/pre-tool-gate.mjs",
       "timeout": 10
     },
@@ -81,6 +81,6 @@
   "interface": {
     "displayName": "Kimi Web Tools",
     "shortDescription": "Multi-provider web search & fetch gateway with Search Mode and Web UI Dashboard",
-    "developerName": "kimi-web-tools"
+    "developerName": "kimi-code-web-search"
   }
 }

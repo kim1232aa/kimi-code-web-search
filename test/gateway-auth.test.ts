@@ -1,5 +1,5 @@
 /**
- * kimi-web-tools — Gateway authentication tests: password login with rate
+ * kimi-code-web-search — Gateway authentication tests: password login with rate
  * limiting, revocable session tokens, and the unauthenticated /health probe.
  */
 import { test, type TestContext } from "node:test";

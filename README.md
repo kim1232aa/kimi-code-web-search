@@ -37,7 +37,7 @@ The plugin itself is free and open source (MIT). You bring your own search-provi
 In the Kimi Code TUI:
 
 ```
-/plugins install https://github.com/kim1232aa/kimi-web-tools
+/plugins install https://github.com/kim1232aa/kimi-code-web-search
 /reload
 ```
 
@@ -48,8 +48,8 @@ Then start a **new session** (`/new`). Plugin changes only apply after `/reload`
 ### Option B — build locally, then install from the local path
 
 ```bash
-git clone https://github.com/kim1232aa/kimi-web-tools.git
-cd kimi-web-tools
+git clone https://github.com/kim1232aa/kimi-code-web-search.git
+cd kimi-code-web-search
 npm install
 npm run build
 ```
@@ -57,7 +57,7 @@ npm run build
 Then in the Kimi Code TUI:
 
 ```
-/plugins install /absolute/path/to/kimi-web-tools
+/plugins install /absolute/path/to/kimi-code-web-search
 /reload
 ```
 
@@ -174,11 +174,11 @@ node ./bin/gateway-daemon.mjs stop
 curl http://127.0.0.1:18492/health
 ```
 
-Package exports: `kimi-web-tools` (host API), `kimi-web-tools/gateway`, `kimi-web-tools/storage`. Binaries: `kimi-web-tools-gateway`, `kimi-web-tools-mcp`, `kimi-web-tools-import-pi`.
+Package exports: `kimi-code-web-search` (host API), `kimi-code-web-search/gateway`, `kimi-code-web-search/storage`. Binaries: `kimi-code-web-search-gateway`, `kimi-code-web-search-mcp`, `kimi-code-web-search-import-pi`.
 
 ## Known limitations
 
-- **Tool renames vs. old sessions.** Kimi Code freezes a session's declared tool list at session start. If the plugin's tool names change (as they did in v0.4.0, `kimi-web-tools` → `web`), sessions opened *before* the change keep declaring the old names; models that call the new names can be rejected by strict upstream gateways that validate function names against the request's tool declarations. Start a new session after updating the plugin.
+- **Tool renames vs. old sessions.** Kimi Code freezes a session's declared tool list at session start. If the plugin's tool names change (as they did in v0.4.0, `kimi-web-tools` → `web` (the repo is now `kimi-code-web-search`)), sessions opened *before* the change keep declaring the old names; models that call the new names can be rejected by strict upstream gateways that validate function names against the request's tool declarations. Start a new session after updating the plugin.
 - **Required mode needs the hooks loaded.** After installing/updating, run `/reload` or start a new session before relying on enforcement. Hooks fail open on execution errors.
 - **Stop-hook budget.** Kimi Code grants one continuation per turn; a second Stop always ends the turn. Failed research is reported as unverified, never silently retried forever.
 - **Platform sessions** (小红书 / X) depend on a local browser and can expire; log in again from the dashboard when needed.

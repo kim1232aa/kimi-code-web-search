@@ -1,5 +1,5 @@
 /**
- * kimi-web-tools — Standalone UI Primitives & Artwork Icons.
+ * kimi-code-web-search — Standalone UI Primitives & Artwork Icons.
  *
  * Replaces `@deepseek-ai/dsh-client-ui-primitives` with self-contained React
  * components (Button, Input, Modal, StateDot, Menu) and the 10 stroke-suffixed

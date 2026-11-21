@@ -1,5 +1,5 @@
 /**
- * kimi-web-tools — Host configuration: settings namespace + native TypeScript validation.
+ * kimi-code-web-search — Host configuration: settings namespace + native TypeScript validation.
  *
  * The config (non-secret knobs) lives in `config.json` (via LocalStorage) or the
  * host settings service. API keys live in `credentials.json` (`WEB_TOOLS_*` refs).

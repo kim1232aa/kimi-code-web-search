@@ -43,7 +43,7 @@ const SMART_AUTO_TEXT =
   "[Smart Mode: Auto] The smart classifier determined that local or general context is sufficient, or classification was unavailable (fail-open). Web search is not required, but still search on demand for external docs/APIs/versions/URLs or uncertain claims; read primary sources via `web_fetch`, switch `provider` instead of retrying errors, and mark unverified claims as 未验证.";
 
 const NO_WEB_ROUTE_INSTRUCTION =
-  "No usable kimi-web-tools search route is available for this turn; mandatory web-search enforcement is exempted. If no other web tool is available, answer strictly from existing context and locally verified files/tests, never claim web verification was performed, and mark unverified external facts as 未验证.";
+  "No usable kimi-code-web-search search route is available for this turn; mandatory web-search enforcement is exempted. If no other web tool is available, answer strictly from existing context and locally verified files/tests, never claim web verification was performed, and mark unverified external facts as 未验证.";
 
 function readJsonFile(filePath, fallback) {
   if (!fs.existsSync(filePath)) return fallback;

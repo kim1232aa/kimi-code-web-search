@@ -1,5 +1,5 @@
 /**
- * kimi-web-tools — Host configuration & native validation tests.
+ * kimi-code-web-search — Host configuration & native validation tests.
  *
  * Verifies that:
  * 1. installConfig respects initial config passed from the loader, flushes onMounted,

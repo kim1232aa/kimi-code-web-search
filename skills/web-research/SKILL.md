@@ -3,7 +3,7 @@ name: web-research
 description: Use when web search, primary-source verification, full-page extraction, Xiaohongshu or X research, or Kimi Web Tools provider and Search Mode configuration is needed.
 ---
 
-# Web Research Skill (`kimi-web-tools`)
+# Web Research Skill (`kimi-code-web-search`)
 
 Use `web_search` to discover sources and `web_fetch` to inspect evidence. A completed search satisfies a required turn; it does not by itself verify a claim.
 
@@ -31,7 +31,7 @@ Call `web_mode({ action: "set", mode: "auto" | "smart" | "required" | "off" })`,
 
 `/web:mode smart` accepts aliases `jev`, `自适应`, and `智能判定`. The Smart hook accepts text or Kimi `ContentPart[]` prompts. When transcript context is enabled, it reads the tail of `$KIMI_CODE_HOME/sessions/<wd>/<session_id>/agents/main/wire.jsonl` and sends `last_assistant_reply` and `recent_tools` to the configured classifier on every classified turn; `recent_user_context` (the previous user turn) is additionally sent only for short follow-ups of at most 24 characters. Choose a backend appropriate for the conversation's privacy needs.
 
-An existing configuration with `enabled: false` always exempts research enforcement. When `exemptWhenNoProvider` is enabled (default `true`), an existing configuration without a usable `kimi-web-tools` web route exempts enforcement too and emits a no-route notice. When `recognizeExternalWebTools` is enabled (default `true`), recognized external web calls are classified as a search or a page read (a `url`/`urls` argument always means a page read); a search satisfies the current turn, a page read only under `requiredEvidence: "search-or-fetch"`, and failed calls count as attempts but remain unverified. Discovery, status, and asynchronous job-start tools do not count, and receipt hooks are best-effort. None of these options weakens the evidence rules above. A Kimi subagent does not inherit or settle the parent turn: pass `session_id` and `turn_id` only to continue that exact turn, and use only tools actually available to the subagent. A call carrying the current session's binding counts toward that turn even when made by a subagent. Mode switches take effect from the next turn (the current turn's Stop decision is frozen at turn start), and `off` immediately blocks this plugin's web tools.
+An existing configuration with `enabled: false` always exempts research enforcement. When `exemptWhenNoProvider` is enabled (default `true`), an existing configuration without a usable `kimi-code-web-search` web route exempts enforcement too and emits a no-route notice. When `recognizeExternalWebTools` is enabled (default `true`), recognized external web calls are classified as a search or a page read (a `url`/`urls` argument always means a page read); a search satisfies the current turn, a page read only under `requiredEvidence: "search-or-fetch"`, and failed calls count as attempts but remain unverified. Discovery, status, and asynchronous job-start tools do not count, and receipt hooks are best-effort. None of these options weakens the evidence rules above. A Kimi subagent does not inherit or settle the parent turn: pass `session_id` and `turn_id` only to continue that exact turn, and use only tools actually available to the subagent. A call carrying the current session's binding counts toward that turn even when made by a subagent. Mode switches take effect from the next turn (the current turn's Stop decision is frozen at turn start), and `off` immediately blocks this plugin's web tools.
 
 ## 4. Status and Web UI
 

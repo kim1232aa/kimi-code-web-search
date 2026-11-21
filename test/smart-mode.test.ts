@@ -769,7 +769,7 @@ test("external web tool recognition matches MCP servers, unwraps proxies, and re
     "mcp__web__web_search",
     "mcp__plugin-web_s__web_search",
     "mcp__plugin-web_s__web_fetch",
-    "mcp__plugin-kimi-web-tools_web__web_search",
+    "mcp__plugin-kimi-code-web-search_web__web_search",
     "web_fetch",
     "web_enable",
     "get_search_content",

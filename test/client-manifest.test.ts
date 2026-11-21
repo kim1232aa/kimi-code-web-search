@@ -1,8 +1,8 @@
 /**
- * kimi-web-tools — package & plugin manifest contract tests.
+ * kimi-code-web-search — package & plugin manifest contract tests.
  *
  * Verifies:
- *  - `package.json` declares `kimi-web-tools` v0.4.0 (`type: "module"`) with zero
+ *  - `package.json` declares `kimi-code-web-search` v0.4.0 (`type: "module"`) with zero
  *    `@deepseek-ai/*` dependencies or peerDependencies.
  *  - `kimi.plugin.json` declares the `s` MCP server (`./bin/mcp-server.mjs`) under plugin `web`,
  *    the lifecycle hooks (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`),
@@ -25,9 +25,9 @@ const readPkg = () =>
 const readPluginManifest = () =>
   JSON.parse(readFileSync(join(root, "kimi.plugin.json"), "utf8")) as Record<string, any>;
 
-test("package.json declares kimi-web-tools 0.4.0 with zero @deepseek-ai/* dependencies", () => {
+test("package.json declares kimi-code-web-search 0.4.0 with zero @deepseek-ai/* dependencies", () => {
   const pkg = readPkg();
-  assert.equal(pkg.name, "kimi-web-tools");
+  assert.equal(pkg.name, "kimi-code-web-search");
   assert.equal(pkg.version, "0.4.0");
   assert.equal(pkg.type, "module");
 
@@ -62,7 +62,7 @@ test("kimi.plugin.json declares MCP server, hooks, commands, skills, and SYSTEM.
     "web_fetch",
     "mcp__plugin-web_s__web_search",
     "mcp__plugin-web_s__web_fetch",
-    "mcp__plugin-kimi-web-tools_web__web_search",
+    "mcp__plugin-kimi-code-web-search_web__web_search",
   ]) {
     assert.ok(preRe.test(name), `PreToolUse matcher must match ${name}`);
   }
@@ -97,8 +97,8 @@ test("PostToolUse prefilter covers every recognized web tool and skips local too
       "web_fetch",
       "mcp__plugin-web_s__web_search",
       "mcp__plugin-web_s__web_fetch",
-      "mcp__plugin-kimi-web-tools_web__web_search",
-      "mcp__plugin-kimi-web-tools_web__web_fetch",
+      "mcp__plugin-kimi-code-web-search_web__web_search",
+      "mcp__plugin-kimi-code-web-search_web__web_fetch",
       // Kimi built-ins
       "FetchURL",
       "WebSearch",

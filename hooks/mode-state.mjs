@@ -182,13 +182,13 @@ export function classifyOwnTool(name) {
     "web_search",
     "mcp__web__web_search",
     "mcp__plugin-web_s__web_search",
-    "mcp__plugin-kimi-web-tools_web__web_search",
+    "mcp__plugin-kimi-code-web-search_web__web_search",
   ].includes(name)) return "web_search";
   if ([
     "web_fetch",
     "mcp__web__web_fetch",
     "mcp__plugin-web_s__web_fetch",
-    "mcp__plugin-kimi-web-tools_web__web_fetch",
+    "mcp__plugin-kimi-code-web-search_web__web_fetch",
   ].includes(name)) return "web_fetch";
   return undefined;
 }
