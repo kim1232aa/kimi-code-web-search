@@ -4,6 +4,9 @@
 
 面向 [Kimi Code CLI](https://www.kimi.com/code) 的多源联网搜索/网页读取插件：按会话生效的**搜索模式**策略、**Jev 智能判定**、小红书 / X 平台研究，以及本地 **Web UI 仪表盘**。
 
+
+> 仓库于 2026-11-22 从 `kimi-web-tools` 改名为 `kimi-code-web-search`。GitHub 会重定向旧地址，已有克隆不受影响。
+
 插件本身免费开源（MIT）。搜索 API key 由你自备；多数厂商的免费额度足够个人使用，详见[价格](#价格)。
 
 ![搜索模式菜单](assets/search-mode-menu.png)

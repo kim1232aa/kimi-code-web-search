@@ -4,6 +4,9 @@
 
 Multi-provider web search & fetch plugin for [Kimi Code CLI](https://www.kimi.com/code), with a per-session **Search Mode** policy, a **Jev smart classifier**, Xiaohongshu / X research, and a local **Web UI dashboard**.
 
+
+> The repository was renamed from `kimi-web-tools` to `kimi-code-web-search` on 2026-11-22. GitHub redirects the old URL, so existing clones keep working.
+
 The plugin itself is free and open source (MIT). You bring your own search-provider API keys; most providers offer a free tier that covers personal use. See [Pricing](#pricing).
 
 ![Search mode menu](assets/search-mode-menu.png)
