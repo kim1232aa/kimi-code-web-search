@@ -93,6 +93,37 @@ test("MCP accepts bounded decimal strings and forwards numeric arguments", async
     { query: "fixture", maxResults: 2, sessionId: "session-a", turnId: 7 });
 });
 
+test("a configured gateway URL is used instead of starting a local gateway", async (t) => {
+  const home = fixture(t);
+  const requests: { url: string; authorization: string | undefined; body: any }[] = [];
+  const remote = http.createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    requests.push({ url: req.url!, authorization: req.headers.authorization, body: body ? JSON.parse(body) : undefined });
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ ok: true, value: { query: "fixture", sources: [] } }));
+  });
+  remote.listen(0, "127.0.0.1");
+  await once(remote, "listening");
+  t.after(async () => { remote.closeAllConnections(); await new Promise<void>(resolve => remote.close(() => resolve())); });
+  const port = (remote.address() as any).port;
+
+  const env = {
+    ...process.env,
+    KIMI_CODE_HOME: home,
+    KIMI_WEB_TOOLS_GATEWAY_URL: `http://127.0.0.1:${port}`,
+    KIMI_WEB_TOOLS_GATEWAY_TOKEN: "remote-token",
+  };
+  const result = await runNode(["bin/mcp-server.mjs"], env,
+    rpc(1, "tools/call", { name: "web_search", arguments: { query: "fixture" } }));
+  assert.equal(result.code, 0, result.stderr);
+  assert.notEqual(JSON.parse(result.stdout).result.isError, true, result.stdout);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/web-tools/mcp/search");
+  assert.equal(requests[0].authorization, "Bearer remote-token");
+  assert.equal(fs.existsSync(path.join(home, "web-tools", "gateway.json")), false, "no local gateway is started");
+});
+
 test("invalid numeric inputs fail without launching a gateway", async (t) => {
   const { env, requests } = await gatewayFixture(t);
   const invalid = ["", " ", "1e1", "0x10", "1.5", "0", "-1", true, [], null, 1.5, 9007199254740992];

@@ -10,6 +10,9 @@
  *    via `apply(ctx)` from `src/host/index.ts`.
  *  - Mounts internal MCP execution endpoints (`POST /web-tools/mcp/search`,
  *    `fetch`, `status`, `mode`).
+ *  - Exposes the same four tools over MCP Streamable HTTP at `POST /mcp`, so a
+ *    Kimi Code plugin on any machine can point its `mcpServers` `url` here
+ *    instead of running its own gateway.
  *  - Persists state in `$KIMI_CODE_HOME/web-tools/` via `LocalStorage`.
  * @module
  */
@@ -78,6 +81,135 @@ function writeJson(
     ...extraHeaders,
   });
   res.end(JSON.stringify(body));
+}
+
+const MCP_PROTOCOL_VERSION = "2025-06-18";
+
+const MCP_TOOLS = [
+  {
+    name: "web_search",
+    description:
+      "Search the web or social platforms (Xiaohongshu / X) through the configured multi-provider routing chain. Prefix the query with `小红书:` or `X:` to target a platform directly.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query. Use `小红书: <topic>` or `X: <topic>` for platform routing." },
+        max_results: { type: "integer", minimum: 1, maximum: 20, description: "Maximum results (default 8, max 20)." },
+        provider: { type: "string", description: "Optional provider to try first for cross-verification." },
+        session_id: { type: "string", description: "Session identifier supplied by the turn's UserPromptSubmit hook." },
+        turn_id: { type: "integer", minimum: 1, description: "Turn identifier supplied by the turn's UserPromptSubmit hook." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "web_fetch",
+    description: "Fetch and extract clean readable text from a public URL, or the full post and comments from a Xiaohongshu / X URL.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The HTTP/HTTPS URL to fetch." },
+        session_id: { type: "string" },
+        turn_id: { type: "integer", minimum: 1 },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "web_mode",
+    description: "View or change the active Search Mode (auto, smart, required, off).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["get", "set", "toggle"] },
+        mode: { type: "string", enum: ["auto", "smart", "required", "off"] },
+        session_id: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "web_status",
+    description: "Inspect gateway health, Search Mode, provider routing, and platform session status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        include_quotas: { type: "boolean" },
+        session_id: { type: "string" },
+      },
+    },
+  },
+] as const;
+
+interface McpRpcResult {
+  status: number;
+  body: Record<string, unknown> | undefined;
+}
+
+/**
+ * One stateless Streamable HTTP JSON-RPC message (protocol 2025-06-18).
+ * Notifications get HTTP 202 with no body; requests get a single JSON object.
+ */
+function mcpRpcResult(message: Record<string, unknown>, callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>): Promise<McpRpcResult> | McpRpcResult {
+  const id = message.id;
+  const respond = (status: number, body: Record<string, unknown>): McpRpcResult => ({ status, body });
+  const error = (code: number, httpStatus: number, msg: string): McpRpcResult =>
+    respond(httpStatus, { jsonrpc: "2.0", id: id ?? null, error: { code, message: msg } });
+
+  if (message.jsonrpc !== "2.0" || typeof message.method !== "string") {
+    return error(-32600, 400, "Invalid JSON-RPC request");
+  }
+  if (id === undefined) return { status: 202, body: undefined };
+
+  const method = message.method;
+  if (method === "initialize") {
+    return respond(200, {
+      jsonrpc: "2.0",
+      id,
+      result: {
+        protocolVersion: MCP_PROTOCOL_VERSION,
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: "kimi-code-web-search", version: CURRENT_VERSION },
+      },
+    });
+  }
+  if (method === "ping") return respond(200, { jsonrpc: "2.0", id, result: {} });
+  if (method === "tools/list") return respond(200, { jsonrpc: "2.0", id, result: { tools: MCP_TOOLS } });
+  if (method !== "tools/call") return error(-32601, 200, `Method not found: ${method}`);
+
+  const params = message.params && typeof message.params === "object" && !Array.isArray(message.params)
+    ? (message.params as Record<string, unknown>) : {};
+  const name = typeof params.name === "string" ? params.name : "";
+  const args = params.arguments && typeof params.arguments === "object" && !Array.isArray(params.arguments)
+    ? (params.arguments as Record<string, unknown>) : {};
+  if (!MCP_TOOLS.some((tool) => tool.name === name)) return error(-32602, 200, `Unknown tool: ${name}`);
+
+  return callTool(name, args).then(
+    (value) => respond(200, { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: mcpToolText(name, value) }] } }),
+    (err: unknown) => respond(200, {
+      jsonrpc: "2.0",
+      id,
+      result: { content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }], isError: true },
+    }),
+  );
+}
+
+function mcpToolText(name: string, value: unknown): string {
+  const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  if (name === "web_search") {
+    const sources = Array.isArray(record.sources) ? record.sources : [];
+    const head = [`Query: ${record.query ?? ""}`, `Results: ${sources.length}`];
+    const items = sources.map((source, index) => {
+      const item = source as Record<string, unknown>;
+      return [`[${index + 1}] ${item.title || item.url}`, `URL: ${item.url}`, item.snippet ? `Snippet: ${item.snippet}` : ""]
+        .filter(Boolean).join("\n");
+    });
+    return [head.join(" | "), ...items].join("\n\n") || "No results found.";
+  }
+  if (name === "web_fetch") {
+    const body = record.body && typeof record.body === "object" ? (record.body as Record<string, unknown>).content : undefined;
+    return `URL: ${record.url ?? ""}\n\n${typeof body === "string" ? body : JSON.stringify(record)}`;
+  }
+  return JSON.stringify(record, null, 2);
 }
 
 async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
@@ -383,6 +515,68 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
     return parsed?.value;
   }
 
+  // Shared by the private `/web-tools/mcp/*` routes and the public MCP
+  // endpoint. Throws on caller error or tool failure; returns the value body.
+  async function runMcpTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    const sessionId = typeof args.session_id === "string" && args.session_id.trim() ? args.session_id.trim()
+      : typeof args.sessionId === "string" && args.sessionId.trim() ? args.sessionId.trim() : "global";
+    if (name === "web_mode") {
+      const action = typeof args.action === "string" ? args.action : "get";
+      if (action === "set" || action === "toggle") {
+        const current = storage.getEffectiveSessionMode(sessionId);
+        const nextMode = action === "toggle" ? nextSearchMode(current) : args.mode;
+        if (nextMode !== "auto" && nextMode !== "smart" && nextMode !== "required" && nextMode !== "off") {
+          throw new Error("mode must be auto, smart, required, or off");
+        }
+        storage.setSessionMode(sessionId, nextMode);
+      }
+      return storageModeValue(sessionId);
+    }
+    if (name === "web_status") {
+      return { ...storageModeValue(sessionId), available: searchProvider?.available() ?? false };
+    }
+    if (storage.getEffectiveSessionMode(sessionId) === "off") {
+      throw new Error(WEB_DISABLED_DENIAL);
+    }
+    const turnId = storage.bindToolTurn(sessionId, positiveInteger(args.turn_id ?? args.turnId, "turn_id"));
+    if (name === "web_search") {
+      const query = typeof args.query === "string" ? args.query.trim() : "";
+      if (!query) throw new Error("query is required");
+      if (!searchProvider) throw new Error("search provider not initialized");
+      try {
+        const outcome = await searchProvider.search({
+          query,
+          maxResults: positiveInteger(args.max_results ?? args.maxResults, "max_results", 20) ?? 8,
+          provider: typeof args.provider === "string" ? args.provider.trim() : undefined,
+        });
+        storage.completeTool(sessionId, "web_search", true, turnId);
+        return { query, sources: outcome.sources };
+      } catch (err) {
+        storage.completeTool(sessionId, "web_search", false, turnId);
+        throw err;
+      }
+    }
+    if (name === "web_fetch") {
+      const url = typeof args.url === "string" ? args.url.trim() : "";
+      if (!url) throw new Error("url is required");
+      if (!fetchProvider) throw new Error("fetch provider not initialized");
+      try {
+        const outcome = await fetchProvider.fetch({ url });
+        storage.completeTool(sessionId, "web_fetch", true, turnId);
+        return outcome;
+      } catch (err) {
+        storage.completeTool(sessionId, "web_fetch", false, turnId);
+        throw err;
+      }
+    }
+    throw new Error(`Unknown tool: ${name}`);
+  }
+
+  function storageModeValue(sessionId: string): { sessionId: string; mode: string; globalMode: string } {
+    const doc = storage.readModeState();
+    return { sessionId, mode: storage.getEffectiveSessionMode(sessionId), globalMode: doc.globalMode };
+  }
+
   const server = http.createServer(async (req, res) => {
     try {
       const parsedUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
@@ -447,6 +641,14 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
         const assetBody = fs.readFileSync(safePath);
         res.writeHead(200, { "content-type": contentTypeFor(safePath) });
         res.end(assetBody);
+        return;
+      }
+
+      // MCP endpoint method check, before authentication: a non-POST never
+      // reveals whether a password is configured, and tells the client the
+      // endpoint is stateless.
+      if (pathname === "/mcp" && req.method !== "POST") {
+        writeJson(res, 405, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Use POST" } }, { allow: "POST" });
         return;
       }
 
@@ -552,6 +754,28 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
       // Enforce same-origin & non-cross-site browser protection
       if (configPlaneTrust(wtReq) === false) {
         writeJson(res, 403, { ok: false, error: { code: "forbidden", message: "Cross-origin access denied" } });
+        return;
+      }
+
+      // 4a. MCP Streamable HTTP endpoint (`POST /mcp`), protocol 2025-06-18.
+      //     Stateless: every JSON-RPC request is its own HTTP POST and the
+      //     response is a single JSON object. Tool calls run the same handlers
+      //     as `/web-tools/mcp/*` below.
+      if (pathname === "/mcp") {
+        let message: Record<string, unknown>;
+        try {
+          message = await readJsonBody(req);
+        } catch (error) {
+          writeJson(res, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: error instanceof Error ? error.message : "Parse error" } });
+          return;
+        }
+        const rpc = await mcpRpcResult(message, (name, args) => runMcpTool(name, args));
+        if (rpc.body === undefined) {
+          res.writeHead(rpc.status);
+          res.end();
+          return;
+        }
+        writeJson(res, rpc.status, rpc.body);
         return;
       }
 

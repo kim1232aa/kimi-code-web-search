@@ -164,6 +164,25 @@ The **Jev smart classifier** adds one small LLM call per classified turn, billed
 
 A typical personal setup can run entirely on free tiers: e.g. Keenable keyless + Tavily's 1,000 monthly credits + Exa's $10 monthly credits.
 
+## Plugin and gateway are separate
+
+The plugin (Search Mode hooks, skill, commands) decides *when* to search and runs on the machine running Kimi Code. The gateway holds the provider API keys and performs the searches, and it can run on a different machine. A local install with no extra configuration runs both on the same machine, which is only the default.
+
+To use a gateway elsewhere, set these in the environment of the machine running Kimi Code:
+
+```bash
+export KIMI_WEB_TOOLS_GATEWAY_URL="http://your-gateway-host:18492"
+export KIMI_WEB_TOOLS_GATEWAY_TOKEN="the gateway password"
+```
+
+Tool calls then go to that gateway and no local gateway is started. The gateway must be reachable at that address and have a password set (`KIMI_WEB_TOOLS_PASSWORD`), and it exposes the same tools over MCP Streamable HTTP at `POST /mcp` (protocol 2025-06-18, stateless), so a remote Kimi Code can also point its own `mcpServers` entry straight at it:
+
+```json
+{ "mcpServers": { "s": { "url": "http://your-gateway-host:18492/mcp", "bearerTokenEnvVar": "KIMI_WEB_TOOLS_GATEWAY_TOKEN" } } }
+```
+
+A plugin that does this drops the bundled stdio server; its hooks still run locally and count search completion by tool name, so required mode keeps working without any provider key on the remote machine.
+
 ## Standalone gateway
 
 The gateway also runs outside Kimi Code:

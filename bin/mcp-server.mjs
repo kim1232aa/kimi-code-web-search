@@ -130,16 +130,39 @@ const TOOLS = [
   },
 ];
 
+/**
+ * Where this plugin's tool calls go. `KIMI_WEB_TOOLS_GATEWAY_URL` points at a
+ * gateway running somewhere else (this machine or another); when it is unset
+ * the plugin uses, and if needed starts, the gateway on this machine.
+ */
+function configuredGateway() {
+  const raw = process.env.KIMI_WEB_TOOLS_GATEWAY_URL?.trim();
+  if (!raw) return undefined;
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("KIMI_WEB_TOOLS_GATEWAY_URL is not a valid URL");
+  }
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("KIMI_WEB_TOOLS_GATEWAY_URL must be an http(s) URL");
+  }
+  return { url: url.origin, token: process.env.KIMI_WEB_TOOLS_GATEWAY_TOKEN?.trim() || "" };
+}
+
 async function callGatewayMcp(endpoint, payload, timeoutMs = 90_000) {
-  const gw = await ensureGatewayDaemon();
+  const configured = configuredGateway();
+  const gw = configured ?? await ensureGatewayDaemon();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
 
   try {
+    const headers = { "content-type": "application/json" };
+    if (configured?.token) headers.authorization = `Bearer ${configured.token}`;
     const res = await fetch(`${gw.url}/web-tools/mcp/${endpoint}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(payload ?? {}),
       signal: controller.signal,
     });

@@ -17,21 +17,10 @@ import {
 } from "./smart-classifier.mjs";
 
 function requiredSearchText(searchOnly) {
-  return [
-    searchOnly
-      ? "Web Search is required for this turn: search for what the user's request actually depends on, not an arbitrary query to pass this check. Only a search call satisfies this turn — reading a URL alone does not count (`web_mode`/`web_status` do not count)."
-      : "Web Search is required for this turn: search for what the user's request actually depends on, not an arbitrary query to pass this check. A search or a URL read satisfies this turn (`web_mode`/`web_status` do not count).",
-    "Before drafting, pick out the facts your answer will rest on — versions, docs/APIs, commands, config keys, errors, URLs, dates (on coding tasks: the libraries and commands you use) — and search each with a query that names the claim (the product, API, or error), not a paraphrase of the request.",
-    "If results miss the point, are thin, or conflict: rewrite the query and switch `provider` (1–2 others, never `all`) or use another web tool; never retry a provider that failed. Unsure of a URL, tool parameter, or command flag? Search for it first — don't guess and retry.",
-    "Search snippets are leads: read the primary source (official docs, source, release notes) with `web_fetch` and cite what you read.",
-    "未搜到不等于不存在: if evidence is missing or conflicting, say so and mark it 未验证 — never fill gaps from memory (不凭记忆补全).",
-  ].join("\n");
+  return searchOnly
+    ? "Web Search is required for this turn: search for what the user's request actually depends on, not an arbitrary query to pass this check. Only a search call satisfies this turn — reading a URL alone does not count (`web_mode`/`web_status` do not count)."
+    : "Web Search is required for this turn: search for what the user's request actually depends on, not an arbitrary query to pass this check. A search or a URL read satisfies this turn (`web_mode`/`web_status` do not count).";
 }
-
-const PLATFORM_SEARCH_TEXT = [
-  "To target a platform, use exactly one routing prefix such as 小红书: or X:; do not repeat the platform name as a topic keyword.",
-  "The provider removes that routing prefix before entering the platform search box.",
-].join("\n");
 
 const SEARCH_DISABLED_TEXT =
   "Web search is switched OFF for this session. Do not call web_search or web_fetch; answer strictly from existing context. If fresh web data or unverified external claims are needed, mark them as 未验证 instead of guessing from memory.";
@@ -126,8 +115,6 @@ async function main() {
     });
   }
 
-  const platforms = cfg.platformEnabled ?? { xiaohongshu: true, x: true };
-  const platformsEnabled = platforms.xiaohongshu !== false || platforms.x !== false;
   const recognizeExternal = !configExists || cfg.recognizeExternalWebTools !== false;
   const searchOnly = turnState.requiredEvidence === "search";
   const turnBinding = `Pass session_id="${sessionId}" and turn_id=${turnState.turn} when calling web_search or web_fetch (also include them in a subagent prompt if delegating required web_search/web_fetch; explore/plan subagents have built-in WebSearch/FetchURL but not this plugin's MCP tools).`;
@@ -148,9 +135,8 @@ async function main() {
     process.stdout.write(`${NO_WEB_ROUTE_INSTRUCTION}\n`);
   } else if (turnState.required) {
     const requiredText = requiredSearchText(searchOnly);
-    const baseText = platformsEnabled ? `${requiredText}\n${PLATFORM_SEARCH_TEXT}` : requiredText;
     const smartText = mode === "smart" ? "[Smart Mode: Escalated to Required Web Search]\n" : "";
-    process.stdout.write(`${smartText}${baseText}${routeHint}\n${turnBinding}\n`);
+    process.stdout.write(`${smartText}${requiredText}${routeHint}\n${turnBinding}\n`);
   }
 }
 

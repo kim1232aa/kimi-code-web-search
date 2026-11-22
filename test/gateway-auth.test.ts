@@ -56,6 +56,37 @@ test("/health stays unauthenticated while the config plane requires login", asyn
   assert.equal(bearer.status, 200, "the gateway password must authenticate directly as a bearer token");
 });
 
+test("POST /mcp speaks stateless Streamable HTTP and requires the bearer token", async (t) => {
+  const handle = await authGateway(t);
+  const rpc = (body: unknown, headers: Record<string, string> = {}) =>
+    post(`${handle.url}/mcp`, body, { accept: "application/json, text/event-stream", ...headers });
+
+  const refused = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize" });
+  assert.equal(refused.status, 401, "a remote caller without the bearer token must be refused");
+
+  const auth = { authorization: `Bearer ${PASSWORD}` };
+  const init = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize" }, auth);
+  assert.equal(init.status, 200);
+  const initBody = (await init.json()) as { result: { protocolVersion: string; serverInfo: { name: string } } };
+  assert.equal(initBody.result.protocolVersion, "2025-06-18");
+  assert.equal(initBody.result.serverInfo.name, "kimi-code-web-search");
+
+  const list = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }, auth);
+  const listBody = (await list.json()) as { result: { tools: Array<{ name: string }> } };
+  assert.deepEqual(listBody.result.tools.map((tool) => tool.name), ["web_search", "web_fetch", "web_mode", "web_status"]);
+
+  const notified = await rpc({ jsonrpc: "2.0", method: "notifications/initialized" }, auth);
+  assert.equal(notified.status, 202, "a notification has no body and no id");
+
+  const call = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "web_status", arguments: {} } }, auth);
+  assert.equal(call.status, 200);
+  const callBody = (await call.json()) as { result: { content: Array<{ text: string }> } };
+  assert.match(callBody.result.content[0].text, /"mode": "auto"/);
+
+  const get = await fetch(`${handle.url}/mcp`);
+  assert.equal(get.status, 405, "the endpoint is stateless and accepts POST only");
+});
+
 test("repeated failed logins lock the client out with 429 + Retry-After", async (t) => {
   const handle = await authGateway(t);
   for (let i = 0; i < 5; i++) {

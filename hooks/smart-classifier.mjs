@@ -17,19 +17,19 @@ export const SMART_QUESTIONS = {
   needs_external_lookup: {
     type: "bool",
     instructions:
-      "Does answering the user's current request require external web lookup, documentation, API/CLI verification, URL inspection, or error diagnostics beyond local files and stable general knowledge?",
+      "Does answering the user's current request require external web lookup, documentation, API/CLI verification, URL inspection, or error diagnostics beyond local files and stable general knowledge? An instruction to perform a local action does not, unless the request also asks to verify an external fact.",
     criteria: {
       true: "Requires checking external docs, versions, APIs, URLs, packages, error messages, or current/unverified facts",
-      false: "Pure greeting, confirmation, general algorithm/coding, or purely local file/directory inspection/editing",
+      false: "Greeting, confirmation, general algorithm/coding, local file inspection/editing, or an instruction to run, restart, install, stop, or configure something locally without verifying an external fact",
     },
   },
   involves_tool_or_config_claim: {
     type: "bool",
     instructions:
-      "Is the user asking about, verifying, or following up on a claim about how specific tools, extensions, configs, or runtime mechanisms work where external doc/source verification is needed?",
+      "Is the user asking to verify a claim about how a specific tool, extension, config, or runtime mechanism works, where the answer depends on external docs or source? An instruction to operate something locally is not such a claim.",
     criteria: {
-      true: "Asks about or follows up on tool/config/runtime claims (including short follow-ups like '追加' or '真的吗' on an earlier technical claim)",
-      false: "Pure confirmation to proceed with an agreed local action, simple greeting, or local code/text edit",
+      true: "Asks whether a claim about a tool, config, or runtime is true, or follows up on one (including short follow-ups like '真的吗')",
+      false: "Tells the agent to do a local action — restart, run, install, stop, build, or edit — or confirms an already agreed local action, without asking to verify an external fact",
     },
   },
 };

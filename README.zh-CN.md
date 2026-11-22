@@ -164,6 +164,25 @@ node ./bin/import-pi.mjs --pi-dir /path/to/pi/agent
 
 个人使用完全可以跑在免费额度上：例如 Keenable 免 key + Tavily 每月 1,000 credits + Exa 每月 $10 额度。
 
+## 插件和网关是分开的
+
+插件（搜索模式钩子、skill、命令）决定*什么时候*搜，跑在运行 Kimi Code 的机器上。网关持有搜索源 API key 并执行搜索，可以跑在另一台机器上。本地安装不做额外配置时两者在同一台机器，这只是默认情况。
+
+要用别处的网关，在运行 Kimi Code 的机器上设置：
+
+```bash
+export KIMI_WEB_TOOLS_GATEWAY_URL="http://your-gateway-host:18492"
+export KIMI_WEB_TOOLS_GATEWAY_TOKEN="网关密码"
+```
+
+工具调用就发往那台网关，不再在本地起网关。网关必须在该地址可达并设了密码（`KIMI_WEB_TOOLS_PASSWORD`）。网关同时在 `POST /mcp` 提供 MCP Streamable HTTP（协议 2025-06-18，无状态），所以远端的 Kimi Code 也可以直接把自己的 `mcpServers` 指过去：
+
+```json
+{ "mcpServers": { "s": { "url": "http://your-gateway-host:18492/mcp", "bearerTokenEnvVar": "KIMI_WEB_TOOLS_GATEWAY_TOKEN" } } }
+```
+
+这样配置的插件去掉自带的 stdio 服务；它的钩子仍在本地运行，按工具名统计搜索完成，所以必搜模式不需要远端机器上有任何搜索源 key。
+
 ## 独立网关
 
 网关也可以脱离 Kimi Code 运行：
