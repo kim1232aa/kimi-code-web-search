@@ -156,12 +156,12 @@ test("read-only MCP queries use an already running local gateway", async (t) => 
   assert.ok(requests.some(r => r.url === "/web-tools/mcp/mode"));
 });
 
-test("remote status shows the client-facing URL instead of the gateway bind address", async (t) => {
+async function remoteStatus(t: any, value: unknown) {
   const home = fixture(t);
   const server = http.createServer((req, res) => {
     assert.equal(req.url, "/web-tools/mcp/status");
     res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ ok: true, value: { gateway: { url: "http://127.0.0.1:18492", pid: 321 } } }));
+    res.end(JSON.stringify({ ok: true, value }));
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
@@ -170,10 +170,28 @@ test("remote status shows the client-facing URL instead of the gateway bind addr
   const result = await runNode(["bin/mcp-server.mjs"], { ...process.env, KIMI_CODE_HOME: home, KIMI_WEB_TOOLS_GATEWAY_URL: url },
     rpc(1, "tools/call", { name: "web_status" }));
   assert.equal(result.code, 0, result.stderr);
-  const text = JSON.parse(result.stdout).result.content[0].text;
-  assert.ok(text.includes(`Dashboard & Gateway URL: ${url}`), text);
-  assert.match(text, /Gateway bind URL: http:\/\/127\.0\.0\.1:18492/);
+  return { home, text: JSON.parse(result.stdout).result.content[0].text };
+}
+
+test("remote status lists only usable search engines and hides bind/PID", async (t) => {
+  const { home, text } = await remoteStatus(t, { usable: ["exa"] });
+  assert.equal(text, "Usable search engines: exa");
+  assert.doesNotMatch(text, /Dashboard|Gateway bind|PID|18492/i);
   assert.equal(fs.existsSync(path.join(home, "web-tools", "gateway.log")), false);
+});
+
+test("stdio status still filters a legacy gateway payload to usable engines", async (t) => {
+  const { text } = await remoteStatus(t, {
+    gateway: { url: "http://127.0.0.1:18492", pid: 321 },
+    providers: [
+      { name: "exa", enabled: true, keyConfigured: true },
+      { name: "brave", enabled: true, keyConfigured: false },
+      { name: "searxng", enabled: true, keyConfigured: false, baseUrlConfigured: false },
+      { name: "tavily", enabled: false, keyConfigured: true },
+    ],
+  });
+  assert.equal(text, "Usable search engines: exa");
+  assert.doesNotMatch(text, /brave|searxng|tavily|Dashboard|18492|PID/i);
 });
 
 test("daemon startup gives build instructions for a source-only install", async (t) => {
@@ -240,7 +258,7 @@ test("startup reports a child import failure instead of an eight-second health t
   assert.ok(Date.now() - started < 4000, result.stderr);
 });
 
-test("required hook accepts numeric strings but rejects invalid and stale turns", (t) => {
+test("required hook accepts any binding shape and never rejects a search", (t) => {
   const home = fixture(t);
   const dir = path.join(home, "web-tools");
   fs.mkdirSync(dir);
@@ -249,18 +267,14 @@ test("required hook accepts numeric strings but rejects invalid and stale turns"
     env: { ...process.env, KIMI_CODE_HOME: home }, input: JSON.stringify(payload), encoding: "utf8",
   });
   assert.equal(hook("user-prompt-submit.mjs", { session_id: "session-a" }).status, 0);
-  for (const turn_id of [1, "1"]) {
+  for (const turn_id of [1, "1", undefined, null, 2, "999"]) {
     const pre = hook("pre-tool-gate.mjs", { session_id: "session-a", tool_name: "web_search",
       tool_input: { query: "fixture", session_id: "session-a", turn_id } });
-    assert.equal(pre.status, 0, pre.stderr);
-  }
-  for (const turn_id of [undefined, null, true, "", " ", "1e0", 2, "2"]) {
-    assert.equal(hook("pre-tool-gate.mjs", { session_id: "session-a", tool_name: "web_search",
-      tool_input: { query: "fixture", session_id: "session-a", turn_id } }).status, 2);
+    assert.equal(pre.status, 0, `a stale/absent turn_id must not block the call: ${pre.stderr}`);
   }
   const stop = hook("stop-turn-gate.mjs", { session_id: "session-a" });
   assert.equal(stop.status, 2);
-  assert.match(stop.stderr, /turn_id=1/);
+  assert.match(stop.stderr, /Run any web search/);
 });
 
 test("a dead lock owner is reclaimed without losing existing session state", async (t) => {
@@ -356,7 +370,7 @@ test("stop cleans the state file when the recorded PID is already dead", async (
   assert.equal(fs.existsSync(gwPath), false);
 });
 
-test("gateway requires explicit current-turn binding without borrowing another session", async (t) => {
+test("gateway records a retrieval against the session's live turn even without a binding", async (t) => {
   const home = fixture(t);
   const handle = await startGatewayServer({ host: "127.0.0.1", port: 0, baseDir: path.join(home, "web-tools"), projectRoot: root });
   t.after(() => handle.close());
@@ -369,16 +383,10 @@ test("gateway requires explicit current-turn binding without borrowing another s
     });
     assert.equal(prompt.status, 0, prompt.stderr);
   }
-  for (const binding of [{}, { sessionId: "session-a" }, { sessionId: "session-a", turnId: 2 }, { sessionId: "missing", turnId: 1 }]) {
-    const response = await fetch(`${handle.url}/web-tools/mcp/fetch`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ url: "http://127.0.0.1/private", ...binding }),
-    });
-    assert.equal(response.status, 400, await response.text());
-  }
-  assert.equal(handle.storage.getTurnState("session-a")!.webFetchCompleted, false);
+  // A fetch to a blocked private URL still records the attempt (and the
+  // failure) on the caller's turn — a stale or absent binding is not an error.
   const result = await runNode(["bin/mcp-server.mjs"], env, rpc(1, "tools/call", {
-    name: "web_fetch", arguments: { url: "http://127.0.0.1/private", session_id: "session-a", turn_id: "1" },
+    name: "web_fetch", arguments: { url: "http://127.0.0.1/private", session_id: "session-a" },
   }) + rpc(2, "ping"));
   const replies = result.stdout.trim().split("\n").map(line => JSON.parse(line));
   assert.equal(replies.find(reply => reply.id === 1).result.isError, true);

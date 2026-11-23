@@ -3,7 +3,7 @@ name: web-research
 description: Use when web search, primary-source verification, full-page extraction, Xiaohongshu or X research, or Kimi Web Tools provider and Search Mode configuration is needed.
 ---
 
-# Web Research Skill (`kimi-code-web-search`)
+# Web Research Skill (`/skill:web:web-research`)
 
 Use `web_search` to discover sources and `web_fetch` to inspect evidence. A completed search satisfies a required turn; it does not by itself verify a claim.
 
@@ -35,4 +35,4 @@ An existing configuration with `enabled: false` always exempts research enforcem
 
 ## 4. Status and Web UI
 
-Call `web_status({ include_quotas: true })` for mode, routing policy (`ordered`, `round-robin`, `random`), key health, quotas, and platform login state. Use the `Dashboard & Gateway URL` returned by the bundled status tool, not the bind address. The dashboard offers the four-mode `SearchModeButton` (`smart` is labelled `Jev 判定`) with Global/Session scope and a Smart/Jev classifier panel for backend, endpoint/model, credentials, timeout, test action, no-route exemption, and external receipts. Reload plugin/session hooks after installation or updates. Keep keys, private endpoints, and transcript data out of public examples and reports.
+Call `web_status({})` to list engines that can actually search. It does not report bind addresses, PIDs, quotas, or dashboard URLs. Configure keys and routing on the gateway host's dashboard; reload plugin/session hooks after installation or updates. Keep keys, private endpoints, and transcript data out of public examples and reports.

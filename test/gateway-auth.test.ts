@@ -81,7 +81,8 @@ test("POST /mcp speaks stateless Streamable HTTP and requires the bearer token",
   const call = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "web_status", arguments: {} } }, auth);
   assert.equal(call.status, 200);
   const callBody = (await call.json()) as { result: { content: Array<{ text: string }> } };
-  assert.match(callBody.result.content[0].text, /"mode": "auto"/);
+  assert.match(callBody.result.content[0].text, /Usable search engines:/);
+  assert.doesNotMatch(callBody.result.content[0].text, /Dashboard|Gateway bind|PID|"mode"|18492/i);
 
   const get = await fetch(`${handle.url}/mcp`);
   assert.equal(get.status, 405, "the endpoint is stateless and accepts POST only");

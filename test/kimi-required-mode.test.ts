@@ -22,16 +22,16 @@ function fixture(t: any) {
   return { home, storage, hook };
 }
 
-test("required prompt binds tool calls to the actual session", (t) => {
+test("required prompt tells the model any search channel satisfies the turn", (t) => {
   const { storage, hook } = fixture(t);
   storage.setSessionMode("global", "required");
   const result = hook("user-prompt-submit.mjs", { session_id: "session-a" });
   assert.equal(result.status, 0);
-  assert.match(result.stdout, /session_id.*session-a/);
-  assert.match(result.stdout, /turn_id/);
+  assert.match(result.stdout, /Any web search counts/);
+  assert.match(result.stdout, /built-in `WebSearch`/);
 });
 
-test("pre-tool does not count a call as completed and rejects a different session", (t) => {
+test("pre-tool does not count a call as completed and never blocks on a stale binding", (t) => {
   const { storage, hook } = fixture(t);
   storage.setSessionMode("global", "required");
   hook("user-prompt-submit.mjs", { session_id: "session-a" });
@@ -43,12 +43,11 @@ test("pre-tool does not count a call as completed and rejects a different sessio
   assert.equal(storage.getTurnState("session-a")!.webSearchCompleted, false);
   const stop = hook("stop-turn-gate.mjs", { session_id: "session-a" });
   assert.equal(stop.status, 2);
-  const wrongSession = hook("pre-tool-gate.mjs", {
+  const staleSession = hook("pre-tool-gate.mjs", {
     session_id: "session-a", tool_name: ownSearch,
     tool_input: { session_id: "session-b" },
   });
-  assert.equal(wrongSession.status, 2);
-  assert.match(wrongSession.stderr, /session-a/);
+  assert.equal(staleSession.status, 0, "a mismatched binding is advisory, not a denial");
 });
 
 test("a mid-turn mode switch takes effect next turn; off blocks tools immediately", (t) => {
@@ -70,17 +69,17 @@ test("a mid-turn mode switch takes effect next turn; off blocks tools immediatel
   assert.equal(hook("stop-turn-gate.mjs", { session_id: "session-a" }).status, 0);
 });
 
-test("auto mode allows optional binding to be omitted but rejects an explicit different session", (t) => {
+test("auto mode allows the binding to be omitted or mismatched without denial", (t) => {
   const { storage, hook } = fixture(t);
   hook("user-prompt-submit.mjs", { session_id: "session-a" });
   const ordinary = hook("pre-tool-gate.mjs", {
     session_id: "session-a", tool_name: ownSearch, tool_input: { query: "example" },
   });
   assert.equal(ordinary.status, 0, ordinary.stderr);
-  const incorrect = hook("pre-tool-gate.mjs", {
+  const mismatched = hook("pre-tool-gate.mjs", {
     session_id: "session-a", tool_name: ownSearch, tool_input: { query: "example", session_id: "session-b" },
   });
-  assert.equal(incorrect.status, 2);
+  assert.equal(mismatched.status, 0, "a stale binding never blocks a search");
   assert.equal(storage.getTurnState("session-a")!.webSearchCompleted, false);
 });
 

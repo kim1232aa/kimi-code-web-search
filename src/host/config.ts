@@ -44,7 +44,6 @@ export const DEFAULT_SETTINGS = {
   fetchOrder: [] as string[],
   providerBaseUrls: {} as Record<string, string>,
   providerEnabled: {} as Record<string, boolean>,
-  platformEnabled: { xiaohongshu: true, x: true } as Record<string, boolean>,
   providerOptions: {} as StoredProviderOptions,
   braveQuotaCache: {} as Record<string, QuotaSnapshot>,
   searchRoutingPolicy: "ordered" as ToolSearchRoutingPolicy,
@@ -68,7 +67,6 @@ export interface WebToolsSettings {
   fetchOrder: string[];
   providerBaseUrls: Record<string, string>;
   providerEnabled: Record<string, boolean>;
-  platformEnabled: Record<string, boolean>;
   providerOptions: StoredProviderOptions;
   /** Brave per-key quota snapshots captured from search response headers. */
   braveQuotaCache: Record<string, QuotaSnapshot>;
@@ -226,7 +224,6 @@ export function validateWebToolsSettings(rawInput?: unknown): WebToolsSettings {
     fetchOrder,
     providerBaseUrls: sanitizeBaseUrlOverrides(unwrapped.providerBaseUrls),
     providerEnabled: sanitizeBooleanDict(unwrapped.providerEnabled),
-    platformEnabled: sanitizeBooleanDict(unwrapped.platformEnabled, DEFAULT_SETTINGS.platformEnabled),
     providerOptions: sanitizeRecordDict(unwrapped.providerOptions) as StoredProviderOptions,
     braveQuotaCache: sanitizeRecordDict<QuotaSnapshot>(unwrapped.braveQuotaCache),
     searchRoutingPolicy,

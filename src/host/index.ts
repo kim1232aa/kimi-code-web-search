@@ -12,7 +12,7 @@
  */
 import type { WebToolsContext } from "./context-types.ts";
 import { Config as PluginConfig, installConfig, type WebToolsSettings } from "./config.ts";
-import { createSearchProvider, createFetchProvider, createPoolStore, PROVIDER_ID, WebToolsWebError } from "./registry.ts";
+import { createSearchProvider, createFetchProvider, createPoolStore, PROVIDER_ID } from "./registry.ts";
 import { registerRoutes } from "./routes.ts";
 import { Stats } from "./stats.ts";
 import { CURRENT_VERSION, compareVersions } from "../shared/version.ts";
@@ -47,12 +47,7 @@ import {
 } from "./custom-provider-schema.ts";
 import type { CustomProviderConfig, CustomSourceErrorCode, CustomSourceTestView, CustomProviderDraft } from "../shared/custom-provider-types.ts";
 
-import { SpecializedSourceRegistry } from "./sources/registry.ts";
-import { XiaohongshuSource } from "./sources/xiaohongshu.ts";
-import { XSource } from "./sources/x.ts";
-import { createNativeBrowserRuntime } from "./browser/index.ts";
 import { extractSearchHints } from "./search-hints.ts";
-import type { SourceFetchOutcome } from "./sources/types.ts";
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = "dsh-web-tools";
@@ -72,50 +67,6 @@ const RELEASES_URL = "https://github.com/A3Boy/dsh-web-tools/releases";
 const VERSION_CACHE_MS = 6 * 60 * 60 * 1000;
 let versionCache: { fetchedAt: number; value: VersionCheckView } | null = null;
 
-export function toRoutedFetchResponse(url: string, outcome: SourceFetchOutcome) {
-  if (outcome.error) {
-    const error = new WebToolsWebError(
-      `platform fetch failed (${outcome.error.code}): ${outcome.error.message}`,
-    );
-    if (outcome.error.code === "aborted") error.code = "WEB_ABORTED";
-    throw error;
-  }
-
-  const item = outcome.item;
-  const rawContent = item?.text?.trim();
-  if (!item || !rawContent) {
-    throw new WebToolsWebError(`platform fetch returned empty content for ${url}`);
-  }
-
-  const sections: string[] = [];
-  if (item.title?.trim() && !rawContent.startsWith(item.title.trim())) {
-    sections.push(`# ${item.title.trim()}`);
-  }
-
-  const metadata: string[] = [];
-  const author = item.author?.handle || item.author?.name;
-  if (author) metadata.push(`Author: ${author}`);
-  if (item.publishedAt) metadata.push(`Published: ${item.publishedAt}`);
-  const engagement = [
-    typeof item.likes === "number" ? `likes ${item.likes}` : undefined,
-    typeof item.collects === "number" ? `collects ${item.collects}` : undefined,
-    typeof item.retweets === "number" ? `retweets ${item.retweets}` : undefined,
-    typeof item.replies === "number" ? `comments/replies ${item.replies}` : undefined,
-  ].filter(Boolean);
-  if (engagement.length > 0) metadata.push(`Engagement: ${engagement.join(", ")}`);
-  if (metadata.length > 0) sections.push(metadata.join("\n"));
-  sections.push(rawContent);
-  if (item.images?.length) sections.push(`Images: ${item.images.length} attached`);
-  const content = sections.join("\n\n");
-
-  return {
-    url,
-    statusCode: 200,
-    body: { kind: "text" as const, content },
-    truncated: false,
-  };
-}
-
 /**
  * Web engines must not receive raw platform routing markers ("X:", "小红书:").
  * `cleanQuery` also drops explicit `site:` operators, so those are re-attached.
@@ -128,7 +79,6 @@ function withoutPlatformMarker(query: string, hints: ReturnType<typeof extractSe
   ];
   return [hints.cleanQuery, ...operators].join(" ");
 }
-
 /** Release lookup is best-effort: startup and settings must work offline. */
 async function checkVersion(): Promise<VersionCheckView> {
   if (versionCache && Date.now() - versionCache.fetchedAt < VERSION_CACHE_MS) return versionCache.value;
@@ -309,86 +259,30 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
   // ONE shared health store so search + fetch respect the same cooldowns.
   const healthStore = createProviderHealthStore();
 
-  const sourceRegistry = new SpecializedSourceRegistry();
-
   const generalSearchProvider = createSearchProvider(resolveRuntimeConfig, resolveKeys, {
     record: (e) => stats.record({ ...e, at: Date.now() }),
   }, undefined, poolStore, healthStore, resolveSnapshot);
 
   const generalFetchProvider = createFetchProvider(resolveRuntimeConfig, resolveKeys, undefined, poolStore, healthStore, undefined, resolveSnapshot);
 
-  sourceRegistry.setFallbackProviders(generalSearchProvider, generalFetchProvider);
-
-  // Sync platformEnabled from config on boot and live updates
-  configHandle.onMounted(() => {
-    const cfg = readConfig();
-    if (cfg.platformEnabled) {
-      sourceRegistry.setPlatformEnabled(cfg.platformEnabled);
-    }
-  });
-
-  // Wrap search provider with SpecializedSourceRouter for XHS / X transparent platform handling
+  // A provider override names a configured web engine. Platform routing
+  // markers ("小红书:", "X:") are stripped so engines never see them.
   const routedSearchProvider = {
     id: PROVIDER_ID,
     available: () => generalSearchProvider.available(),
     search: async (request: { query: string; maxResults?: number; provider?: string }, signal?: AbortSignal) => {
-      const requestedProvider = typeof request.provider === "string" ? request.provider.trim().toLowerCase() : "";
-      const hints = extractSearchHints(request.query);
-      const explicitPlatform = requestedProvider === "xiaohongshu" || requestedProvider === "x" ? requestedProvider : undefined;
-      if (requestedProvider && !explicitPlatform) {
-        return generalSearchProvider.search({ ...request, query: withoutPlatformMarker(request.query, hints) }, signal);
-      }
-      const outcome = await sourceRegistry.search(
-        request.query,
-        {
-          maxResults: request.maxResults,
-          hints: explicitPlatform ? { ...hints, platform: explicitPlatform, platformExplicit: true } : hints,
-        },
-        signal,
-      );
-      if (outcome.error) {
-        throw new Error(`[${outcome.error.code}] ${outcome.error.message}`);
-      }
-      return {
-        sources: outcome.items.map((item) => ({
-          url: item.url,
-          title: item.title,
-          snippet: item.snippet,
-          publishedAt: item.publishedAt,
-        })),
-        truncated: false,
-      };
+      const query = withoutPlatformMarker(request.query, extractSearchHints(request.query));
+      return generalSearchProvider.search({ ...request, query }, signal);
     },
   };
   ctx.web.registerSearchProvider(routedSearchProvider as never);
 
-  // Wrap fetch provider with SpecializedSourceRouter
   const routedFetchProvider = {
     id: `${PROVIDER_ID}-fetch`,
     available: () => generalFetchProvider.available(),
-    fetch: async (request: { url: string }, signal?: AbortSignal) => {
-      const outcome = await sourceRegistry.fetch(request.url, signal);
-      return toRoutedFetchResponse(request.url, outcome);
-    },
+    fetch: (request: { url: string }, signal?: AbortSignal) => generalFetchProvider.fetch({ url: request.url }, signal),
   };
   ctx.web.registerFetchProvider(routedFetchProvider as never);
-
-  // Specialized Sources: Register Xiaohongshu and Twitter/X with NativeBrowserRuntime
-  const nativeRuntime = createNativeBrowserRuntime();
-  const xhsSource = new XiaohongshuSource(nativeRuntime);
-  const xSource = new XSource(nativeRuntime);
-  sourceRegistry.registerSource(xhsSource);
-  sourceRegistry.registerSource(xSource);
-
-  // Hook NativeBrowserRuntime lifecycle into Cordis effect
-  ctx.effect(
-    () => {
-      return () => {
-        nativeRuntime.dispose().catch(() => {});
-      };
-    },
-    "dsh-web-tools: native browser runtime",
-  );
 
   /** Run one real minimal search through a single provider (test connection). */
   async function testProviderSearch(providerName: string, query: string) {
@@ -582,17 +476,7 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
   // provider service is enabled with a chain provider. Messages use the
   // OFFICIAL @deepseek-ai/dsh-llm createUserMessage ({ content, source }):
   // required = durable snapshot section, correction = one-shot notice.
-  const searchModeMessages = createSearchModeMessages(
-    (input) => defaultCreateUserMessage(input),
-    () => {
-      // The platform-routing lines only make sense while a platform source can
-      // actually serve a routed query; otherwise the model is taught a prefix
-      // that silently does nothing.
-      const cfg = readConfig();
-      const platforms = cfg.platformEnabled ?? {};
-      return platforms.xiaohongshu !== false || platforms.x !== false;
-    },
-  );
+  const searchModeMessages = createSearchModeMessages((input) => defaultCreateUserMessage(input));
   const searchModeRuntime = new SearchModeRuntime(
     () => routedSearchProvider.available(),
     (ctx as unknown as { localStorage?: import("./local-storage.ts").LocalStorage }).localStorage,
@@ -850,8 +734,6 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
         testProviderSearch,
         testFullSearch,
         describeQuotas,
-        nativeRuntime,
-        sourceRegistry,
         checkVersion,
         poolEntries: (providerName) => poolStore.poolOf(providerName),
         proxyStatus,

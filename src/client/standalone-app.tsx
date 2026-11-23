@@ -7,7 +7,7 @@
  *    the exact `SearchModeButton` (智能联网 / Jev 判定 / 始终联网 / 关闭联网),
  *    language switch, and Light/Dark theme toggle.
  *  - Main body hosting the full `WebToolsSection` (provider cards, API keys,
- *    drag-and-drop routing order, Xiaohongshu / X browser login, custom sources).
+ *    drag-and-drop routing order, custom sources).
  * @module
  */
 import * as React from "react";

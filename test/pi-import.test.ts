@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 import { importFromPi } from "../src/host/pi-import.ts";
 import { LocalStorage } from "../src/host/local-storage.ts";
 import { registerRoutes, API_PREFIX } from "../src/host/routes.ts";
-import { SpecializedSourceRegistry } from "../src/host/sources/registry.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -195,8 +194,6 @@ test("/web-tools/api/import/pi route invokes importPi dependency", async () => {
       testProviderSearch: async () => ({}),
       testFullSearch: async () => ({}),
       describeQuotas: async () => ({}),
-      nativeRuntime: {} as any,
-      sourceRegistry: new SpecializedSourceRegistry(),
       importPi: async () => ({
         piDir: "/tmp/pi",
         importedSearchProviders: ["exa"],

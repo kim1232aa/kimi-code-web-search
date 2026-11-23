@@ -49,7 +49,7 @@ export function webResearchCompleted(state: TurnState): boolean {
   return state.webSearchCompleted || state.webFetchCompleted || Boolean(state.externalWebCompleted);
 }
 
-/** The turn policy lines every required turn needs, regardless of platform routing. */
+/** The turn policy lines every required turn needs. */
 const REQUIRED_SEARCH_CORE_LINES = [
   "Web Search is required for this turn.",
   "Before finalizing, complete at least one web_search or web_fetch call.",
@@ -59,31 +59,12 @@ const REQUIRED_SEARCH_CORE_LINES = [
   "If web access fails, say what could not be verified.",
 ];
 
-/**
- * The two lines that only make sense while a platform source (Xiaohongshu / X)
- * is enabled: they advertise a routing prefix the provider strips before the
- * platform search box.
- */
-const REQUIRED_SEARCH_PLATFORM_LINES = [
-  "To target a platform, use exactly one routing prefix such as 小红书: or X:; do not repeat the platform name as a topic keyword.",
-  "The provider removes that routing prefix before entering the platform search box.",
-];
-
 /** The injected "you must research" instruction the model sees on step 1. */
-export const REQUIRED_SEARCH_TEXT = [
-  ...REQUIRED_SEARCH_CORE_LINES.slice(0, 3),
-  ...REQUIRED_SEARCH_PLATFORM_LINES,
-  ...REQUIRED_SEARCH_CORE_LINES.slice(3),
-].join("\n");
+export const REQUIRED_SEARCH_TEXT = REQUIRED_SEARCH_CORE_LINES.join("\n");
 
-/** Same policy with the platform-routing lines dropped (both platforms off). */
-export const REQUIRED_SEARCH_TEXT_NO_PLATFORMS = REQUIRED_SEARCH_CORE_LINES.join("\n");
-
-/**
- * Pick the policy text for the live configuration.
- */
-export function requiredSearchText(platformsEnabled?: boolean): string {
-  return platformsEnabled === false ? REQUIRED_SEARCH_TEXT_NO_PLATFORMS : REQUIRED_SEARCH_TEXT;
+/** Kept for callers that still pass the removed platform flag. */
+export function requiredSearchText(_platformsEnabled?: boolean): string {
+  return REQUIRED_SEARCH_TEXT;
 }
 
 /** One-shot steer used when the model tries to end without researching. */
@@ -283,7 +264,6 @@ export const SEARCH_SMART_TEXT =
  */
 export function createSearchModeMessages(
   createUserMessage: (input: unknown) => unknown = defaultCreateUserMessage,
-  platformsEnabled?: () => boolean,
 ): SearchModeMessages {
   const snapshot = (text: string, section: string) =>
     createUserMessage({
@@ -295,17 +275,7 @@ export function createSearchModeMessages(
         sections: [{ name: section, text }],
       },
     });
-  const policyText = () => {
-    let enabled = true;
-    if (platformsEnabled !== undefined) {
-      try {
-        enabled = platformsEnabled() !== false;
-      } catch {
-        enabled = true;
-      }
-    }
-    return requiredSearchText(enabled);
-  };
+  const policyText = () => REQUIRED_SEARCH_TEXT;
   return {
     required: () => snapshot(policyText(), "web-search-mode"),
     auto: () => snapshot(SEARCH_AUTO_TEXT, "web-search-mode"),

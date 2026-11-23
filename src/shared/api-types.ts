@@ -115,7 +115,6 @@ export interface ConfigView {
   fallbackOrder: string[];
   fetchOrder?: string[];
   providers: ProviderView[];
-  platformEnabled?: Record<string, boolean>;
   smartSearch?: SmartSearchSettings;
   smartSearchConfigured?: boolean;
   smartSearchKeyHint?: string;

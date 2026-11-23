@@ -1,6 +1,6 @@
 # Kimi Web Tools (Plugin Instructions)
 
-Use the available web tools for search and extraction. The bundled `kimi-code-web-search` tools can target a local or remote gateway; do not assume a gateway address.
+Use the available web tools for search and extraction. The bundled `kimi-code-web-search` tools can target a local or remote gateway; do not assume a gateway address. Any web search channel satisfies a required turn — this plugin's tools, the built-in `WebSearch`/`FetchURL`, or another search MCP. The optional research skill is `/skill:web:web-research`; if a skill name is not found, do not retry it — proceed with the tools directly.
 
 ## Core Tools
 
@@ -12,7 +12,7 @@ Use the available web tools for search and extraction. The bundled `kimi-code-we
   - Use `web_fetch` when you already have a specific URL; use `web_search` for discovery. Fetch official documentation, source files, release notes, or other primary sources and cite key links before asserting detailed external facts.
   - Treat `web_search` snippets as discovery leads, not full page details or verified comments. Describe comments/replies as verified only when `web_fetch` returns their contents.
 - `web_mode`: View or change the active Search Mode (`auto`, `smart`, `required`, `off`). `/web:mode smart` (UI label `Jev 判定`) also accepts `jev`, `自适应`, and `智能判定`. A mid-turn switch takes effect from the next user turn — the current turn's Stop decision is frozen at turn start — while `off` immediately blocks this plugin's web tools.
-- `web_status`: Inspect a running gateway without starting it. Use the returned `Dashboard & Gateway URL`, not its bind address.
+- `web_status`: List search engines that can actually run a query. It does not start a gateway and does not report bind addresses, PIDs, or dashboard URLs.
 
 ## Search Mode Policy
 

@@ -28,7 +28,6 @@ function view(overrides: Record<string, unknown> = {}) {
     providerAttemptTimeoutMs: 10000,
     fallbackOrder: ["tavily", "parallel"],
     providers: [],
-    platformEnabled: {},
     searchRoutingPolicy: "ordered",
     ...overrides,
   } as never;

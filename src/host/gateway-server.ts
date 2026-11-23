@@ -89,11 +89,11 @@ const MCP_TOOLS = [
   {
     name: "web_search",
     description:
-      "Search the web or social platforms (Xiaohongshu / X) through the configured multi-provider routing chain. Prefix the query with `小红书:` or `X:` to target a platform directly.",
+      "Search the web through the configured multi-provider routing chain.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Search query. Use `小红书: <topic>` or `X: <topic>` for platform routing." },
+        query: { type: "string", description: "Search query." },
         max_results: { type: "integer", minimum: 1, maximum: 20, description: "Maximum results (default 8, max 20)." },
         provider: { type: "string", description: "Optional provider to try first for cross-verification." },
         session_id: { type: "string", description: "Session identifier supplied by the turn's UserPromptSubmit hook." },
@@ -104,7 +104,7 @@ const MCP_TOOLS = [
   },
   {
     name: "web_fetch",
-    description: "Fetch and extract clean readable text from a public URL, or the full post and comments from a Xiaohongshu / X URL.",
+    description: "Fetch and extract clean readable text from a public URL.",
     inputSchema: {
       type: "object",
       properties: {
@@ -129,11 +129,10 @@ const MCP_TOOLS = [
   },
   {
     name: "web_status",
-    description: "Inspect gateway health, Search Mode, provider routing, and platform session status.",
+    description: "List search engines that can actually run a query (configured key or explicit self-hosted instance).",
     inputSchema: {
       type: "object",
       properties: {
-        include_quotas: { type: "boolean" },
         session_id: { type: "string" },
       },
     },
@@ -208,6 +207,12 @@ function mcpToolText(name: string, value: unknown): string {
   if (name === "web_fetch") {
     const body = record.body && typeof record.body === "object" ? (record.body as Record<string, unknown>).content : undefined;
     return `URL: ${record.url ?? ""}\n\n${typeof body === "string" ? body : JSON.stringify(record)}`;
+  }
+  if (name === "web_status") {
+    const names = Array.isArray(record.usable)
+      ? record.usable.filter((name): name is string => typeof name === "string" && Boolean(name.trim()))
+      : [];
+    return `Usable search engines: ${names.length > 0 ? names.join(", ") : "(none)"}`;
   }
   return JSON.stringify(record, null, 2);
 }
@@ -515,6 +520,20 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
     return parsed?.value;
   }
 
+  async function usableSearchEngineNames(): Promise<string[]> {
+    const configView = (await callInternalApi("config/get")) as { providers?: Array<Record<string, unknown>> };
+    const names: string[] = [];
+    for (const item of configView.providers ?? []) {
+      if (!item || item.enabled === false) continue;
+      const name = typeof item.name === "string" ? item.name.trim() : "";
+      if (!name) continue;
+      const selfHosted = name === "searxng" || item.needsBaseUrl === true;
+      const configured = selfHosted ? item.baseUrlConfigured === true : item.keyConfigured === true;
+      if (configured) names.push(name);
+    }
+    return names;
+  }
+
   // Shared by the private `/web-tools/mcp/*` routes and the public MCP
   // endpoint. Throws on caller error or tool failure; returns the value body.
   async function runMcpTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -533,7 +552,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
       return storageModeValue(sessionId);
     }
     if (name === "web_status") {
-      return { ...storageModeValue(sessionId), available: searchProvider?.available() ?? false };
+      return { usable: await usableSearchEngineNames() };
     }
     if (storage.getEffectiveSessionMode(sessionId) === "off") {
       throw new Error(WEB_DISABLED_DENIAL);
@@ -972,9 +991,6 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
         if (mcpAction === "status") {
           const sessionId = typeof payload.sessionId === "string" && payload.sessionId.trim() ? payload.sessionId.trim() : "global";
           const configView = (await callInternalApi("config/get")) as Record<string, unknown>;
-          const platformStatus = (await callInternalApi("platform/status").catch(() => ({ platforms: {} }))) as {
-            platforms?: Record<string, unknown>;
-          };
           const quotaView =
             payload.includeQuotas === true
               ? ((await callInternalApi("quota/describe").catch(() => ({ quotas: {} }))) as { quotas?: Record<string, unknown> })
@@ -984,9 +1000,12 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           const addr = server.address();
           const boundPort = typeof addr === "object" && addr ? addr.port : requestedPort;
 
+          // Internal diagnostics for the stdio bridge and the dashboard. The
+          // model-facing `web_status` MCP tool renders only `usable` from this.
           writeJson(res, 200, {
             ok: true,
             value: {
+              usable: await usableSearchEngineNames(),
               version: CURRENT_VERSION,
               gateway: {
                 pid: process.pid,
@@ -1008,7 +1027,6 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
                 fetchOrder: configView.fetchOrder,
                 searchRoutingPolicy: configView.searchRoutingPolicy,
                 providerAttemptTimeoutMs: configView.providerAttemptTimeoutMs,
-                platformEnabled: configView.platformEnabled,
                 smartSearch: configView.smartSearch,
                 smartSearchConfigured: configView.smartSearchConfigured,
                 exemptWhenNoProvider: configView.exemptWhenNoProvider,
@@ -1017,7 +1035,6 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
               },
               lastSmartDecision: smartDecision,
               providers: configView.providers,
-              platforms: platformStatus.platforms ?? {},
               ...(quotaView ? { quotas: quotaView.quotas } : {}),
             },
           });

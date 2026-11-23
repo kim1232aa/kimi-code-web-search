@@ -10,8 +10,8 @@ import {
 } from "./mode-state.mjs";
 
 function requiredSearchCorrectionText(searchOnly) {
-  const call = searchOnly ? "Call web_search" : "Call web_search or web_fetch";
-  return `Web Search is required for this turn. ${call} before finalizing: search for what the user's request depends on, not an arbitrary query (\`web_mode\`/\`web_status\` do not count); mark unresolved gaps as 未验证.`;
+  const call = searchOnly ? "Run any web search" : "Run any web search or page read";
+  return `Web Search is required for this turn. ${call} before finalizing — this plugin's tools, built-in WebSearch/FetchURL, or another search MCP all count (\`web_mode\`/\`web_status\` do not); mark unresolved gaps as 未验证.`;
 }
 
 const FETCH_ONLY_NOTE =
@@ -19,7 +19,7 @@ const FETCH_ONLY_NOTE =
 
 function failedResearchCorrectionText(searchOnly) {
   const what = searchOnly ? "web search" : "web lookup";
-  return `Every ${what} this turn failed (errors or quota limits). Before finalizing, rewrite the query and switch \`provider\` or use another web search tool; if those fail too, answer and mark the affected claims 未验证.`;
+  return `Every ${what} this turn failed (errors or quota limits). Before finalizing, rewrite the query and switch to another source or another search tool; if those fail too, answer and mark the affected claims 未验证.`;
 }
 
 const FAILED_RESEARCH_REMINDER =
@@ -136,10 +136,12 @@ async function main() {
 
   if (shouldSteer) {
     // exitCode instead of process.exit lets queued stderr drain (Node docs:
-    // process.exit may truncate pending writes on POSIX pipes).
+    // process.exit may truncate pending writes on POSIX pipes). No session/turn
+    // ids are printed: the binding is advisory now, and echoing it made models
+    // retry with a stale id.
     const fetchOnlyNote = fetchOnly ? ` ${FETCH_ONLY_NOTE}` : "";
     const text = allFailed ? failedResearchCorrectionText(searchOnlyTurn) : `${requiredSearchCorrectionText(searchOnlyTurn)}${fetchOnlyNote}`;
-    process.stderr.write(`${text} (session_id="${sessionId}", turn_id=${turnId})`);
+    process.stderr.write(text);
     process.exitCode = 2;
     return;
   }

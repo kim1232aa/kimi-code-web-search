@@ -302,14 +302,13 @@ function hookConfig(baseUrl: string): Record<string, unknown> {
   return {
     enabled: true,
     defaultProvider: "exa",
-    platformEnabled: { xiaohongshu: false, x: false },
     exemptWhenNoProvider: false,
     recognizeExternalWebTools: false,
     smartSearch: classifierInput(baseUrl).config.smartSearch,
   };
 }
 
-test("smart escalated hooks bind session/turn and Stop steers before research", async (t) => {
+test("smart escalated hooks steer once, then stop; stale bindings never hard-fail", async (t) => {
   const mock = await mockClassifier(t);
   const home = hookHome(t, "smart", hookConfig(mock.baseUrl), { WEB_TOOLS_TYPESAFE: "test-classifier-key", WEB_TOOLS_EXA: "test-search-key" });
   const sessionId = "smart-escalated";
@@ -318,18 +317,18 @@ test("smart escalated hooks bind session/turn and Stop steers before research", 
   });
   assert.equal(prompt.status, 0, prompt.stderr);
   assert.match(prompt.stdout, /Web Search is required/);
-  assert.match(prompt.stdout, /session_id="smart-escalated"/);
-  assert.match(prompt.stdout, /turn_id=1/);
   assert.match(prompt.stdout, /not an arbitrary query to pass this check/, "the prompt must forbid performative searches");
-  assert.match(prompt.stdout, /reading a URL alone does not count/, "default evidence is a real search");
+  assert.match(prompt.stdout, /Reading a URL alone does not count/, "default evidence is a real search");
+  assert.match(prompt.stdout, /Any web search counts/, "the prompt must accept any search channel");
   assert.equal(storedTurn(home, sessionId).required, true);
   assert.equal(storedTurn(home, sessionId).smartEscalated, true);
 
+  // A stale or missing binding is advisory: it must never block a legitimate call.
   for (const input of [{}, { session_id: sessionId }, { session_id: "another-session", turn_id: 1 }, { session_id: sessionId, turn_id: 2 }]) {
-    const denied = await runHook(home, "pre-tool-gate.mjs", {
-      hook_event_name: "PreToolUse", session_id: sessionId, tool_name: "web_search", tool_input: input,
+    const allowed = await runHook(home, "pre-tool-gate.mjs", {
+      hook_event_name: "PreToolUse", session_id: sessionId, tool_name: "web_search", tool_call_id: "own-search", tool_input: input,
     });
-    assert.equal(denied.status, 2, `must reject invalid turn binding: ${JSON.stringify(input)}; ${denied.stderr}`);
+    assert.equal(allowed.status, 0, `a stale binding must not block the call: ${JSON.stringify(input)}; ${allowed.stderr}`);
   }
   const allowed = await runHook(home, "pre-tool-gate.mjs", {
     hook_event_name: "PreToolUse", session_id: sessionId, tool_name: "web_search", tool_call_id: "own-search",
@@ -338,9 +337,7 @@ test("smart escalated hooks bind session/turn and Stop steers before research", 
   assert.equal(allowed.status, 0, allowed.stderr);
   const stop = await runHook(home, "stop-turn-gate.mjs", { hook_event_name: "Stop", session_id: sessionId, agent_id: "main" });
   assert.equal(stop.status, 2);
-  assert.match(stop.stderr, /Call web_search before finalizing/);
-  assert.match(stop.stderr, /session_id="smart-escalated"/);
-  assert.match(stop.stderr, /turn_id=1/);
+  assert.match(stop.stderr, /Run any web search/);
   const recursiveStop = await runHook(home, "stop-turn-gate.mjs", {
     hook_event_name: "Stop", session_id: sessionId, agent_id: "main", stop_hook_active: true,
   });
@@ -389,7 +386,6 @@ test("auto mode hooks stay completely silent in stdout to avoid terminal noise",
   const home = hookHome(t, "auto", {
     enabled: true,
     defaultProvider: "exa",
-    platformEnabled: { xiaohongshu: false, x: false },
     exemptWhenNoProvider: false,
   }, { WEB_TOOLS_EXA: "test-key" });
   const prompt = await runHook(home, "user-prompt-submit.mjs", {
@@ -404,8 +400,7 @@ test("auto mode hooks stay completely silent in stdout to avoid terminal noise",
 
 test("required hooks exempt an existing config without usable routes and emit a notice", async (t) => {
   const home = hookHome(t, "required", {
-    enabled: true, defaultProvider: "exa", fallbackOrder: [],
-    platformEnabled: { xiaohongshu: false, x: false }, exemptWhenNoProvider: true,
+    enabled: true, defaultProvider: "exa", fallbackOrder: [], exemptWhenNoProvider: true,
   });
   const prompt = await runHook(home, "user-prompt-submit.mjs", { hook_event_name: "UserPromptSubmit", session_id: "no-route", prompt: "Check the release." });
   assert.equal(prompt.status, 0, prompt.stderr);
@@ -420,7 +415,6 @@ for (const recognizeExternalWebTools of [true, false]) {
   test(`external web receipts satisfy required Stop only when recognition is ${recognizeExternalWebTools}`, async (t) => {
     const home = hookHome(t, "required", {
       enabled: true, defaultProvider: "exa", exemptWhenNoProvider: false, recognizeExternalWebTools,
-      platformEnabled: { xiaohongshu: false, x: false },
     }, { WEB_TOOLS_EXA: "test-search-key" });
     const sessionId = "external-receipt";
     const prompt = await runHook(home, "user-prompt-submit.mjs", { hook_event_name: "UserPromptSubmit", session_id: sessionId, prompt: "Check the release." });
@@ -602,7 +596,7 @@ test("extractKimiSessionContext drops the truncated first line of an oversized w
 });
 
 test("hasUsableSearchProvider recognizes search keys supplied through the environment", () => {
-  const cfg = { enabled: true, defaultProvider: "exa", platformEnabled: { xiaohongshu: false, x: false } };
+  const cfg = { enabled: true, defaultProvider: "exa" };
   assert.equal(hasUsableSearchProvider(cfg, {}, {}, undefined, {}), false);
   assert.equal(hasUsableSearchProvider(cfg, {}, {}, undefined, { WEB_TOOLS_EXA: "test-search-key" }), true);
   assert.equal(
@@ -614,8 +608,7 @@ test("hasUsableSearchProvider recognizes search keys supplied through the enviro
 
 test("hooks do not exempt a required turn when a search key exists only in the environment", async (t) => {
   const config = {
-    enabled: true, defaultProvider: "exa", fallbackOrder: [],
-    platformEnabled: { xiaohongshu: false, x: false }, exemptWhenNoProvider: true,
+    enabled: true, defaultProvider: "exa", fallbackOrder: [], exemptWhenNoProvider: true,
   };
   const withEnv = hookHome(t, "required", config);
   const keyed = await runHook(
@@ -727,7 +720,6 @@ test("user-prompt-submit advertises ready search providers without leaking secre
     enabled: true,
     defaultProvider: "tavily",
     fallbackOrder: ["exa"],
-    platformEnabled: { xiaohongshu: false, x: false },
     exemptWhenNoProvider: false,
     recognizeExternalWebTools: true,
   }, { WEB_TOOLS_TAVILY: "tvly-secret-val", WEB_TOOLS_EXA: "exa-secret-val" });
@@ -840,14 +832,13 @@ test("requiredEvidence defaults to search: a URL read alone gets one correction,
     const home = hookHome(t, "required", {
       enabled: true,
       defaultProvider: "exa",
-      platformEnabled: { xiaohongshu: false, x: false },
       exemptWhenNoProvider: false,
       ...(requiredEvidence ? { requiredEvidence } : {}),
     }, { WEB_TOOLS_EXA: "test-search-key" });
     const sessionId = `evidence-${requiredEvidence ?? "default"}`;
     const prompt = await runHook(home, "user-prompt-submit.mjs", { session_id: sessionId, prompt: "Read the docs page." });
     assert.equal(prompt.status, 0, prompt.stderr);
-    assert.match(prompt.stdout, settles ? /A search or a URL read satisfies this turn/ : /reading a URL alone does not count/);
+    assert.match(prompt.stdout, settles ? /Any web search or page read counts/ : /Reading a URL alone does not count/);
     assert.equal(storedTurn(home, sessionId).requiredEvidence, requiredEvidence ?? "search");
 
     new LocalStorage(path.join(home, "web-tools")).completeTool(sessionId, "web_fetch", true, 1);
@@ -868,7 +859,7 @@ test("requiredEvidence defaults to search: a URL read alone gets one correction,
       continue;
     }
     assert.equal(stop.status, 2);
-    assert.match(stop.stderr, /Call web_search before finalizing/);
+    assert.match(stop.stderr, /Run any web search before finalizing/);
     assert.match(stop.stderr, /Reading a URL alone does not satisfy this turn/);
 
     const search = await runHook(home, "post-tool-receipt.mjs", {
@@ -890,7 +881,6 @@ test("text-only provider errors count as failed and an all-failed turn is steere
   const home = hookHome(t, "required", {
     enabled: true,
     defaultProvider: "exa",
-    platformEnabled: { xiaohongshu: false, x: false },
     exemptWhenNoProvider: false,
   }, { WEB_TOOLS_EXA: "test-search-key" });
   const sessionId = "all-failed";
@@ -910,7 +900,7 @@ test("text-only provider errors count as failed and an all-failed turn is steere
   const steer = await runHook(home, "stop-turn-gate.mjs", { session_id: sessionId });
   assert.equal(steer.status, 2);
   assert.match(steer.stderr, /Every web search this turn failed/);
-  assert.match(steer.stderr, /switch `provider` or use another web search tool/);
+  assert.match(steer.stderr, /switch to another source or another search tool/);
 
   const finalStop = await runHook(home, "stop-turn-gate.mjs", { session_id: sessionId });
   assert.equal(finalStop.status, 0, "the correction budget is one per turn");
@@ -966,7 +956,6 @@ test("external web proxy calls and missing config.json default to enabled receip
     enabled: true,
     defaultProvider: "exa",
     fallbackOrder: [],
-    platformEnabled: { xiaohongshu: false, x: false },
   });
   const exempted = await runHook(home, "user-prompt-submit.mjs", {
     hook_event_name: "UserPromptSubmit",
@@ -981,7 +970,6 @@ test("UserPromptSubmit preserves turn state on is_steer; subagent activity reset
   const home = hookHome(t, "required", {
     enabled: true,
     defaultProvider: "exa",
-    platformEnabled: { xiaohongshu: false, x: false },
     exemptWhenNoProvider: false,
   }, { WEB_TOOLS_EXA: "test-search-key" });
   const sessionId = "steer-subagent";
@@ -1017,7 +1005,6 @@ test("Stop gate stays silent while a subagent is active and resumes after Subage
   const home = hookHome(t, "required", {
     enabled: true,
     defaultProvider: "exa",
-    platformEnabled: { xiaohongshu: false, x: false },
     exemptWhenNoProvider: false,
   }, { WEB_TOOLS_EXA: "test-search-key" });
   const sessionId = "subagent-stop";
@@ -1073,7 +1060,6 @@ test("system-trigger turns skip the Stop gate once and user turns clear the mark
   const home = hookHome(t, "required", {
     enabled: true,
     defaultProvider: "exa",
-    platformEnabled: { xiaohongshu: false, x: false },
     exemptWhenNoProvider: false,
   }, { WEB_TOOLS_EXA: "test-search-key" });
   const sessionId = "system-turn";
@@ -1121,7 +1107,6 @@ test("SessionEnd removes ephemeral turn state but keeps explicit mode overrides"
   const home = hookHome(t, "required", {
     enabled: true,
     defaultProvider: "exa",
-    platformEnabled: { xiaohongshu: false, x: false },
     exemptWhenNoProvider: false,
   }, { WEB_TOOLS_EXA: "test-search-key" });
   const statePath = path.join(home, "web-tools", "mode-state.json");
@@ -1148,7 +1133,6 @@ test("newTurn prunes stale non-override sessions but keeps overrides and fresh e
   const home = hookHome(t, "required", {
     enabled: true,
     defaultProvider: "exa",
-    platformEnabled: { xiaohongshu: false, x: false },
     exemptWhenNoProvider: false,
   }, { WEB_TOOLS_EXA: "test-search-key" });
   const statePath = path.join(home, "web-tools", "mode-state.json");
@@ -1172,11 +1156,10 @@ test("newTurn prunes stale non-override sessions but keeps overrides and fresh e
   assert.ok(doc.sessions["prune-trigger"].turn);
 });
 
-test("required subagent calls use the same binding and never settle another session", async (t) => {
+test("a subagent call without a binding still counts toward the parent turn when bound", async (t) => {
   const home = hookHome(t, "required", {
     enabled: true,
     defaultProvider: "exa",
-    platformEnabled: { xiaohongshu: false, x: false },
     exemptWhenNoProvider: false,
     recognizeExternalWebTools: true,
     requiredEvidence: "search-or-fetch",
@@ -1192,10 +1175,10 @@ test("required subagent calls use the same binding and never settle another sess
     tool_call_id: "sub-call-1",
     tool_input: { query: "example docs" },
   });
-  assert.equal(unbound.status, 2, unbound.stderr);
+  assert.equal(unbound.status, 0, "a subagent call is never blocked for lacking a binding");
 
   const storage = new LocalStorage(path.join(home, "web-tools"));
-  assert.throws(() => storage.bindToolTurn("global"), /session_id and turn_id/i);
+  assert.doesNotThrow(() => storage.bindToolTurn("global"));
   assert.equal(storedTurn(home, sessionId).webSearchCompleted, false);
 
   const ownReceipt = await runHook(home, "post-tool-receipt.mjs", {
@@ -1222,7 +1205,7 @@ test("required subagent calls use the same binding and never settle another sess
   const failedStop = await runHook(home, "stop-turn-gate.mjs", { session_id: sessionId, agent_id: "main" });
   assert.equal(failedStop.status, 2, "an all-failed turn gets one correction to switch sources");
   assert.match(failedStop.stderr, /Every web lookup this turn failed/);
-  assert.match(failedStop.stderr, /switch `provider`/);
+  assert.match(failedStop.stderr, /switch to another source or another search tool/);
 
   // Subsequent successful external call in the same turn must turn externalWebSucceeded to true
   const succeededExternal = await runHook(home, "post-tool-receipt.mjs", {

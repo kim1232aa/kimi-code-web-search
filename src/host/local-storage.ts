@@ -9,13 +9,21 @@
  * @module
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { getWebToolsBaseDir } from "./browser/paths.ts";
 import { DEFAULT_SETTINGS, validateWebToolsSettings, type WebToolsSettings } from "./config.ts";
 import type { SearchMode } from "../shared/api-types.ts";
 import type { TurnState } from "./search-mode-runtime.ts";
 import type { WebToolsCredentialsService, WebToolsSettingsService } from "./context-types.ts";
 import { readModeState, updateModeState } from "../../hooks/mode-state.mjs";
+
+/** `$KIMI_CODE_HOME/web-tools` (default `~/.kimi-code/web-tools`). */
+export function getWebToolsBaseDir(baseDirOverride?: string): string {
+  const home = baseDirOverride
+    ? path.join(baseDirOverride, ".kimi-code")
+    : process.env.KIMI_CODE_HOME?.trim() || path.join(os.homedir(), ".kimi-code");
+  return path.join(home, "web-tools");
+}
 
 export interface ModeSessionRecord {
   mode?: SearchMode;
@@ -260,15 +268,10 @@ export class LocalStorage {
   bindToolTurn(sessionId: string, turnId?: number): number | undefined {
     const doc = this.readModeState();
     const entry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
-    const mode = entry?.mode ?? doc.globalMode;
-    const turnRequired = (mode === "required" || (mode === "smart" && entry?.turn?.required === true)) && !entry?.turn?.exempted;
-    if (turnRequired && (!sessionId || sessionId === "global" || !entry?.turn || turnId === undefined)) {
-      throw new Error("Required mode needs session_id and turn_id from the current UserPromptSubmit hook.");
-    }
-    if (turnId !== undefined && turnId !== entry?.turn?.turn) {
-      throw new Error(`Stale or unknown turn for session ${sessionId}; use the current hook's turn_id.`);
-    }
-    return turnId ?? entry?.turn?.turn;
+    // A mismatched turn id is ignored, not rejected: a stale binding must never
+    // turn a legitimate search into a hard error, and the gateway records the
+    // completion against the session's live turn either way.
+    return turnId !== undefined && turnId === entry?.turn?.turn ? turnId : entry?.turn?.turn;
   }
 
   completeTool(sessionId: string, kind: "web_search" | "web_fetch", succeeded: boolean, turnId?: number): void {

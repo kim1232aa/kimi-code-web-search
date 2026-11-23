@@ -93,19 +93,19 @@ node ./bin/import-pi.mjs --pi-dir /path/to/pi/agent
 | `mcp__plugin-web_s__web_search` | 跨搜索源池的网页/平台搜索；可选 `provider` 指定优先源 |
 | `mcp__plugin-web_s__web_fetch` | URL → 干净 Markdown；小红书 / X 帖子返回全文与评论 |
 | `mcp__plugin-web_s__web_mode` | 查看 / 设置 / 循环切换搜索模式 |
-| `mcp__plugin-web_s__web_status` | 网关健康、路由链、key 池、额度、平台会话 |
+| `mcp__plugin-web_s__web_status` | 真正能发搜索的引擎列表 |
 
 ### 斜杠命令
 
 - `/web:mode [auto|smart|required|off|toggle]` —— 查看或切换模式（`smart` 也接受 `jev`、`自适应`、`智能判定`）。
-- `/web:status` —— 网关、模式、路由、额度、平台登录摘要。
-- `/web:dashboard` —— 显示当前配置的仪表盘地址，不启动网关。
+- `/web:status` —— 真正能搜的引擎。
+- `/web:dashboard` —— 指向网关主机上的仪表盘，不启动网关。
 
 插件与网关共用同一数据目录时，轮中切换模式从下一个用户轮生效；`off` 立即屏蔽自带的联网工具。不共享状态时，参见[远程模式的限制](#远程模式的限制)。
 
 ### Skill
 
-深度研究可通过 `/skill:web:web-research` 加载查询设计、交叉验证和核查一手来源的流程。普通搜索直接用可用的 MCP 工具，不需要先加载 Skill；只接 HTTP MCP 不提供这个 Skill。
+深度研究可通过 `/skill:web:web-research` 加载查询设计、交叉验证和核查一手来源的流程。普通搜索直接用任意可用的搜索工具，不需要先加载 Skill；重装后 skill 名仍找不到时执行 `/reload`，不要反复重试名字。只接 HTTP MCP 不提供这个 Skill。
 
 ## 配置
 
@@ -178,7 +178,7 @@ node ./bin/import-pi.mjs --pi-dir /path/to/pi/agent
 }
 ```
 
-打开**新会话**。TUI 中用 `/mcp` 确认 `web-remote` 已连接、`plugin-web_s` 未启用，再用远程工具实际搜一次、读一次网页。网关登记了 `web_search`、`web_fetch`、`web_status`、`web_mode` 四个工具；例子仅启用前两个。后两个查看或更改的是**网关侧**状态，纯 MCP 客户端不需要它们。
+打开**新会话**。TUI 中用 `/mcp` 确认 `web-remote` 已连接、`plugin-web_s` 未启用，再用远程工具实际搜一次、读一次网页。网关登记了 `web_search`、`web_fetch`、`web_status`、`web_mode` 四个工具；例子仅启用前两个。`web_status` 只列出可用引擎，不暴露监听地址。`web_mode` 改的是**网关侧**搜索模式，纯 MCP 客户端不需要它。
 
 ### stdio 桥接远程网关
 

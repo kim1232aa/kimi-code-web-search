@@ -7,7 +7,6 @@ import {
   classifyOwnTool,
   hookPayload,
   hookFailure,
-  positiveInteger,
 } from "./mode-state.mjs";
 
 const WEB_DISABLED_DENIAL =
@@ -22,21 +21,6 @@ async function main() {
 
   const sessionId =
     typeof payload.session_id === "string" && payload.session_id.trim() ? payload.session_id.trim() : "global";
-  const inputSession =
-    payload.tool_input?.session_id ?? payload.tool_input?.sessionId;
-
-  // If the caller explicitly passed a non-empty session_id, it must match the current session
-  if (
-    typeof inputSession === "string" &&
-    inputSession.trim() &&
-    inputSession.trim() !== sessionId &&
-    inputSession.trim() !== "global"
-  ) {
-    process.stderr.write(`Session mismatch: pass session_id="${sessionId}" for this plugin's retrieval call.`);
-    process.exitCode = 2;
-    return;
-  }
-
   const modeStatePath = path.join(webToolsDir(), "mode-state.json");
   let blocked = false;
 
@@ -47,25 +31,7 @@ async function main() {
       return;
     }
 
-    const sessionEntry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : {};
-    const turnRequired = (mode === "required" || (mode === "smart" && sessionEntry.turn?.required === true)) && !sessionEntry.turn?.exempted;
-    const suppliedInput = payload.tool_input;
-    const input = suppliedInput ?? {};
-    const rawTurn = Object.hasOwn(input, "turn_id") ? input.turn_id : input.turnId;
-    const turnId = positiveInteger(rawTurn, "turn_id");
-
-    if (turnRequired && suppliedInput !== undefined) {
-      if (typeof inputSession !== "string" || inputSession.trim() !== sessionId) {
-        throw new Error(`Session mismatch: pass session_id="${sessionId}" for this plugin's retrieval call.`);
-      }
-      if (turnId === undefined || (sessionEntry.turn && turnId !== sessionEntry.turn.turn)) {
-        throw new Error(`Pass turn_id=${sessionEntry.turn?.turn ?? 1} and session_id="${sessionId}" for the current turn.`);
-      }
-    } else if (turnId !== undefined && sessionEntry.turn && turnId !== sessionEntry.turn.turn) {
-      throw new Error(`Pass turn_id=${sessionEntry.turn.turn} and session_id="${sessionId}" for the current turn.`);
-    }
-
-    const currentEntry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : sessionEntry;
+    const currentEntry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : {};
     const pendingTools = Array.isArray(currentEntry.pendingTools) ? [...currentEntry.pendingTools] : [];
     pendingTools.push(`${kind}:${payload.tool_call_id || Date.now()}`);
     doc.activeSessionId = sessionId;

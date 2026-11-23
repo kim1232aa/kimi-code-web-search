@@ -35,7 +35,7 @@
     },
     {
       "event": "PreToolUse",
-      "matcher": "^(web_search|web_fetch|mcp__(?:plugin-web_s|plugin-kimi-code-web-search_web|web)__(web_search|web_fetch))$",
+      "matcher": "^(web_search|web_fetch|mcp__plugin-[\\w.-]+__(?:web_search|web_fetch))$",
       "command": "node ./hooks/pre-tool-gate.mjs",
       "timeout": 10
     },

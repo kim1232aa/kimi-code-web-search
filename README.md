@@ -93,19 +93,19 @@ Imports provider keys, base URLs, routing, classifier credentials (`auth.json`),
 | `mcp__plugin-web_s__web_search` | Web / platform search across the provider pool; optional `provider` override |
 | `mcp__plugin-web_s__web_fetch` | URL → clean Markdown; full post + comments for 小红书 / X URLs |
 | `mcp__plugin-web_s__web_mode` | Get / set / toggle the Search Mode |
-| `mcp__plugin-web_s__web_status` | Gateway health, routing chain, key pools, quotas, platform sessions |
+| `mcp__plugin-web_s__web_status` | Search engines that can actually run a query |
 
 ### Slash commands
 
 - `/web:mode [auto|smart|required|off|toggle]` — view or switch the mode (`smart` also accepts `jev`, `自适应`, `智能判定`).
-- `/web:status` — gateway, mode, routing, quotas, platform login summary.
-- `/web:dashboard` — report the configured dashboard address without starting a gateway.
+- `/web:status` — engines that can actually search.
+- `/web:dashboard` — point at the gateway-host dashboard; does not start a gateway.
 
 When plugin and gateway share the same data directory, a mid-turn mode switch takes effect from the next user turn; `off` immediately blocks the bundled retrieval tools. The [remote policy limitations](#remote-policy-limitations) apply when they do not share state.
 
 ### Skill
 
-Use `/skill:web:web-research` for deeper research (query design, cross-checks and primary sources). The Skill is optional; ordinary searches can call the available MCP tools directly. It is not provided by HTTP MCP alone.
+Use `/skill:web:web-research` for deeper research (query design, cross-checks and primary sources). The Skill is optional; ordinary searches can call any available search tool directly, and if a skill name is not found after a reinstall, run `/reload` rather than retrying the name. It is not provided by HTTP MCP alone.
 
 ## Configuration
 
@@ -178,7 +178,7 @@ The Kimi plugin runs hooks and loads skills on the **client**. The **gateway** r
 }
 ```
 
-Open a **new** session. In the TUI, check `/mcp`: `web-remote` should be connected, and `plugin-web_s` should not be active. Test a search and a page read with that server. The gateway advertises `web_search`, `web_fetch`, `web_status`, and `web_mode`; the allowlist exposes only the retrieval tools. The other two describe or modify **gateway-side** state and are not needed for an MCP-only client.
+Open a **new** session. In the TUI, check `/mcp`: `web-remote` should be connected, and `plugin-web_s` should not be active. Test a search and a page read with that server. The gateway advertises `web_search`, `web_fetch`, `web_status`, and `web_mode`; the allowlist exposes only the retrieval tools. `web_status` lists usable engines and does not expose bind addresses. `web_mode` changes **gateway-side** Search Mode and is not needed for an MCP-only client.
 
 ### Stdio bridge to a remote gateway
 

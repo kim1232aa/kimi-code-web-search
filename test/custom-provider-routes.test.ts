@@ -12,7 +12,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerRoutes, API_PREFIX } from "../src/host/routes.ts";
-import { SpecializedSourceRegistry } from "../src/host/sources/registry.ts";
 import type { RouteDeps } from "../src/host/routes.ts";
 
 function mockServer() {
@@ -78,8 +77,6 @@ test("Routes: sources/describe returns sources metadata without secrets", async 
     testProviderSearch: async () => ({ ok: true }),
     testFullSearch: async () => ({ ok: true }),
     describeQuotas: async () => ({}),
-    nativeRuntime: {} as any,
-    sourceRegistry: new SpecializedSourceRegistry(),
   };
 
   registerRoutes({ webServer: server } as any, deps);
@@ -127,8 +124,6 @@ test("Routes: sources/create validates draft, saves config, and compensates on c
     testProviderSearch: async () => ({ ok: true }),
     testFullSearch: async () => ({ ok: true }),
     describeQuotas: async () => ({}),
-    nativeRuntime: {} as any,
-    sourceRegistry: new SpecializedSourceRegistry(),
     revokeSourceCredentials: async (id) => {
       revokedId = id;
       return { removed: [], failed: [] };
@@ -210,8 +205,6 @@ test("Routes: sources/update enforces optimistic concurrency revision", async ()
     testProviderSearch: async () => ({ ok: true }),
     testFullSearch: async () => ({ ok: true }),
     describeQuotas: async () => ({}),
-    nativeRuntime: {} as any,
-    sourceRegistry: new SpecializedSourceRegistry(),
   };
 
   registerRoutes({ webServer: server } as any, deps);
@@ -271,8 +264,6 @@ test("Routes: sources/delete removes source, cleans routing references, and revo
     testProviderSearch: async () => ({ ok: true }),
     testFullSearch: async () => ({ ok: true }),
     describeQuotas: async () => ({}),
-    nativeRuntime: {} as any,
-    sourceRegistry: new SpecializedSourceRegistry(),
     revokeSourceCredentials: async (id) => {
       revokedId = id;
       return { removed: ["WEB_TOOLS_CUSTOM_DELETE01"], failed: [] };
@@ -308,8 +299,6 @@ test("Routes: sources/endpoint-set validates URLs and manages foreign confirmati
     testProviderSearch: async () => ({ ok: true }),
     testFullSearch: async () => ({ ok: true }),
     describeQuotas: async () => ({}),
-    nativeRuntime: {} as any,
-    sourceRegistry: new SpecializedSourceRegistry(),
   };
 
   registerRoutes({ webServer: server } as any, deps);
@@ -375,8 +364,6 @@ test("Routes: routing/set accepts custom source IDs alongside built-in providers
     testProviderSearch: async () => ({ ok: true }),
     testFullSearch: async () => ({ ok: true }),
     describeQuotas: async () => ({}),
-    nativeRuntime: {} as any,
-    sourceRegistry: new SpecializedSourceRegistry(),
   };
 
   registerRoutes({ webServer: server } as any, deps);
@@ -408,8 +395,6 @@ test("Routes: sources/test supports candidate credentials and draft testing with
     testProviderSearch: async () => ({ ok: true }),
     testFullSearch: async () => ({ ok: true }),
     describeQuotas: async () => ({}),
-    nativeRuntime: {} as any,
-    sourceRegistry: new SpecializedSourceRegistry(),
     testSource: async (input) => {
       capturedInput = input;
       return { ok: true, status: "connected", resultCount: 2, latencyMs: 150 };
@@ -457,8 +442,6 @@ test("Routes: authorization lifecycle tracks sourceId, prunes old on update, and
     testProviderSearch: async () => ({ ok: true }),
     testFullSearch: async () => ({ ok: true }),
     describeQuotas: async () => ({}),
-    nativeRuntime: {} as any,
-    sourceRegistry: new SpecializedSourceRegistry(),
     revokeSourceCredentials: async () => ({ removed: [], failed: [] }),
   };
 
@@ -538,8 +521,6 @@ test("Routes: intranet domain resolving to private IP triggers 409 conflict and 
     testProviderSearch: async () => ({ ok: true }),
     testFullSearch: async () => ({ ok: true }),
     describeQuotas: async () => ({}),
-    nativeRuntime: {} as any,
-    sourceRegistry: new SpecializedSourceRegistry(),
     lookupAll: fakeLookupAll,
   };
 
@@ -591,8 +572,6 @@ test("Routes: shared endpoint authorization is preserved while any source uses i
     testProviderSearch: async () => ({ ok: true }),
     testFullSearch: async () => ({ ok: true }),
     describeQuotas: async () => ({}),
-    nativeRuntime: {} as any,
-    sourceRegistry: new SpecializedSourceRegistry(),
     revokeSourceCredentials: async () => ({ removed: [], failed: [] }),
   };
 

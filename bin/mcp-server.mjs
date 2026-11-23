@@ -8,11 +8,12 @@
  *    1. `web_search` — Multi-provider web & social platform (Xiaohongshu / X) search
  *    2. `web_fetch`  — Full-page & social post/comment content extraction
  *    3. `web_mode`   — View or switch Search Mode (`auto`, `smart`, `required`, `off`)
- *    4. `web_status` — Inspect gateway, providers, quotas, and platform login state
+ *    4. `web_status` — List search engines that can actually run a query
  */
 import readline from "node:readline";
 import { ensureGatewayDaemon, probeLocalGateway } from "./gateway-daemon.mjs";
 import { positiveInteger } from "../hooks/mode-state.mjs";
+import { formatUsableEngines } from "../hooks/usable-engines.mjs";
 
 const VERSION = "0.4.0";
 const PROTOCOL_VERSION = "2025-06-18";
@@ -112,18 +113,13 @@ const TOOLS = [
   },
   {
     name: "web_status",
-    description:
-      "Inspect the Kimi Web Tools gateway status, dashboard URL, active search mode, provider routing chain, API key pools, and Xiaohongshu / X browser session status.",
+    description: "List search engines that can actually run a query (configured key or explicit self-hosted instance).",
     inputSchema: {
       type: "object",
       properties: {
-        include_quotas: {
-          type: "boolean",
-          description: "Whether to query live provider quota snapshots (default: false).",
-        },
         session_id: {
           type: "string",
-          description: "Optional session ID to check effective search mode for.",
+          description: "Optional session ID. Ignored; status is gateway-wide.",
         },
       },
     },
@@ -186,7 +182,7 @@ async function callGatewayMcp(endpoint, payload, timeoutMs = 90_000) {
     if (!res.ok || parsed?.ok === false) {
       throw new Error(parsed?.error?.message || `Gateway HTTP ${res.status}`);
     }
-    return endpoint === "status" && parsed.value ? { ...parsed.value, clientGatewayUrl: gw.url } : parsed.value;
+    return parsed.value;
   } finally {
     clearTimeout(timer);
   }
@@ -238,69 +234,7 @@ function formatModeOutput(value) {
 }
 
 function formatStatusOutput(value) {
-  const lines = [];
-  lines.push(`# Kimi Web Tools Status (v${value?.version ?? VERSION})`);
-  const url = value?.clientGatewayUrl ?? value?.gateway?.url;
-  if (url) {
-    const pid = value?.gateway?.pid;
-    lines.push(`- Dashboard & Gateway URL: ${url}${pid === undefined ? "" : ` (PID: ${pid})`}`);
-    if (value?.gateway?.url && value.gateway.url !== url) lines.push(`- Gateway bind URL: ${value.gateway.url}`);
-  }
-  if (value?.mode) {
-    lines.push(
-      `- Search Mode: ${value.mode.mode} (global: ${value.mode.globalMode}, provider available: ${value.mode.available})`,
-    );
-  }
-  if (value?.config) {
-    const chain = [value.config.defaultProvider, ...(value.config.fallbackOrder || [])].filter(Boolean);
-    lines.push(`- Routing Policy: ${value.config.searchRoutingPolicy || "ordered"}`);
-    lines.push(`- Active Chain: ${chain.join(" -> ") || "none"}`);
-    const fetchChain = Array.isArray(value.config.fetchOrder) && value.config.fetchOrder.length > 0
-      ? value.config.fetchOrder.join(" -> ")
-      : "(follows search chain -> builtin-http)";
-    lines.push(`- Fetch Chain: ${fetchChain}`);
-    lines.push(`- Attempt Timeout: ${value.config.providerAttemptTimeoutMs}ms`);
-    if (value.config.exemptWhenNoProvider !== undefined) {
-      lines.push(`- Exempt When No Provider: ${value.config.exemptWhenNoProvider}`);
-    }
-    if (value.config.recognizeExternalWebTools !== undefined) {
-      lines.push(`- Recognize External Web Tools: ${value.config.recognizeExternalWebTools}`);
-    }
-    if (value.config.requiredEvidence !== undefined) {
-      lines.push(`- Required Evidence: ${value.config.requiredEvidence}`);
-    }
-  }
-  const smart = value?.smartSearch ?? value?.config?.smartSearch ?? {};
-  lines.push("\n## Smart Classifier");
-  lines.push(`- Enabled: ${smart.enabled ?? "unknown"}`);
-  lines.push(`- Provider: ${smart.provider ?? "unknown"}`);
-  lines.push(`- Model: ${smart.model || "not configured"}`);
-  lines.push(`- Configured: ${value?.config?.smartSearchConfigured ?? smart.configured ?? "unknown"}`);
-  lines.push(`- Threshold: ${smart.threshold ?? "unknown"}`);
-  lines.push(`- Timeout: ${smart.timeoutMs === undefined ? "unknown" : `${smart.timeoutMs}ms`}`);
-  const lastSmartDecision = value?.lastSmartDecision ?? value?.mode?.lastSmartDecision ?? smart.lastSmartDecision;
-  lines.push(`- Last Smart Decision (${value?.mode?.sessionId ?? "global"}): ${lastSmartDecision ? JSON.stringify(lastSmartDecision) : "none"}`);
-  if (Array.isArray(value?.providers)) {
-    lines.push(`\n## Providers (${value.providers.length})`);
-    for (const p of value.providers) {
-      const state = !p.enabled
-        ? "disabled"
-        : p.keyConfigured || p.name === "searxng"
-          ? `ready (keys: ${p.poolSize ?? 0})`
-          : "not configured";
-      lines.push(`- ${p.label} (\`${p.name}\`${p.custom ? ", custom" : ""}): ${state}`);
-    }
-  }
-  if (value?.platforms && typeof value.platforms === "object") {
-    lines.push(`\n## Social Platforms`);
-    for (const [id, plat] of Object.entries(value.platforms)) {
-      if (!plat || typeof plat !== "object") continue;
-      lines.push(
-        `- ${plat.name || id} (\`${id}\`): enabled=${plat.enabled}, authenticated=${plat.authenticated}, state=${plat.runtimeState}`,
-      );
-    }
-  }
-  return lines.join("\n");
+  return formatUsableEngines(value);
 }
 
 async function runTool(params) {
@@ -339,8 +273,7 @@ async function runTool(params) {
     }
 
     if (name === "web_status") {
-      const includeQuotas = Boolean(args.include_quotas ?? args.includeQuotas);
-      const result = await callGatewayMcp("status", { sessionId, includeQuotas });
+      const result = await callGatewayMcp("status", { sessionId });
       return { content: [{ type: "text", text: formatStatusOutput(result) }] };
     }
 

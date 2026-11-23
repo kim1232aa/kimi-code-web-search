@@ -18,21 +18,21 @@ import {
 
 function requiredSearchText(searchOnly) {
   return searchOnly
-    ? "Web Search is required for this turn: search for what the user's request actually depends on, not an arbitrary query to pass this check. Only a search call satisfies this turn — reading a URL alone does not count (`web_mode`/`web_status` do not count)."
-    : "Web Search is required for this turn: search for what the user's request actually depends on, not an arbitrary query to pass this check. A search or a URL read satisfies this turn (`web_mode`/`web_status` do not count).";
+    ? "Web Search is required for this turn: search for what the user's request actually depends on, not an arbitrary query to pass this check. Any web search counts — this plugin's `web_search`, your built-in `WebSearch`, or another search MCP (`exa`, `tavily`, `brave`, ...). Reading a URL alone does not count (`web_mode`/`web_status` do not count)."
+    : "Web Search is required for this turn: search for what the user's request actually depends on, not an arbitrary query to pass this check. Any web search or page read counts — this plugin's tools, your built-in `WebSearch`/`FetchURL`, or another search MCP. (`web_mode`/`web_status` do not count.)";
 }
 
 const SEARCH_DISABLED_TEXT =
   "Web search is switched OFF for this session. Do not call web_search or web_fetch; answer strictly from existing context. If fresh web data or unverified external claims are needed, mark them as 未验证 instead of guessing from memory.";
 
 const SEARCH_AUTO_TEXT =
-  "Web search is available but not required. Call web_search (or web_fetch for a specific URL) for current facts, versions/docs/APIs, unknown entities, or errors; otherwise answer directly from context. When searching, do not retry a failing provider — switch via `provider` to cross-verify gaps/conflicts, read primary sources via `web_fetch`, and mark unsupported claims as 未验证.";
+  "Web search is available but not required. Call any available web search — this plugin's `web_search`, your built-in `WebSearch`, or another search MCP — for current facts, versions/docs/APIs, unknown entities, or errors; otherwise answer directly from context. When searching, do not retry a failing provider — switch source to cross-verify gaps/conflicts, read primary sources via `web_fetch`/`FetchURL`, and mark unsupported claims as 未验证.";
 
 const SMART_AUTO_TEXT =
   "[Smart Mode: Auto] The smart classifier determined that local or general context is sufficient, or classification was unavailable (fail-open). Web search is not required, but still search on demand for external docs/APIs/versions/URLs or uncertain claims; read primary sources via `web_fetch`, switch `provider` instead of retrying errors, and mark unverified claims as 未验证.";
 
 const NO_WEB_ROUTE_INSTRUCTION =
-  "No usable kimi-code-web-search search route is available for this turn; mandatory web-search enforcement is exempted. If no other web tool is available, answer strictly from existing context and locally verified files/tests, never claim web verification was performed, and mark unverified external facts as 未验证.";
+  "No usable route for this plugin's own web search was found this turn, so mandatory enforcement is exempted. You may still use your built-in `WebSearch`/`FetchURL` or any other search MCP; never claim web verification that did not happen, and mark unverified external facts as 未验证.";
 
 function readJsonFile(filePath, fallback) {
   if (!fs.existsSync(filePath)) return fallback;
@@ -117,7 +117,7 @@ async function main() {
 
   const recognizeExternal = !configExists || cfg.recognizeExternalWebTools !== false;
   const searchOnly = turnState.requiredEvidence === "search";
-  const turnBinding = `Pass session_id="${sessionId}" and turn_id=${turnState.turn} when calling web_search or web_fetch (also include them in a subagent prompt if delegating required web_search/web_fetch; explore/plan subagents have built-in WebSearch/FetchURL but not this plugin's MCP tools).`;
+  const turnBinding = `Any search path counts. If you use this plugin's own tools, pass session_id="${sessionId}" and turn_id=${turnState.turn} (also include them in a subagent prompt when delegating); built-in WebSearch/FetchURL and other search MCP tools count without them.`;
   const hintParts = [];
   if (configExists && routes.webProviders.length > 0) {
     hintParts.push(`Ready search providers (for web_search provider=...): ${routes.webProviders.join(", ")}.`);

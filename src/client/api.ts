@@ -63,10 +63,6 @@ import type {
   VersionCheckView,
 } from "../shared/api-types.ts";
 import type {
-  BrowserPlatform,
-  PlatformStatusResponse,
-} from "../shared/platform-types.ts";
-import type {
   CustomProviderDraft,
   CustomSourceTestView,
 } from "../shared/custom-provider-types.ts";
@@ -88,10 +84,6 @@ export type {
   SmartSearchTestView,
   VersionCheckView,
 } from "../shared/api-types.ts";
-export type {
-  BrowserPlatform,
-  PlatformStatusResponse,
-} from "../shared/platform-types.ts";
 export type {
   CustomProviderConfig,
   CustomProviderDraft,
@@ -125,14 +117,6 @@ export const api = {
     call<Record<string, any>>("provider-options/batch", { providers }),
   routingSet: (policy: SearchRoutingPolicy, orderedProviders: string[]) =>
     call<{ saved: true; policy: SearchRoutingPolicy; defaultProvider: string; fallbackOrder: string[] }>("routing/set", { policy, orderedProviders }),
-  platformStatus: () =>
-    call<PlatformStatusResponse>("platform/status"),
-  platformLogin: (platform: BrowserPlatform) =>
-    call<{ status: string }>("platform/login", { platform }),
-  platformStop: (platform: BrowserPlatform) =>
-    call<{ ok: boolean }>("platform/stop", { platform }),
-  platformReset: (platform: BrowserPlatform) =>
-    call<{ ok: boolean }>("platform/reset", { platform }),
   sourcesDescribe: () =>
     call<{ builtIns: any[]; custom: any[] }>("sources/describe"),
   sourceCreate: (source: CustomProviderDraft, credential?: unknown, confirmTarget?: boolean) =>

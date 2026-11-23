@@ -62,11 +62,18 @@ test("kimi.plugin.json declares MCP server, hooks, commands, skills, and SYSTEM.
     "web_fetch",
     "mcp__plugin-web_s__web_search",
     "mcp__plugin-web_s__web_fetch",
-    "mcp__plugin-kimi-code-web-search_web__web_search",
+    "mcp__plugin-kimi-web-tools_s__web_search",
+    "mcp__plugin-kimi-code-web-search_web__web_fetch",
   ]) {
     assert.ok(preRe.test(name), `PreToolUse matcher must match ${name}`);
   }
-  for (const name of ["mcp__plugin-web_s__web_mode", "mcp__plugin-web_s__web_status", "FetchURL", "Read"]) {
+  for (const name of [
+    "mcp__plugin-web_s__web_mode",
+    "mcp__plugin-web_s__web_status",
+    "mcp__exa__web_search",
+    "FetchURL",
+    "Read",
+  ]) {
     assert.ok(!preRe.test(name), `PreToolUse matcher must skip ${name}`);
   }
 

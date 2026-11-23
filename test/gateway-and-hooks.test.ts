@@ -81,6 +81,7 @@ test("Standalone Gateway Server serves UI, management APIs, and MCP endpoints", 
     });
     const mcpStatusJson = (await mcpStatus.json()) as any;
     assert.equal(mcpStatusJson.ok, true);
+    assert.ok(Array.isArray(mcpStatusJson.value.usable));
     assert.equal(mcpStatusJson.value.version, "0.4.0");
     assert.equal(mcpStatusJson.value.mode.mode, "required");
   } finally {
@@ -159,7 +160,7 @@ test("Kimi Code Hooks enforce off-mode gate and required-mode stop turn steer", 
       },
     );
     assert.equal(stopBeforeResearch.status, 2, "Stop hook must exit 2 when required research has not run");
-    assert.match(stopBeforeResearch.stderr, /Call web_search before finalizing/);
+    assert.match(stopBeforeResearch.stderr, /Run any web search before finalizing/);
 
     // Second Stop without research -> does not infinite-loop (correctionCount === 1)
     const stopSecondTime = spawnSync(

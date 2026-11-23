@@ -177,20 +177,33 @@ export function newTurn(doc, sessionId, options) {
   return turn;
 }
 
+/**
+ * Recognize this plugin's own retrieval tools by name, not by a fixed list.
+ *
+ * Kimi tool names are `mcp__plugin-<plugin-id>_<server-key>__<tool>`, and both
+ * segments have changed as the plugin was renamed and the server key was
+ * shortened, so an exact allowlist breaks on the next rename. Match the shape
+ * instead: an own search/fetch tool is one whose server segment belongs to this
+ * plugin (`plugin-*web*`) and whose tool segment is `web_search`/`web_fetch`.
+ * A bare `web_search`/`web_fetch` also counts: those are this plugin's names.
+ */
+function ownKindOfServer(server) {
+  const normalized = normalizeToolSegment(server);
+  if (!/(?:^|_)plugin_(?:.*_)?web(?:_|$)/.test(normalized) && !/(?:^|_)web(?:_|$)/.test(normalized)) return undefined;
+  return "own";
+}
+
 export function classifyOwnTool(name) {
-  if ([
-    "web_search",
-    "mcp__web__web_search",
-    "mcp__plugin-web_s__web_search",
-    "mcp__plugin-kimi-code-web-search_web__web_search",
-  ].includes(name)) return "web_search";
-  if ([
-    "web_fetch",
-    "mcp__web__web_fetch",
-    "mcp__plugin-web_s__web_fetch",
-    "mcp__plugin-kimi-code-web-search_web__web_fetch",
-  ].includes(name)) return "web_fetch";
-  return undefined;
+  if (typeof name !== "string" || !name.trim()) return undefined;
+  const bare = normalizeToolSegment(name);
+  if (bare === "web_search" || bare === "web_fetch") return bare;
+  if (!name.startsWith("mcp__")) return undefined;
+  const parts = name.slice(5).split("__").filter(Boolean);
+  const tool = normalizeToolSegment(parts.length >= 2 ? parts.slice(1).join("__") : parts[0] ?? "");
+  if (tool !== "web_search" && tool !== "web_fetch") return undefined;
+  if (parts.length < 2) return undefined;
+  if (!ownKindOfServer(parts[0])) return undefined;
+  return tool;
 }
 
 const NON_WEB_TOOLS = new Set(["web_enable", "get_search_content", "select_tools", "web_mode", "web_status", "fetch_logs"]);
