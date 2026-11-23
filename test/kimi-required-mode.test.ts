@@ -134,7 +134,203 @@ test("corrupt mode state fails visibly instead of pretending auto mode", (t) => 
   const { storage, hook } = fixture(t);
   fs.writeFileSync(storage.modeStatePath, "{broken");
   const result = hook("user-prompt-submit.mjs", { session_id: "session-a" });
-  assert.notEqual(result.status, 0);
+  assert.equal(result.status, 1, "hookFailure must exit 1 (fail-open), reserving exit 2 for explicit blocks");
   assert.match(result.stderr, /mode-state|JSON|parse/i);
   assert.equal(fs.readFileSync(storage.modeStatePath, "utf8"), "{broken");
+});
+
+test("hookPayload decodes multi-byte UTF-8 split across stdin chunks", async (t) => {
+  const { home, storage } = fixture(t);
+  storage.setSessionMode("global", "required");
+  const payloadBytes = Buffer.from(JSON.stringify({ session_id: "utf8-split", prompt: "你好世界🚀" }), "utf8");
+  const splitAt = payloadBytes.indexOf(0xe4) + 1;
+  assert.ok(splitAt > 1, "test payload must contain multi-byte UTF-8");
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(root, "hooks/user-prompt-submit.mjs")], {
+      env: { ...process.env, KIMI_CODE_HOME: home },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}: ${stderr}`))));
+    child.stdin.write(payloadBytes.subarray(0, splitAt));
+    setTimeout(() => child.stdin.end(payloadBytes.subarray(splitAt)), 20);
+  });
+  assert.ok(storage.getTurnState("utf8-split"), "chunked multi-byte payload must parse cleanly");
+});
+
+test("updateModeState retries transient NTFS errors on lock ops and atomic rename", (t) => {
+  const { home } = fixture(t);
+  const statePath = path.join(home, "web-tools", "mode-state.json");
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import fs from "node:fs";
+    import assert from "node:assert/strict";
+    import { updateModeState, readModeState } from "./hooks/mode-state.mjs";
+
+    const origOpen = fs.openSync;
+    const origStat = fs.statSync;
+    const origRead = fs.readFileSync;
+    const origRename = fs.renameSync;
+    let openFails = 0;
+    let statFails = 0;
+    let renameFails = 0;
+    const lockPath = ${JSON.stringify(statePath + ".lock")};
+    const filePath = ${JSON.stringify(statePath)};
+
+    fs.openSync = (p, flags, ...rest) => {
+      if (p === lockPath && flags === "wx") {
+        if (openFails === 0) { openFails++; throw Object.assign(new Error("busy"), { code: "EBUSY" }); }
+        if (openFails === 1) { openFails++; throw Object.assign(new Error("exists"), { code: "EEXIST" }); }
+      }
+      return origOpen(p, flags, ...rest);
+    };
+    fs.statSync = (p, ...rest) => {
+      if (p === lockPath && statFails === 0) { statFails++; throw Object.assign(new Error("perm"), { code: "EPERM" }); }
+      if (p === lockPath) throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      return origStat(p, ...rest);
+    };
+    fs.readFileSync = (p, ...rest) => origRead(p, ...rest);
+    fs.renameSync = (from, to) => {
+      if (to === filePath && renameFails < 2) {
+        renameFails++;
+        throw Object.assign(new Error("access"), { code: renameFails === 1 ? "EACCES" : "EPERM" });
+      }
+      return origRename(from, to);
+    };
+
+    updateModeState(filePath, (doc) => { doc.globalMode = "required"; });
+    assert.equal(openFails, 2);
+    assert.equal(statFails, 1);
+    assert.equal(renameFails, 2);
+    assert.equal(readModeState(filePath).globalMode, "required");
+  `], { cwd: root, env: { ...process.env, KIMI_CODE_HOME: home }, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("post-tool-receipt credits own tools for remote gateway or omitted/global session_id unless subagent active locally", (t) => {
+  const { home, storage, hook } = fixture(t);
+  storage.setSessionMode("global", "required");
+  const runWithEnv = (file: string, payload: object, extraEnv: Record<string, string> = {}) =>
+    spawnSync(process.execPath, [path.join(root, "hooks", file)], {
+      input: JSON.stringify(payload),
+      encoding: "utf8",
+      env: { ...process.env, KIMI_CODE_HOME: home, ...extraEnv },
+    });
+
+  // 1. Local gateway with explicit non-global session_id -> receipt skips (gateway is authoritative)
+  hook("user-prompt-submit.mjs", { session_id: "s-explicit" });
+  assert.equal(hook("post-tool-receipt.mjs", {
+    hook_event_name: "PostToolUse",
+    session_id: "s-explicit",
+    tool_name: ownSearch,
+    tool_input: { query: "q", session_id: "s-explicit" },
+    tool_response: { content: [{ type: "text", text: "ok" }] },
+  }).status, 0);
+  assert.equal(storage.getTurnState("s-explicit")!.webSearchCompleted, false);
+
+  // 2. Local gateway with omitted session_id or "global" -> receipt credits turn
+  assert.equal(hook("post-tool-receipt.mjs", {
+    hook_event_name: "PostToolUse",
+    session_id: "s-explicit",
+    tool_name: ownSearch,
+    tool_input: { query: "q" },
+    tool_response: { content: [{ type: "text", text: "ok" }] },
+  }).status, 0);
+  assert.equal(storage.getTurnState("s-explicit")!.webSearchCompleted, true);
+  assert.equal(storage.getTurnState("s-explicit")!.webSearchSucceeded, true);
+
+  hook("user-prompt-submit.mjs", { session_id: "s-global-arg" });
+  assert.equal(hook("post-tool-receipt.mjs", {
+    hook_event_name: "PostToolUse",
+    session_id: "s-global-arg",
+    tool_name: ownSearch,
+    tool_input: { query: "q", session_id: "global" },
+    tool_response: { content: [{ type: "text", text: "ok" }] },
+  }).status, 0);
+  assert.equal(storage.getTurnState("s-global-arg")!.webSearchCompleted, true);
+  assert.equal(storage.getTurnState("s-global-arg")!.webSearchSucceeded, true);
+
+  // 3. Local gateway with active subagent -> omitted session_id skips crediting parent turn
+  hook("user-prompt-submit.mjs", { session_id: "s-sub" });
+  hook("subagent-activity.mjs", { hook_event_name: "SubagentStart", session_id: "s-sub" });
+  assert.equal(hook("post-tool-receipt.mjs", {
+    hook_event_name: "PostToolUse",
+    session_id: "s-sub",
+    tool_name: ownSearch,
+    tool_input: { query: "q" },
+    tool_response: { content: [{ type: "text", text: "ok" }] },
+  }).status, 0);
+  assert.equal(storage.getTurnState("s-sub")!.webSearchCompleted, false);
+
+  // 4. Remote gateway -> credits even with explicit session_id (and even when config disables external recognition)
+  fs.writeFileSync(path.join(home, "web-tools", "config.json"), JSON.stringify({ recognizeExternalWebTools: false }));
+  hook("user-prompt-submit.mjs", { session_id: "s-remote" });
+  assert.equal(runWithEnv("post-tool-receipt.mjs", {
+    hook_event_name: "PostToolUse",
+    session_id: "s-remote",
+    tool_name: "mcp__plugin-web_s__web_fetch",
+    tool_input: { url: "https://example.org", sessionId: "s-remote" },
+    tool_response: { content: [{ type: "text", text: "Error: HTTP 502" }] },
+  }, { KIMI_WEB_TOOLS_GATEWAY_URL: "https://gw.example.com" }).status, 0);
+  assert.equal(storage.getTurnState("s-remote")!.webFetchCompleted, true);
+  assert.equal(storage.getTurnState("s-remote")!.webFetchSucceeded, false);
+
+  assert.equal(runWithEnv("post-tool-receipt.mjs", {
+    hook_event_name: "PostToolUse",
+    session_id: "s-remote",
+    tool_name: ownSearch,
+    tool_input: { query: "q", session_id: "s-remote" },
+    tool_response: "Error: timeout",
+  }, { KIMI_WEB_TOOLS_GATEWAY_URL: "https://gw.example.com" }).status, 0);
+  assert.equal(storage.getTurnState("s-remote")!.webSearchCompleted, true);
+  assert.equal(storage.getTurnState("s-remote")!.webSearchSucceeded, false);
+});
+
+test("stop-turn-gate fallback turn demands search and distinguishes no-attempt vs all-failed reminders", (t) => {
+  const { storage, hook } = fixture(t);
+  storage.setSessionMode("global", "required");
+
+  // Missing turn record falls back to search-only requirement
+  const firstStop = hook("stop-turn-gate.mjs", { session_id: "no-turn-yet" });
+  assert.equal(firstStop.status, 2);
+  assert.match(firstStop.stderr, /Run any web search before finalizing/);
+  assert.doesNotMatch(firstStop.stderr, /or page read/);
+
+  // No search attempted reminder
+  hook("user-prompt-submit.mjs", { session_id: "s-none" });
+  assert.equal(hook("stop-turn-gate.mjs", { session_id: "s-none" }).status, 2);
+  const noneFinal = hook("stop-turn-gate.mjs", { session_id: "s-none" });
+  assert.equal(noneFinal.status, 0);
+  assert.match(noneFinal.stdout, /not completed.*未验证/);
+  assert.doesNotMatch(noneFinal.stdout, /Web research failed/);
+
+  // All attempts failed reminder
+  hook("user-prompt-submit.mjs", { session_id: "s-fail" });
+  (storage as any).completeTool("s-fail", "web_search", false, 1);
+  assert.equal(hook("stop-turn-gate.mjs", { session_id: "s-fail" }).status, 2);
+  const failFinal = hook("stop-turn-gate.mjs", { session_id: "s-fail" });
+  assert.equal(failFinal.status, 0);
+  assert.match(failFinal.stdout, /Web research failed.*未验证/);
+});
+
+test("kimi.plugin.json updated timeout, clean metadata, and robust PostToolUse matchers", () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "kimi.plugin.json"), "utf8"));
+  assert.doesNotMatch(manifest.description, /xiaohongshu|\bX\b/i);
+  assert.ok(!manifest.keywords.includes("xiaohongshu"));
+  assert.ok(!manifest.keywords.includes("x"));
+  const promptHook = manifest.hooks.find((h: any) => h.event === "UserPromptSubmit");
+  assert.equal(promptHook.timeout, 15);
+
+  for (const event of ["PostToolUse", "PostToolUseFailure"]) {
+    const matcher = manifest.hooks.find((h: any) => h.event === event).matcher;
+    const re = new RegExp(matcher);
+    for (const tool of ["mcp__ddg__search", "DDG_SEARCH", "DdgSearch", "mcp__perplexity__perplexity_ask", "mcp__perplexity__perplexityAsk", "mcp__custom__research", "mcp__custom__reason", "WEB_SEARCH", "FETCH_URL"]) {
+      assert.ok(re.test(tool), `${event} must match ${tool}`);
+    }
+    for (const local of ["Read", "Edit", "Write", "Glob", "Grep", "Bash", "TodoList", "TaskList", "TaskOutput", "NotifyUser", "Skill", "Agent", "CronCreate", "WaitFor"]) {
+      assert.ok(!re.test(local), `${event} must skip ${local}`);
+    }
+  }
 });

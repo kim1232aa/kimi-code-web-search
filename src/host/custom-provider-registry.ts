@@ -110,11 +110,12 @@ export function policyForCustomSource(
 ): { policy: OutboundPolicy; trust: DestinationTrust } {
   const parsed = new URL(config.endpoint.baseUrl);
   const port = parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80;
-  const host = parsed.hostname.toLowerCase();
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   const authorization = authorizations.find(
     (entry) =>
       (entry.host.toLowerCase().replace(/^\[|\]$/g, "") === host ||
-        (entry.host.startsWith(".") && (host === entry.host.slice(1) || host.endsWith(entry.host.toLowerCase())))) &&
+        (entry.host.startsWith(".") &&
+          (host === entry.host.slice(1).toLowerCase() || host.endsWith(entry.host.toLowerCase())))) &&
       (entry.port === undefined || entry.port === port),
   );
 

@@ -7,7 +7,7 @@
  * operator-configured and trusted by definition).
  * @module
  */
-import { providerError, resolveContext, type ProviderAdapter, type SearchOutcome } from "./types.ts";
+import { providerError, resolveContext, safeHttpUrl, throwIfHttp, type ProviderAdapter, type SearchOutcome } from "./types.ts";
 import { fetchWithProxy } from "../fetch-proxy.ts";
 import { joinUrl } from "../endpoints.ts";
 import type { SearchHints } from "../search-hints.ts";
@@ -110,17 +110,17 @@ export const SearxngProvider: ProviderAdapter = {
     }
     if (!res.ok) {
       if (res.status === 401 || res.status === 403) {
+        void res.body?.cancel?.().catch(() => {});
         throw providerError("auth", `SearXNG refused the request (HTTP ${res.status}) — check the instance credential and enable JSON output in settings.yml`, res.status);
       }
-      if (res.status >= 500) throw providerError("server", `SearXNG server error (HTTP ${res.status})`, res.status);
-      throw providerError("bad-request", `SearXNG request failed (HTTP ${res.status})`, res.status);
+      throwIfHttp("SearXNG", res);
     }
     const raw = await res.json();
     const results = Array.isArray(raw?.results) ? raw.results : [];
     const sources = results
       .slice(0, maxResults)
       .map((r: Record<string, unknown>) => {
-        const u = typeof r?.url === "string" ? r.url : "";
+        const u = safeHttpUrl(r?.url);
         if (!u) return null;
         const s: { url: string; title?: string; snippet?: string } = { url: u };
         if (typeof r.title === "string" && r.title) s.title = r.title;

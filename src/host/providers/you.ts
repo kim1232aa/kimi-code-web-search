@@ -1,4 +1,4 @@
-import { providerError, throwIfHttp, resolveContext, type ProviderAdapter } from "./types.ts";
+import { providerError, throwIfHttp, resolveContext, safeHttpUrl, type ProviderAdapter } from "./types.ts";
 import { fetchWithProxy } from "../fetch-proxy.ts";
 import { endpointViewOf } from "../endpoints.ts";
 import type { QuotaSnapshot } from "../quota.ts";
@@ -83,6 +83,7 @@ function youAuthHeader(apiKey: string): Record<string, string> {
 /** Error handler that highlights missing product scope for 403. */
 function throwYouError(res: Response): never {
   if (res.status === 403) {
+    void res.body?.cancel?.().catch(() => {});
     throw providerError("auth", "You.com returned 403: Forbidden (check API key permissions and product scopes)", 403);
   }
   // Only called when !res.ok, so this always throws.
@@ -115,7 +116,7 @@ export const YouProvider: ProviderAdapter = {
     const results = [...webResults, ...newsResults, ...legacyHits];
     const sources = results
       .map((r: Record<string, unknown>) => {
-        const u = typeof r?.url === "string" ? r.url : "";
+        const u = safeHttpUrl(r?.url);
         if (!u) return null;
         const s: { url: string; title?: string; snippet?: string; publishedAt?: string } = { url: u };
         if (typeof r.title === "string" && r.title) s.title = r.title;
@@ -174,17 +175,30 @@ export const YouProvider: ProviderAdapter = {
 };
 
 /** Snapshot provider for You.com. */
-export async function youQuota(apiKey: string, _signal?: AbortSignal): Promise<QuotaSnapshot> {
-  return pollYouQuota(apiKey);
+export async function youQuota(apiKey: string, signal?: AbortSignal): Promise<QuotaSnapshot> {
+  return pollYouQuota(apiKey, signal);
 }
 
-export async function pollYouQuota(apiKey: string): Promise<QuotaSnapshot> {
+export async function pollYouQuota(apiKey: string, signal?: AbortSignal): Promise<QuotaSnapshot> {
   const fetchedAt = Date.now();
+  const token = (apiKey ?? "").trim();
+  if (!token) {
+    return {
+      supported: false,
+      authoritative: false,
+      unit: "usd_cents",
+      source: "dashboard",
+      fetchedAt,
+      note: "You.com API key is not configured",
+    };
+  }
   const res = await fetchWithProxy(YOU_BALANCE_URL, {
     method: "GET",
-    headers: youAuthHeader(apiKey),
+    headers: youAuthHeader(token),
+    signal,
   }, { provider: "you" });
   if (!res.ok) {
+    void res.body?.cancel?.().catch(() => {});
     return {
       supported: true,
       authoritative: false,

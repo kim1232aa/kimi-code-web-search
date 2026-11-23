@@ -13,7 +13,14 @@ import {
   hasUsableSearchProvider,
   resolveSmartCredential,
 } from "../hooks/smart-classifier.mjs";
-import { externalWebToolKind, isExternalWebToolCall, isExternalWebToolName, isMcpProxyToolName } from "../hooks/mode-state.mjs";
+import {
+  classifyOwnTool,
+  externalWebToolKind,
+  isExternalWebToolCall,
+  isExternalWebToolName,
+  isMcpProxyToolName,
+} from "../hooks/mode-state.mjs";
+import { usableSearchRoutes } from "../hooks/smart-classifier.mjs";
 import { LocalStorage } from "../src/host/local-storage.ts";
 import { startGatewayServer } from "../src/host/gateway-server.ts";
 import { createSearchProvider, type ProviderAdapterLike } from "../src/host/registry.ts";
@@ -310,7 +317,7 @@ function hookConfig(baseUrl: string): Record<string, unknown> {
 
 test("smart escalated hooks steer once, then stop; stale bindings never hard-fail", async (t) => {
   const mock = await mockClassifier(t);
-  const home = hookHome(t, "smart", hookConfig(mock.baseUrl), { WEB_TOOLS_TYPESAFE: "test-classifier-key", WEB_TOOLS_EXA: "test-search-key" });
+  const home = hookHome(t, "smart", { ...hookConfig(mock.baseUrl), recognizeExternalWebTools: true }, { WEB_TOOLS_TYPESAFE: "test-classifier-key", WEB_TOOLS_EXA: "test-search-key" });
   const sessionId = "smart-escalated";
   const prompt = await runHook(home, "user-prompt-submit.mjs", {
     hook_event_name: "UserPromptSubmit", session_id: sessionId, prompt: [{ type: "text", text: "Check the current example CLI docs." }],
@@ -1167,6 +1174,12 @@ test("a subagent call without a binding still counts toward the parent turn when
   const sessionId = "parent-sess";
   await runHook(home, "user-prompt-submit.mjs", { session_id: sessionId, prompt: "Research docs." });
 
+  await runHook(home, "subagent-activity.mjs", {
+    hook_event_name: "SubagentStart",
+    session_id: sessionId,
+    agent_name: "agent-coder-1",
+  });
+
   const unbound = await runHook(home, "pre-tool-gate.mjs", {
     hook_event_name: "PreToolUse",
     session_id: sessionId,
@@ -1191,6 +1204,12 @@ test("a subagent call without a binding still counts toward the parent turn when
   });
   assert.equal(ownReceipt.status, 0, ownReceipt.stderr);
   assert.equal(storedTurn(home, sessionId).webSearchCompleted, false, "an own-tool hook receipt must not bypass gateway turn binding");
+
+  await runHook(home, "subagent-activity.mjs", {
+    hook_event_name: "SubagentStop",
+    session_id: sessionId,
+    agent_name: "agent-coder-1",
+  });
 
   const failedExternal = await runHook(home, "post-tool-receipt.mjs", {
     hook_event_name: "PostToolUseFailure",
@@ -1231,4 +1250,128 @@ test("a subagent call without a binding still counts toward the parent turn when
     tool_input: { query: "example docs", session_id: sessionId, turn_id: 1 },
   });
   assert.equal(subOff.status, 2);
+});
+
+test("ownKindOfServer excludes external web-remote/my-web servers and CamelCase external tools match", () => {
+  for (const own of [
+    "web_search",
+    "web_fetch",
+    "mcp__web__web_search",
+    "mcp__kimi-web-tools__web_search",
+    "mcp__kimi-code-web-search__web_fetch",
+    "mcp__plugin-web_s__web_search",
+    "mcp__plugin-kimi-web-tools_s__web_search",
+    "mcp__plugin-kimi-code-web-search_web__web_fetch",
+  ]) {
+    assert.ok(classifyOwnTool(own), `${own} must classify as own tool`);
+  }
+
+  for (const external of [
+    "mcp__web-remote__web_search",
+    "mcp__web-remote__web_fetch",
+    "mcp__my-web__web_search",
+    "mcp__exa__deepSearchExa",
+    "mcp__tavily__tavilySearch",
+    "mcp__perplexity__perplexityAsk",
+  ]) {
+    assert.equal(classifyOwnTool(external), undefined, `${external} must NOT classify as own tool`);
+    assert.equal(isExternalWebToolName(external), true, `${external} must classify as external web tool`);
+  }
+  assert.equal(externalWebToolKind("mcp__exa__deepSearchExa", { objective: "latest spec" }), "search");
+  assert.equal(externalWebToolKind("mcp__tavily__tavilySearch", { query: "latest spec" }), "search");
+  assert.equal(externalWebToolKind("mcp__web-remote__web_search", { query: "latest spec" }), "search");
+  assert.equal(externalWebToolKind("mcp__web-remote__web_fetch", { url: "https://example.org" }), "fetch");
+});
+
+test("usableSearchRoutes ignores stale browser-profiles and requires providerBaseUrls.searxng", (t) => {
+  const home = temporaryHome(t);
+  writeJson(path.join(home, "web-tools", "browser-profiles", "xiaohongshu", "dsh-profile-meta.json"), { authenticated: true });
+  writeJson(path.join(home, "web-tools", "browser-profiles", "x", "dsh-profile-meta.json"), { sessionEstablished: true });
+
+  const noUrl = usableSearchRoutes({ enabled: true, defaultProvider: "searxng" }, { WEB_TOOLS_SEARXNG: "token" }, undefined, home, {});
+  assert.deepEqual(noUrl, { webProviders: [], platforms: [] });
+  assert.equal(hasUsableSearchProvider({ enabled: true, defaultProvider: "searxng" }, {}, undefined, home, { WEB_TOOLS_SEARXNG: "token" }), false);
+
+  const withUrl = usableSearchRoutes({ enabled: true, providerBaseUrls: { searxng: "https://searx.example.org" } }, {}, undefined, home, {});
+  assert.deepEqual(withUrl, { webProviders: ["searxng"], platforms: [] });
+});
+
+test("remote gateway skips no-key exemption, auto mode stays silent without keys, and recognizeExternalWebTools=false hides external hints", async (t) => {
+  // 1. Auto mode without keys stays completely silent
+  const autoHome = hookHome(t, "auto", { enabled: true, defaultProvider: "exa", exemptWhenNoProvider: true });
+  const autoPrompt = await runHook(autoHome, "user-prompt-submit.mjs", { session_id: "auto-no-key", prompt: "hello" });
+  assert.equal(autoPrompt.status, 0, autoPrompt.stderr);
+  assert.equal(autoPrompt.stdout, "");
+  assert.equal(storedTurn(autoHome, "auto-no-key").exempted, false);
+
+  // 2. Remote gateway in required mode does not exempt even when local config.json has no keys
+  const remoteHome = hookHome(t, "required", { enabled: true, defaultProvider: "exa", exemptWhenNoProvider: true });
+  const remotePrompt = await runHook(
+    remoteHome,
+    "user-prompt-submit.mjs",
+    { session_id: "remote-req", prompt: "check docs" },
+    { KIMI_WEB_TOOLS_GATEWAY_URL: "https://gw.example.org" },
+  );
+  assert.equal(remotePrompt.status, 0, remotePrompt.stderr);
+  assert.equal(storedTurn(remoteHome, "remote-req").exempted, false);
+  assert.equal(storedTurn(remoteHome, "remote-req").required, true);
+  assert.match(remotePrompt.stdout, /Web Search is required/);
+  assert.doesNotMatch(remotePrompt.stdout, /Ready search providers/);
+
+  // 3. recognizeExternalWebTools: false hides external tool mentions in both UserPromptSubmit and Stop
+  const strictHome = hookHome(t, "required", {
+    enabled: true,
+    defaultProvider: "exa",
+    exemptWhenNoProvider: false,
+    recognizeExternalWebTools: false,
+  }, { WEB_TOOLS_EXA: "test-key" });
+  const strictPrompt = await runHook(strictHome, "user-prompt-submit.mjs", { session_id: "strict-own", prompt: "check docs" });
+  assert.equal(strictPrompt.status, 0, strictPrompt.stderr);
+  assert.doesNotMatch(strictPrompt.stdout, /WebSearch|FetchURL|another search MCP|Any web search counts|Any search path counts/);
+  assert.equal(storedTurn(strictHome, "strict-own").recognizeExternal, false);
+
+  const strictStop = await runHook(strictHome, "stop-turn-gate.mjs", { session_id: "strict-own" });
+  assert.equal(strictStop.status, 2);
+  assert.doesNotMatch(strictStop.stderr, /WebSearch|FetchURL|another search MCP/);
+  assert.match(strictStop.stderr, /this plugin's `web_search`/);
+});
+
+test("smart classifier trims short follow-ups, extracts output_text, and parses JSON preceded by braces in prose", async (t) => {
+  const home = temporaryHome(t);
+  writeWire(home, "trim-test");
+  const context = extractKimiSessionContext("trim-test", home);
+
+  const shortPadded = buildSmartClassifierState("  真的吗  \n", false, context);
+  assert.equal(shortPadded.recent_user_context, context.prevUserText);
+  const longPadded = buildSmartClassifierState(`  ${"x".repeat(25)}  `, false, context);
+  assert.equal("recent_user_context" in longPadded, false);
+
+  assert.deepEqual(extractPromptInput([
+    { type: "output_text", text: "First" },
+    { output_text: "Second" },
+    { type: "think", text: "ignored" },
+  ]), { text: "First\nSecond", hasImages: false });
+
+  const result = await classifySmartTurn({
+    ...classifierInput("https://llm.example.org/v1", "openrouter"),
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [{
+          message: {
+            content: [
+              {
+                type: "output_text",
+                text: 'Considering {user_prompt} and {unclosed prose:\n{"needs_external_lookup": 0.85, "involves_tool_or_config_claim": 0.2}\nNote: {done}',
+              },
+            ],
+          },
+        }],
+      }),
+    }),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.escalated, true);
+  assert.deepEqual(result.probabilities, { needs_external_lookup: 0.85, involves_tool_or_config_claim: 0.2 });
 });

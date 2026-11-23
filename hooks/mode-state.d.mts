@@ -13,6 +13,7 @@ export function effectiveMode(document: ModeDocument, sessionId: string): "auto"
 export function newTurn(document: ModeDocument, sessionId: string, options?: {
   required?: boolean;
   requiredEvidence?: "search" | "search-or-fetch";
+  recognizeExternal?: boolean;
   exempted?: boolean;
   smartEscalated?: boolean;
   smartDecision?: any;
@@ -21,6 +22,7 @@ export function newTurn(document: ModeDocument, sessionId: string, options?: {
   required: boolean;
   disabled: boolean;
   requiredEvidence: "search" | "search-or-fetch";
+  recognizeExternal: boolean;
   exempted: boolean;
   smartEscalated: boolean;
   smartDecision?: any;

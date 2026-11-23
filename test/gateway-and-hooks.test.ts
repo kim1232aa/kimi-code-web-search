@@ -173,6 +173,7 @@ test("Kimi Code Hooks enforce off-mode gate and required-mode stop turn steer", 
       },
     );
     assert.equal(stopSecondTime.status, 0, "Stop hook must not loop after one correction steer");
+    assert.match(stopSecondTime.stdout, /not completed.*未验证/);
 
     // New turn where actual search completion is recorded -> Stop exits 0 immediately
     spawnSync(

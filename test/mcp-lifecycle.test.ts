@@ -212,18 +212,28 @@ test("daemon startup gives build instructions for a source-only install", async 
   assert.equal(fs.existsSync(path.join(home, "web-tools", "gateway.log")), false);
 });
 
-test("invalid numeric inputs fail without launching a gateway", async (t) => {
+test("invalid max_results inputs fail without launching a gateway while advisory turn_id degrades cleanly", async (t) => {
   const { env, requests } = await gatewayFixture(t);
-  const invalid = ["", " ", "1e1", "0x10", "1.5", "0", "-1", true, [], null, 1.5, 9007199254740992];
-  const input = invalid.map((turn_id, i) => rpc(i + 1, "tools/call", {
-    name: "web_fetch", arguments: { url: "https://example.com", turn_id },
-  })).join("") + rpc(99, "tools/call", { name: "web_search", arguments: { query: "fixture", max_results: 21 } });
+  const invalid = ["", " ", "1e1", "0x10", "1.5", "0", "-1", true, [], null, 1.5, 21, 9007199254740992];
+  const input = invalid.map((max_results, i) => rpc(i + 1, "tools/call", {
+    name: "web_search", arguments: { query: "fixture", max_results },
+  })).join("");
   const result = await runNode(["bin/mcp-server.mjs"], env, input);
   assert.equal(result.code, 0, result.stderr);
   const replies = result.stdout.trim().split("\n").map(line => JSON.parse(line));
-  assert.equal(replies.length, invalid.length + 1);
+  assert.equal(replies.length, invalid.length);
   for (const reply of replies) assert.equal(reply.result.isError, true, JSON.stringify(reply));
   assert.equal(requests.length, 0);
+
+  const advisory = await runNode(["bin/mcp-server.mjs"], env,
+    rpc(101, "tools/call", { name: "web_search", arguments: { query: "fixture", turn_id: null } }) +
+    rpc(102, "tools/call", { name: "web_fetch", arguments: { url: "https://example.com", turn_id: -5 } }));
+  assert.equal(advisory.code, 0, advisory.stderr);
+  const advReplies = advisory.stdout.trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(advReplies.length, 2);
+  for (const reply of advReplies) assert.notEqual(reply.result.isError, true, JSON.stringify(reply));
+  assert.equal(requests.find(r => r.url.endsWith("/search"))?.body.turnId, undefined);
+  assert.equal(requests.find(r => r.url.endsWith("/fetch"))?.body.turnId, undefined);
 });
 
 test("EOF drains a large in-flight MCP response before exiting", async (t) => {
@@ -307,7 +317,7 @@ test("a live lock is not stolen just because it is old", (t) => {
   const result = spawnSync(process.execPath, [path.join(root, "hooks/user-prompt-submit.mjs")], {
     env: { ...process.env, KIMI_CODE_HOME: home }, input: '{"session_id":"session-a"}', encoding: "utf8",
   });
-  assert.equal(result.status, 2);
+  assert.equal(result.status, 1);
   assert.match(result.stderr, /Timed out/);
   assert.equal(fs.readFileSync(lock, "utf8"), String(process.pid));
 });
@@ -324,7 +334,7 @@ test("an unowned empty lock is reclaimed only after the grace period", (t) => {
   const fresh = spawnSync(process.execPath, [path.join(root, "hooks/user-prompt-submit.mjs")], {
     env: { ...process.env, KIMI_CODE_HOME: home }, input: '{"session_id":"fresh"}', encoding: "utf8",
   });
-  assert.equal(fresh.status, 2, "a fresh empty lock may still be mid-creation");
+  assert.equal(fresh.status, 1, "a fresh empty lock may still be mid-creation");
   assert.match(fresh.stderr, /Timed out/);
   assert.equal(fs.existsSync(lock), true);
 
@@ -434,4 +444,111 @@ test("daemon does not invoke a non-Node host executable when Node cannot be foun
   `], { ...process.env, KIMI_CODE_HOME: home });
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /Node\.js executable not found/);
+});
+
+test("MCP server validates JSON-RPC 2.0 requests, cleans tool descriptions, and preserves gateway path prefix", async (t) => {
+  const home = fixture(t);
+  const requests: string[] = [];
+  const server = http.createServer((req, res) => {
+    requests.push(req.url ?? "");
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, value: { query: "q", sources: [], mode: "required", globalMode: "required", available: true } }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); });
+  const port = (server.address() as any).port;
+
+  const env = { ...process.env, KIMI_CODE_HOME: home, KIMI_WEB_TOOLS_GATEWAY_URL: `http://127.0.0.1:${port}/edge/mcp/` };
+  const input = [
+    JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    "123",
+    "[]",
+    JSON.stringify({ jsonrpc: "1.0", id: 1, method: "ping" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "web_mode", arguments: { action: "get" } } }),
+  ].join("\n") + "\n";
+  const result = await runNode(["bin/mcp-server.mjs"], env, input);
+  assert.equal(result.code, 0, result.stderr);
+  const replies = result.stdout.trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(replies.length, 5, "valid notification must be ignored while invalid/valid requests reply");
+  assert.equal(replies[0].error.code, -32600);
+  assert.equal(replies[1].error.code, -32600);
+  assert.equal(replies[2].id, 1);
+  assert.equal(replies[2].error.code, -32600);
+  const toolsJson = JSON.stringify(replies[3].result.tools);
+  assert.doesNotMatch(toolsJson, /Xiaohongshu|小红书|Twitter|social/i);
+  assert.match(replies[4].result.content[0].text, /at least one web_search required per turn/);
+  assert.deepEqual(requests, ["/edge/web-tools/mcp/mode"]);
+
+  for (const badUrl of ["http://user:pass@127.0.0.1:8080", "http://127.0.0.1:8080?x=1", "http://127.0.0.1:8080#frag"]) {
+    const bad = await runNode(["bin/mcp-server.mjs"], { ...process.env, KIMI_CODE_HOME: home, KIMI_WEB_TOOLS_GATEWAY_URL: badUrl },
+      rpc(1, "tools/call", { name: "web_status" }));
+    const reply = JSON.parse(bad.stdout.trim());
+    assert.equal(reply.result.isError, true);
+    assert.match(reply.result.content[0].text, /KIMI_WEB_TOOLS_GATEWAY_URL/);
+  }
+});
+
+test("daemon connectHostFor, resolveNodeExecutable directory guard, and LocalStorage error resilience", async (t) => {
+  const { connectHostFor } = await import("../bin/gateway-daemon.mjs");
+  assert.equal(connectHostFor("0.0.0.0"), "127.0.0.1");
+  assert.equal(connectHostFor("::"), "[::1]");
+  assert.equal(connectHostFor("::1"), "[::1]");
+  assert.equal(connectHostFor("[::1]"), "[::1]");
+
+  // A directory named `node` on PATH must be skipped rather than treated as executable.
+  const home = fixture(t);
+  const fakeBin = path.join(home, "bin");
+  fs.mkdirSync(path.join(fakeBin, process.platform === "win32" ? "node.exe" : "node"), { recursive: true });
+  const result = await runNode(["--input-type=module", "-e", `
+    import fs from 'node:fs';
+    import cp from 'node:child_process';
+    Object.defineProperty(process, 'execPath', { value: '/missing/kimi' });
+    process.env.PATH = ${JSON.stringify(`"${fakeBin}"`)};
+    let spawned;
+    cp.spawn = (exe) => { spawned = exe; throw Object.assign(new Error('stop'), { code: 'EACCES' }); };
+    const { syncBuiltinESMExports } = await import('node:module'); syncBuiltinESMExports();
+    globalThis.fetch = async () => { throw Object.assign(new Error('offline'), { cause: { code: 'ECONNREFUSED' } }); };
+    const { ensureGatewayDaemon } = await import('./bin/gateway-daemon.mjs');
+    try { await ensureGatewayDaemon(); } catch (e) { console.log(JSON.stringify({ spawned, msg: e.message })); }
+  `], { ...process.env, KIMI_CODE_HOME: home });
+  assert.equal(result.code, 0, result.stderr);
+  const info = JSON.parse(result.stdout.trim());
+  assert.notEqual(info.spawned, path.join(fakeBin, process.platform === "win32" ? "node.exe" : "node"));
+
+  // LocalStorage must not backup/destroy config or credentials on transient EBUSY,
+  // and must clean up temp files when renameSync fails.
+  const storageDir = path.join(home, "storage");
+  fs.mkdirSync(storageDir, { recursive: true });
+  fs.writeFileSync(path.join(storageDir, "config.json"), '{"defaultProvider":"brave"}\n');
+  fs.writeFileSync(path.join(storageDir, "credentials.json"), '{"WEB_TOOLS_EXA":"keep"}\n');
+  const storageRes = await runNode(["--experimental-strip-types", "--input-type=module", "-e", `
+    import fs from 'node:fs';
+    import assert from 'node:assert/strict';
+    import { LocalStorage } from './src/host/local-storage.ts';
+    const dir = ${JSON.stringify(storageDir)};
+    const storage = new LocalStorage(dir);
+    const origRead = fs.readFileSync;
+    fs.readFileSync = (p, ...rest) => {
+      if (String(p).endsWith('config.json') || String(p).endsWith('credentials.json')) {
+        throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+      }
+      return origRead(p, ...rest);
+    };
+    const origRename = fs.renameSync;
+    fs.renameSync = () => { throw Object.assign(new Error('perm'), { code: 'EPERM' }); };
+    const { syncBuiltinESMExports } = await import('node:module'); syncBuiltinESMExports();
+    assert.throws(() => storage.readConfig(), { code: 'EBUSY' });
+    assert.throws(() => storage.readAllCredentials(), { code: 'EBUSY' });
+    fs.readFileSync = origRead;
+    assert.throws(() => storage.writeAllCredentials({ WEB_TOOLS_EXA: 'new' }), { code: 'EPERM' });
+    fs.renameSync = origRename;
+    const files = fs.readdirSync(dir);
+    assert.equal(files.some(f => f.includes('.corrupt-')), false, 'must not backup intact files on EBUSY');
+    assert.equal(files.some(f => f.endsWith('.tmp')), false, 'must unlink temp file on failed rename');
+    assert.equal(storage.readConfig().defaultProvider, 'brave');
+    assert.equal(storage.readAllCredentials().WEB_TOOLS_EXA, 'keep');
+  `], { ...process.env, KIMI_CODE_HOME: home });
+  assert.equal(storageRes.code, 0, storageRes.stderr);
 });

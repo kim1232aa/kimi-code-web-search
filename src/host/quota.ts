@@ -125,10 +125,13 @@ export function isLow(snapshot: QuotaSnapshot | undefined, fraction = 0.1): bool
  */
 export function mergePoolQuota(snapshots: QuotaSnapshot[]): QuotaSnapshot {
   const first = snapshots[0];
+  const primary = snapshots.find((s) => s.authoritative) ?? snapshots.find((s) => s.supported) ?? first;
+  const supported = snapshots.some((s) => s.supported);
+  const authoritative = snapshots.some((s) => s.authoritative);
   let remaining: number | undefined;
   let used: number | undefined;
   let limit: number | undefined;
-  let resetAt = first.resetAt;
+  let resetAt = primary.resetAt;
   const breakdown: Record<string, number> = {};
 
   for (const s of snapshots) {
@@ -141,15 +144,15 @@ export function mergePoolQuota(snapshots: QuotaSnapshot[]): QuotaSnapshot {
 
   const note = snapshots.length > 1 ? `聚合 ${snapshots.length} 把 Key 的总额度` : first.note;
   return {
-    supported: first.supported,
-    authoritative: first.authoritative,
-    unit: first.unit,
+    supported,
+    authoritative,
+    unit: primary.unit,
     ...(remaining !== undefined ? { remaining } : {}),
     ...(used !== undefined ? { used } : {}),
     ...(limit !== undefined ? { limit } : {}),
     ...(resetAt !== undefined ? { resetAt } : {}),
     ...(Object.keys(breakdown).length > 0 ? { breakdown } : {}),
-    source: first.source,
+    source: primary.source,
     fetchedAt: Date.now(),
     ...(note ? { note } : {}),
   };

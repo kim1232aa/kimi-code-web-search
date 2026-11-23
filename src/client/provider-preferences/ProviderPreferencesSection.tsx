@@ -165,8 +165,8 @@ function PreferencesBody(props: {
     setMsg(null);
     try {
       const res = await api.providerOptionsSet(p.name, draft);
-      if (res?.options?.overrides) {
-        setDraft({ ...res.options.overrides });
+      if (res?.overrides) {
+        setDraft({ ...res.overrides });
       }
       await onConfigChanged();
       // On success, remain silent per design spec (no green "已保存" bar)

@@ -6,7 +6,7 @@
  * by default.
  * @module
  */
-import { useState, useRef, type CSSProperties } from "react";
+import { useEffect, useState, useRef, type CSSProperties } from "react";
 import { Button, Modal, StateDot } from "./primitives.tsx";
 import {
   IconChevronRightOutline14,
@@ -36,7 +36,7 @@ interface Props {
   inChain: boolean;
   onClose: () => void;
   onToggle: (enabled: boolean) => void;
-  onBaseUrl: (url: string) => void;
+  onBaseUrl: (url: string) => Promise<boolean | void> | void;
   onTest: () => Promise<void>;
   onRefreshQuota: () => void;
   onConfigChanged: () => Promise<void> | void;
@@ -336,7 +336,7 @@ function ConnectionSettingsDisclosure(props: {
   p: ProviderView;
   draftBaseUrl: string;
   setDraftBaseUrl: (v: string) => void;
-  onBaseUrl: (url: string) => void;
+  onBaseUrl: (url: string) => Promise<void> | void;
 }) {
   const { t, p, draftBaseUrl, setDraftBaseUrl, onBaseUrl } = props;
   const selfHosted = p.name === "searxng";
@@ -381,14 +381,14 @@ function ConnectionSettingsDisclosure(props: {
               }}
               onBlur={() => {
                 if (draftBaseUrl.trim() !== (p.baseUrlConfigured ? (p.baseUrl ?? "") : "")) {
-                  onBaseUrl(draftBaseUrl.trim());
+                  void onBaseUrl(draftBaseUrl.trim());
                 }
               }}
               placeholder={p.defaultBaseUrl || t("baseUrlPlaceholder")}
               style={{ flex: 1, padding: "6px 10px", borderRadius: 6, border: `1px solid ${surface.border}`, background: surface.layer2, color: text.primary, fontFamily: "inherit", fontSize: 13 }}
             />
             {isConfigured && (
-              <Button size="sm" variant="ghost" onClick={() => { setDraftBaseUrl(""); onBaseUrl(""); }}>
+              <Button size="sm" variant="ghost" onClick={() => { setDraftBaseUrl(""); void onBaseUrl(""); }}>
                 {t("restoreDefaultUrl")}
               </Button>
             )}
@@ -409,6 +409,26 @@ export function ProviderModal(props: Props) {
   const { t, p, quota, testResult, busy, showPreferred, inChain, onClose, onToggle, onBaseUrl, onTest, onRefreshQuota, onConfigChanged } = props;
   const [localError, setLocalError] = useState("");
   const [draftBaseUrl, setDraftBaseUrl] = useState(p.baseUrlConfigured ? (p.baseUrl ?? "") : "");
+
+  useEffect(() => {
+    setDraftBaseUrl(p.baseUrlConfigured ? (p.baseUrl ?? "") : "");
+  }, [p.name, p.baseUrl, p.baseUrlConfigured]);
+
+  useEffect(() => {
+    setLocalError("");
+  }, [p.name]);
+
+  const handleBaseUrl = async (url: string) => {
+    setLocalError("");
+    try {
+      const saved = await onBaseUrl(url);
+      if (saved === false) {
+        setDraftBaseUrl(p.baseUrlConfigured ? (p.baseUrl ?? "") : "");
+      }
+    } catch (e) {
+      setLocalError(e instanceof Error ? e.message : String(e));
+    }
+  };
   const base = providerStatusOf(p, quota, inChain);
   const status = base === "ready" ? (testOutcomeStatus(testResult) ?? base) : base;
   const statusText = {
@@ -503,7 +523,7 @@ export function ProviderModal(props: Props) {
               p={p}
               draftBaseUrl={draftBaseUrl}
               setDraftBaseUrl={setDraftBaseUrl}
-              onBaseUrl={onBaseUrl}
+              onBaseUrl={handleBaseUrl}
             />
           )}
         </SettingsGroup>

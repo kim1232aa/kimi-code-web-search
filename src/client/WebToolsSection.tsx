@@ -65,6 +65,16 @@ import { SegmentedControl } from "./ui/SegmentedControl.tsx";
 export type { TFunc, ProviderStatus };
 export { providerStatusOf, quotaSummary, outcomeLabel };
 
+function safeHref(url?: string): string | undefined {
+  if (!url) return undefined;
+  try {
+    const parsed = new URL(url.trim());
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Local switch (DSH primitives ship no toggle; role=switch keeps it accessible). */
 export function Switch(props: { checked: boolean; onChange: (next: boolean) => void; label: string; disabled?: boolean }) {
   const { checked, onChange, label, disabled } = props;
@@ -418,7 +428,7 @@ function TestSearchBlock(props: { t: TFunc; config: ConfigView; onError: (msg: s
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {(result.results ?? []).slice(0, 5).map((r, i) => (
                 <div key={i} style={{ display: "flex", flexDirection: "column", gap: 2, paddingTop: 6, borderTop: `1px solid ${surface.border}` }}>
-                  <a href={r.url} target="_blank" rel="noreferrer" style={{ color: accentText(), textDecoration: "none", fontSize: 13 }}>
+                  <a href={safeHref(r.url)} target="_blank" rel="noreferrer" style={{ color: accentText(), textDecoration: "none", fontSize: 13 }}>
                     {r.title}
                   </a>
                   <span style={{ color: text.tertiary, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -991,12 +1001,12 @@ export function WebToolsSection(props: SectionProps) {
     mounted.current = true;
     void load();
     void loadQuotas();
-    void api.versionCheck().then(setVersionInfo).catch(() => {});
+    void api.versionCheck().then((info) => {
+      if (mounted.current) setVersionInfo(info);
+    }).catch(() => {});
 
-    let timer: NodeJS.Timeout | undefined;
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible") {
-        if (timer) clearTimeout(timer);
         void loadQuotas();
       }
     };
@@ -1006,7 +1016,6 @@ export function WebToolsSection(props: SectionProps) {
     }
 
     return () => {
-      if (timer) clearTimeout(timer);
       if (typeof document !== "undefined") {
         document.removeEventListener("visibilitychange", onVisibilityChange);
       }
@@ -1037,26 +1046,26 @@ export function WebToolsSection(props: SectionProps) {
   const setEnabled = (enabled: boolean) => void save({ enabled });
 
   const toggleProvider = (name: string, enabled: boolean) => {
-    const providerEnabled = Object.fromEntries(config.providers.map((p) => [p.name, p.name === name ? enabled : p.enabled]));
+    const current = configRef.current;
+    if (!current) return;
+    const providerEnabled = Object.fromEntries(current.providers.map((p) => [p.name, p.name === name ? enabled : p.enabled]));
     void save({ providerEnabled });
   };
-  const setBaseUrl = async (name: string, baseUrl: string) => {
+  const setBaseUrl = async (name: string, baseUrl: string): Promise<boolean> => {
     try {
       await api.sourceEndpointSet(name, baseUrl);
       await load();
+      return true;
     } catch (err: any) {
       if (err instanceof WebToolsApiError && err.code === "conflict") {
         if (window.confirm(err.message || t("confirmForeignOverride"))) {
-          try {
-            await api.sourceEndpointSet(name, baseUrl, true);
-            await load();
-          } catch (retryErr: any) {
-            setError(retryErr instanceof Error ? retryErr.message : String(retryErr));
-          }
+          await api.sourceEndpointSet(name, baseUrl, true);
+          await load();
+          return true;
         }
-      } else {
-        setError(err instanceof Error ? err.message : String(err));
+        return false;
       }
+      throw err;
     }
   };
 
@@ -1123,7 +1132,7 @@ export function WebToolsSection(props: SectionProps) {
     if (orderWriteInFlight.current) return; // the in-flight settle drains next
     const fields = pendingOrder.current;
     if (!fields) {
-      setSavingOrder(false);
+      if (mounted.current) setSavingOrder(false);
       return;
     }
     const seq = orderWriteSeq.current;
@@ -1132,12 +1141,13 @@ export function WebToolsSection(props: SectionProps) {
     void api
       .routingSet(fields.policy, [fields.defaultProvider, ...fields.fallbackOrder])
       .then((result) => {
-        if (seq !== orderWriteSeq.current) return; // a newer intent owns the view
+        if (!mounted.current || seq !== orderWriteSeq.current) return; // unmounted or a newer intent owns the view
         pendingOrder.current = null;
         setConfig((prev) => applyRoutingResult(prev, result));
         setError("");
       })
       .catch((e) => {
+        if (!mounted.current) return;
         setError(e instanceof Error ? e.message : String(e));
         if (seq !== orderWriteSeq.current) return;
         // Roll the optimistic order back to what the Host actually holds.
@@ -1146,6 +1156,7 @@ export function WebToolsSection(props: SectionProps) {
       })
       .finally(() => {
         orderWriteInFlight.current = false;
+        if (!mounted.current) return;
         if (pendingOrder.current) drainOrderWrites();
         else setSavingOrder(false);
       });
@@ -1207,13 +1218,13 @@ export function WebToolsSection(props: SectionProps) {
 
       {error && <div style={{ color: stateColor.danger, fontSize: 13 }}>{error}</div>}
 
-      {versionInfo?.updateAvailable && versionInfo.latestVersion && versionInfo.releaseUrl && (
+      {versionInfo?.updateAvailable && versionInfo.latestVersion && safeHref(versionInfo.releaseUrl) && (
         <div className="dswt-update-banner" role="status">
           <div className="dswt-update-copy">
             <strong>{t("updateAvailableTitle", { version: versionInfo.latestVersion })}</strong>
             <span>{t("updateAvailableBody", { current: versionInfo.currentVersion })}</span>
           </div>
-          <a className="dswt-update-link" href={versionInfo.releaseUrl} target="_blank" rel="noreferrer">
+          <a className="dswt-update-link" href={safeHref(versionInfo.releaseUrl)} target="_blank" rel="noreferrer">
             {t("viewUpdate")}
             <ExternalLinkIcon size={12} />
           </a>

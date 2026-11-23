@@ -2,7 +2,7 @@
 
 [English](README.md) | **中文**
 
-面向 [Kimi Code CLI](https://www.kimi.com/code) 的多源联网搜索/网页读取插件：按会话生效的**搜索模式**策略、**Jev 智能判定**、小红书 / X 平台研究，以及本地 **Web UI 仪表盘**。
+面向 [Kimi Code CLI](https://www.kimi.com/code) 的多源联网搜索/网页读取插件：按会话生效的**搜索模式**策略、**Jev 智能判定**，以及本地 **Web UI 仪表盘**。
 
 
 > 仓库于 2026-11-22 从 `kimi-web-tools` 改名为 `kimi-code-web-search`。GitHub 会重定向旧地址，已有克隆不受影响。
@@ -14,15 +14,14 @@
 ## 功能
 
 - **`web_search`** —— 一个工具打通可配置的搜索源池：Exa、Tavily、Brave、You.com、Firecrawl、Parallel、Jina、Keenable、自建 SearXNG，以及自定义源（Tavily 兼容、SearXNG JSON、通用 JSON API）。多 key 池、健康感知轮换、额度跟踪、自动降级。路由策略：`ordered`（顺序）、`round-robin`（轮询）、`random`（随机）。可选 `provider` 参数指定优先尝试的源，用于多源交叉验证。
-- **`web_fetch`** —— 任意公开 URL → 干净可读的 Markdown/正文，独立的读取链（`fetchOrder`），兜底为内置 HTTP。小红书和 X 的帖子 URL 会返回完整正文与热门评论。
-- **平台内搜索** —— 查询加前缀 `小红书:` 或 `X:` 直接在平台内搜索（需要在仪表盘登录浏览器会话）。网关会在输入平台搜索框前去掉前缀。
+- **`web_fetch`** —— 任意公开 URL → 干净可读的 Markdown/正文，独立的读取链（`fetchOrder`），兜底为内置 HTTP。
 - **四种搜索模式**，通过 Kimi Code 生命周期钩子强制执行：
   - `auto`（智能联网）—— 按需联网，其余情况直接依据上下文回答。
   - `smart`（Jev 判定）—— 由小型分类器逐轮判定是否需要联网。后端支持 TypeSafe System One（默认模型 `jev-latest`）、OpenRouter、任意 OpenAI 兼容端点。出错/超时默认放行（fail open），配置 `failOpen: false` 则改为升级成必搜。
   - `required`（始终联网）—— 每个用户轮必须先完成一次真实搜索才能结束回答。默认只有搜索算数（`requiredEvidence: "search"`），切到 `"search-or-fetch"` 后读取 URL 也算。识别到的外部 web/MCP 搜索工具同样计入。没搜或全部失败时，Stop 门只纠偏一次，随后放行并要求把失败如实报告为未验证——不会死循环。
   - `off`（关闭联网）—— 屏蔽本插件的联网工具；不影响其他插件。
 - **防幻觉提示词纪律** —— 围绕请求真正依赖的事实去搜、用一手来源核验、失败的源不重试而是换源、绝不凭记忆补全（"未搜到不等于不存在"）。
-- **Web UI 仪表盘**（`http://127.0.0.1:18492`）——  provider key 与额度、拖拽排序路由、Smart/Jev 面板（含分类器测试）、全局/会话级模式切换、平台登录、明暗主题、中英文界面。
+- **Web UI 仪表盘**（`http://127.0.0.1:18492`）——  provider key 与额度、拖拽排序路由、Smart/Jev 面板（含分类器测试）、全局/会话级模式切换、明暗主题、中英文界面。
 - **Pi 导入** —— 一条命令从本地 Pi agent 配置（`always-search.ts` + `pi-web-access`）迁移 API key、端点、路由和搜索模式。
 - **子代理感知** —— 正确处理子代理活动、系统触发轮和会话清理，必搜门不会在后台轮上误伤。
 
@@ -68,7 +67,7 @@ Kimi 会把准备好的目录复制到 `$KIMI_CODE_HOME/plugins/managed/web/`。
 ### 本地网关首次使用
 
 1. 在构建好的仓库或解压后的插件目录执行 `node ./bin/gateway-daemon.mjs ensure`，再打开 `http://127.0.0.1:18492`。没配置远程地址时，只有 `web_search` 和 `web_fetch` 可按需启动本机网关；`web_status`、`web_mode` 和 `/web:dashboard` 都不启动它。
-2. 在网关上配置可用的搜索源：添加搜索 API key（如 `WEB_TOOLS_EXA`），或配置受支持的免 key 搜索源。小红书／X 原生检索所需的浏览器也配置在网关主机上。
+2. 在网关上配置可用的搜索源：添加搜索 API key（如 `WEB_TOOLS_EXA`），或配置受支持的免 key 搜索源（如 SearXNG）。
 3. 在 Kimi 新会话运行 `/web:status`，再实际搜一次。进程健康或 MCP 已连接，不代表搜索源能用。
 
 仪表盘配置的搜索源 key 保存在网关主机的 `$KIMI_CODE_HOME/web-tools/credentials.json`，不放在 `mcp.json`。
@@ -90,8 +89,8 @@ node ./bin/import-pi.mjs --pi-dir /path/to/pi/agent
 
 | 工具 | 用途 |
 | --- | --- |
-| `mcp__plugin-web_s__web_search` | 跨搜索源池的网页/平台搜索；可选 `provider` 指定优先源 |
-| `mcp__plugin-web_s__web_fetch` | URL → 干净 Markdown；小红书 / X 帖子返回全文与评论 |
+| `mcp__plugin-web_s__web_search` | 跨搜索源池的网页搜索；可选 `provider` 指定优先源 |
+| `mcp__plugin-web_s__web_fetch` | URL → 干净可读的 Markdown/正文 |
 | `mcp__plugin-web_s__web_mode` | 查看 / 设置 / 循环切换搜索模式 |
 | `mcp__plugin-web_s__web_status` | 真正能发搜索的引擎列表 |
 
@@ -199,7 +198,7 @@ kimi
 ### 远程模式的限制
 
 - **HTTP 直连是接入工具，不是安装插件。** 不会自动安装 Skill、斜杠命令或钩子。保留并启用插件时，如果打开了 `recognizeExternalWebTools` 且收到回执，`web-remote` 的搜索可以作为外部搜索计入本轮；插件自带的 `off` 拦截不会阻止这条独立 MCP 连接。
-- **两种远程接法都不共享客户端轮次状态。** 带着只有客户端知道的 `turn_id` 调用，可能报 `Stale or unknown turn`；如果网关本身处于 `required`，不绑定轮次的请求也可能被拒绝。远程状态和模式查询反映的是网关，不是客户端策略。不要把跨主机 Jev、必搜或关闭模式当成同机部署的等价替代。搜索源 key 留在网关。
+- **两种远程接法都不共享客户端轮次状态。** 客户端侧的轮次跟踪和钩子读写客户端本地的 `mode-state.json`，而远程桥接返回的模式和状态反映的是网关侧，不是客户端策略。不要把跨主机 Jev、必搜或关闭模式当成同机部署的等价替代。搜索源 key 留在网关。
 
 ### MCP 排错
 
@@ -227,7 +226,6 @@ curl http://127.0.0.1:18492/health
 - **工具改名与老会话。** Kimi Code 在会话开始时冻结工具声明清单。插件工具名变更后（v0.4.0 曾把 `kimi-web-tools` 改为 `web`（仓库现名 `kimi-code-web-search`）），改名*之前*开的会话仍声明旧名；模型若调用新名，可能被严格校验函数名的上游网关拒绝。更新插件后请新开会话。
 - **必搜模式依赖钩子加载。** 安装/更新后先 `/reload` 或新开会话再依赖强制执行。钩子执行出错时放行（fail open）。
 - **Stop 门预算。** Kimi Code 每轮只给一次续写机会；第二次 Stop 一定放行。失败的研究如实报告为未验证，不会无限重试。
-- **平台会话**（小红书 / X）依赖本地浏览器且可能过期，需要时在仪表盘重新登录。
 - **回执钩子是尽力而为。** Kimi Code 的 `PostToolUse` / `PostToolUseFailure` 仅观察不拦截，外部工具识别偶尔可能漏记。
 
 ## 开发
@@ -238,8 +236,6 @@ npm run typecheck    # tsc --noEmit
 npm test             # node --test（Node >= 22.6）
 npm run build        # 宿主（tsc）+ 客户端（esbuild）
 ```
-
-依赖浏览器的测试（`browser-lifecycle`、`browser-session`）需要本地 Chrome/Chromium，无头环境下跳过。
 
 ## 许可证
 

@@ -253,7 +253,7 @@ export function shouldBypassProxy(url: string | URL): boolean {
  *    request actually terminates, instead of silently stopping dispatch;
  *  - on any terminal path (done / error / cancel) the dispatcher is destroyed.
  */
-function withBodyLifetime(response: Response, onDone: () => void): Response {
+export function withBodyLifetime(response: Response, onDone: () => void): Response {
   const body = response.body;
   if (!body) {
     onDone();
@@ -310,7 +310,7 @@ function withBodyLifetime(response: Response, onDone: () => void): Response {
   });
 }
 
-async function destroySafely(dispatcher: unknown): Promise<void> {
+export async function destroySafely(dispatcher: unknown): Promise<void> {
   if (dispatcher && typeof (dispatcher as { destroy?: unknown }).destroy === "function") {
     try {
       await (dispatcher as { destroy: () => Promise<unknown> }).destroy();
@@ -374,7 +374,7 @@ export async function fetchWithProxy(
         const res = await dns.lookup(h, { all: true });
         return res as Array<{ address: string; family: number }>;
       },
-    });
+    }, port);
 
     const proxyUrl = shouldBypassProxy(url) ? undefined : (proxyFromEnv() ?? proxyFromSystem());
     if (proxyUrl !== undefined) {

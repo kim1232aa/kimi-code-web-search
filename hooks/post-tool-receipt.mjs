@@ -28,10 +28,26 @@ function receiptSucceeded(payload) {
   const output = payload.tool_output;
   if (typeof output === "string" && looksLikeErrorText(output)) return false;
   const response = payload.tool_response;
+  if (typeof response === "string" && looksLikeErrorText(response)) return false;
   if (response && typeof response === "object") {
     if (response.isError === true || response.is_error === true || response.ok === false) return false;
+    if (Array.isArray(response.content)) {
+      const texts = response.content
+        .map((item) => (item && typeof item === "object" && typeof item.text === "string" ? item.text : ""))
+        .filter((text) => text.trim().length > 0);
+      if (texts.length > 0 && texts.every((text) => looksLikeErrorText(text))) return false;
+    }
   }
   return true;
+}
+
+function recordOutcome(turn, completedKey, succeededKey, failed) {
+  turn[completedKey] = true;
+  if (!failed) {
+    turn[succeededKey] = true;
+  } else if (turn[succeededKey] === undefined) {
+    turn[succeededKey] = false;
+  }
 }
 
 async function main() {
@@ -41,16 +57,42 @@ async function main() {
     typeof payload.session_id === "string" && payload.session_id.trim() ? payload.session_id.trim() : "global";
   const baseDir = webToolsDir();
   const modeStatePath = path.join(baseDir, "mode-state.json");
-
-  // Own-tool completion is authoritative in the gateway. A second receipt here
-  // cannot identify the parent turn of an isolated subagent and must not guess.
-  const ownKind = classifyOwnTool(payload.tool_name);
-  if (ownKind) return;
-
   const input =
     payload.tool_input && typeof payload.tool_input === "object" && !Array.isArray(payload.tool_input)
       ? payload.tool_input
       : {};
+
+  // On a local gateway with an explicit non-global session_id, the gateway is
+  // authoritative. Remote gateways cannot write local mode-state.json, and
+  // omitted/"global" session_id calls skip completeTool("global", ...) locally,
+  // so credit those here unless a subagent is active on local mode.
+  const ownKind = classifyOwnTool(payload.tool_name);
+  if (ownKind) {
+    const remoteGateway = Boolean(process.env.KIMI_WEB_TOOLS_GATEWAY_URL?.trim());
+    const inputSessionId =
+      typeof input.session_id === "string" && input.session_id.trim()
+        ? input.session_id.trim()
+        : typeof input.sessionId === "string" && input.sessionId.trim()
+          ? input.sessionId.trim()
+          : "";
+    const hasExplicitSession = Boolean(inputSessionId && inputSessionId !== "global");
+    if (!remoteGateway && hasExplicitSession) return;
+    if (!fs.existsSync(modeStatePath)) return;
+    updateModeState(modeStatePath, (doc) => {
+      const entry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
+      if (!entry?.turn) return;
+      const subagentActive = typeof entry.activeSubagents === "number" && entry.activeSubagents > 0;
+      if (!remoteGateway && subagentActive) return;
+      if (ownKind === "web_search") {
+        recordOutcome(entry.turn, "webSearchCompleted", "webSearchSucceeded", failed);
+      } else {
+        recordOutcome(entry.turn, "webFetchCompleted", "webFetchSucceeded", failed);
+      }
+      entry.updatedAt = Date.now();
+    });
+    return;
+  }
+
   const kind = externalWebToolKind(payload.tool_name, input);
   if (!kind) return;
 
@@ -69,19 +111,9 @@ async function main() {
   updateModeState(modeStatePath, (doc) => {
     const entry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
     if (!entry?.turn) return;
-    entry.turn.externalWebCompleted = true;
-    if (!failed) {
-      entry.turn.externalWebSucceeded = true;
-    } else if (entry.turn.externalWebSucceeded === undefined) {
-      entry.turn.externalWebSucceeded = false;
-    }
+    recordOutcome(entry.turn, "externalWebCompleted", "externalWebSucceeded", failed);
     if (kind === "search") {
-      entry.turn.externalSearchCompleted = true;
-      if (!failed) {
-        entry.turn.externalSearchSucceeded = true;
-      } else if (entry.turn.externalSearchSucceeded === undefined) {
-        entry.turn.externalSearchSucceeded = false;
-      }
+      recordOutcome(entry.turn, "externalSearchCompleted", "externalSearchSucceeded", failed);
     }
     entry.updatedAt = Date.now();
   });

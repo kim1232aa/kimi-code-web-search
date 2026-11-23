@@ -2,14 +2,17 @@
 import path from "node:path";
 import {
   webToolsDir,
-  readModeState,
   updateModeState,
   effectiveMode,
   hookPayload,
   hookFailure,
 } from "./mode-state.mjs";
 
-function requiredSearchCorrectionText(searchOnly) {
+function requiredSearchCorrectionText(searchOnly, recognizeExternal = true) {
+  if (!recognizeExternal) {
+    const call = searchOnly ? "Run this plugin's `web_search`" : "Run this plugin's `web_search` or `web_fetch`";
+    return `Web Search is required for this turn. ${call} before finalizing (\`web_mode\`/\`web_status\` do not count); mark unresolved gaps as 未验证.`;
+  }
   const call = searchOnly ? "Run any web search" : "Run any web search or page read";
   return `Web Search is required for this turn. ${call} before finalizing — this plugin's tools, built-in WebSearch/FetchURL, or another search MCP all count (\`web_mode\`/\`web_status\` do not); mark unresolved gaps as 未验证.`;
 }
@@ -25,6 +28,11 @@ function failedResearchCorrectionText(searchOnly) {
 const FAILED_RESEARCH_REMINDER =
   "Web research failed during this turn; state clearly what could not be verified (未验证).";
 
+function noResearchReminderText(searchOnly) {
+  const what = searchOnly ? "web search" : "web lookup";
+  return `Required ${what} was not completed during this turn; state clearly what could not be verified (未验证).`;
+}
+
 async function main() {
   const payload = await hookPayload();
 
@@ -34,51 +42,50 @@ async function main() {
     typeof payload.session_id === "string" && payload.session_id.trim() ? payload.session_id.trim() : "global";
   const modeStatePath = path.join(webToolsDir(), "mode-state.json");
 
-  // Kimi fires the Stop hook for every agent scope with the shared session_id
-  // and no agent identity in the payload, so a subagent's turn-end cannot be
-  // told apart from the main agent's. While subagents are active, stay silent
-  // (fail-open, matching the DSH/Pi rule that subagents are exempt from forced
-  // web search) and never consume the turn's correction budget. This check
-  // runs BEFORE the system-turn marker so a subagent's Stop cannot consume it.
-  const pre = readModeState(modeStatePath);
-  const preEntry = pre.sessions[sessionId];
-  if (typeof preEntry?.activeSubagents === "number" && preEntry.activeSubagents > 0) {
-    return;
-  }
-
-  // System-trigger turns (background task notifications, goal continuations)
-  // have no user prompt and must not inherit the previous user turn's research
-  // requirement. Consume the marker set by TurnStarted and skip this turn-end.
-  if (preEntry?.systemTurnPending === true) {
-    updateModeState(modeStatePath, (doc) => {
-      const entry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
-      if (!entry) return;
-      Object.defineProperty(doc.sessions, sessionId, {
-        value: { ...entry, systemTurnPending: false, updatedAt: Date.now() },
-        writable: true,
-        enumerable: true,
-        configurable: true,
-      });
-    });
-    return;
-  }
-
   let shouldSteer = false;
-  let turnId;
   let failedResearch = false;
   let fetchOnly = false;
   let searchOnlyTurn = false;
   let allFailed = false;
+  let recognizeExternalTurn = true;
 
   updateModeState(modeStatePath, (doc) => {
+    const existingEntry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
+
+    // Kimi fires the Stop hook for every agent scope with the shared session_id
+    // and no agent identity in the payload, so a subagent's turn-end cannot be
+    // told apart from the main agent's. While subagents are active, stay silent
+    // (fail-open, matching the DSH/Pi rule that subagents are exempt from forced
+    // web search) and never consume the turn's correction budget. This check
+    // runs BEFORE the system-turn marker so a subagent's Stop cannot consume it.
+    if (typeof existingEntry?.activeSubagents === "number" && existingEntry.activeSubagents > 0) {
+      return;
+    }
+
+    // System-trigger turns (background task notifications, goal continuations)
+    // have no user prompt and must not inherit the previous user turn's research
+    // requirement. Consume the marker set by TurnStarted and skip this turn-end.
+    if (existingEntry?.systemTurnPending === true) {
+      Object.defineProperty(doc.sessions, sessionId, {
+        value: { ...existingEntry, systemTurnPending: false, updatedAt: Date.now() },
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      return;
+    }
+
     const mode = effectiveMode(doc, sessionId);
-    const sessionEntry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : {};
+    const sessionEntry = existingEntry ?? {};
     const turn = sessionEntry.turn || {
       turn: 1,
       required: mode === "required",
       disabled: mode === "off",
+      requiredEvidence: "search",
+      recognizeExternal: true,
       exempted: false,
       externalWebCompleted: false,
+      externalSearchCompleted: false,
       webSearchCompleted: false,
       webSearchSucceeded: false,
       webFetchCompleted: false,
@@ -98,6 +105,7 @@ async function main() {
     // Turns recorded before this field existed keep their original semantics.
     const searchOnly = turn.requiredEvidence === "search";
     searchOnlyTurn = searchOnly;
+    recognizeExternalTurn = turn.recognizeExternal !== false;
     const completed = searchOnly
       ? Boolean(turn.webSearchCompleted || turn.externalSearchCompleted)
       : Boolean(turn.webSearchCompleted || turn.webFetchCompleted || turn.externalWebCompleted);
@@ -128,7 +136,6 @@ async function main() {
         configurable: true,
       });
       shouldSteer = true;
-      turnId = turn.turn;
     } else {
       failedResearch = true;
     }
@@ -140,13 +147,16 @@ async function main() {
     // ids are printed: the binding is advisory now, and echoing it made models
     // retry with a stale id.
     const fetchOnlyNote = fetchOnly ? ` ${FETCH_ONLY_NOTE}` : "";
-    const text = allFailed ? failedResearchCorrectionText(searchOnlyTurn) : `${requiredSearchCorrectionText(searchOnlyTurn)}${fetchOnlyNote}`;
+    const text = allFailed
+      ? failedResearchCorrectionText(searchOnlyTurn)
+      : `${requiredSearchCorrectionText(searchOnlyTurn, recognizeExternalTurn)}${fetchOnlyNote}`;
     process.stderr.write(text);
     process.exitCode = 2;
     return;
   }
   if (failedResearch) {
-    process.stdout.write(`${FAILED_RESEARCH_REMINDER}\n`);
+    const reminder = allFailed ? FAILED_RESEARCH_REMINDER : noResearchReminderText(searchOnlyTurn);
+    process.stdout.write(`${reminder}\n`);
   }
 }
 

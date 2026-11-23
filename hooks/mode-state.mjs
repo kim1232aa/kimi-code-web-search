@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 
 const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
 const modes = new Set(["auto", "smart", "required", "off"]);
+const TRANSIENT_FS_ERRORS = new Set(["EPERM", "EBUSY", "EACCES"]);
 // A lock created via openSync("wx") is written a moment later; empty locks
 // younger than this are assumed to be mid-creation, not orphaned.
 const EMPTY_LOCK_GRACE_MS = 10_000;
@@ -66,12 +67,17 @@ export function updateModeState(file, change) {
       fd = fs.openSync(lock, "wx", 0o600);
       fs.writeFileSync(fd, String(process.pid));
     } catch (error) {
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch {}
+        try { fs.unlinkSync(lock); } catch {}
+        fd = undefined;
+      }
       if (error.code !== "EEXIST") {
-        if (fd !== undefined) {
-          fs.closeSync(fd);
-          fs.unlinkSync(lock);
+        if (!TRANSIENT_FS_ERRORS.has(error.code) || Date.now() >= deadline) {
+          throw error;
         }
-        throw error;
+        Atomics.wait(waitBuffer, 0, 0, 10);
+        continue;
       }
       try {
         const before = fs.statSync(lock);
@@ -111,13 +117,16 @@ export function updateModeState(file, change) {
           }
         }
       } catch (readError) {
-        if (readError.code !== "ENOENT") throw readError;
+        if (readError.code !== "ENOENT") {
+          if (!TRANSIENT_FS_ERRORS.has(readError.code) || Date.now() >= deadline) throw readError;
+        }
       }
       if (Date.now() >= deadline) throw new Error(`Timed out updating mode-state: ${file}`);
       Atomics.wait(waitBuffer, 0, 0, 10);
     }
   }
   let temporary;
+  let succeeded = false;
   try {
     const doc = readModeState(file);
     change(doc);
@@ -132,14 +141,31 @@ export function updateModeState(file, change) {
     } finally {
       fs.closeSync(out);
     }
-    fs.renameSync(temporary, file);
+    while (true) {
+      try {
+        fs.renameSync(temporary, file);
+        break;
+      } catch (renameError) {
+        if (!TRANSIENT_FS_ERRORS.has(renameError.code) || Date.now() >= deadline) {
+          throw renameError;
+        }
+        Atomics.wait(waitBuffer, 0, 0, 10);
+      }
+    }
     syncDirQuietly(path.dirname(file));
     temporary = undefined;
+    succeeded = true;
     return doc;
   } finally {
-    if (temporary && fs.existsSync(temporary)) fs.unlinkSync(temporary);
-    fs.closeSync(fd);
-    fs.unlinkSync(lock);
+    if (temporary && fs.existsSync(temporary)) {
+      try { fs.unlinkSync(temporary); } catch {}
+    }
+    try { fs.closeSync(fd); } catch {}
+    try {
+      fs.unlinkSync(lock);
+    } catch (unlinkError) {
+      if (succeeded && unlinkError?.code !== "ENOENT") throw unlinkError;
+    }
   }
 }
 
@@ -164,6 +190,7 @@ export function newTurn(doc, sessionId, options) {
     turn: (previous.turn?.turn ?? 0) + 1,
     required: options?.required ?? (mode === "required"), disabled: mode === "off",
     requiredEvidence: options?.requiredEvidence === "search-or-fetch" ? "search-or-fetch" : "search",
+    recognizeExternal: options?.recognizeExternal !== false,
     exempted: Boolean(options?.exempted), smartEscalated: Boolean(options?.smartEscalated),
     smartDecision: options?.smartDecision, externalWebCompleted: false,
     externalSearchCompleted: false,
@@ -177,6 +204,8 @@ export function newTurn(doc, sessionId, options) {
   return turn;
 }
 
+const OWN_EXACT_SERVERS = new Set(["web", "kimi_web_tools", "kimi_code_web_search"]);
+
 /**
  * Recognize this plugin's own retrieval tools by name, not by a fixed list.
  *
@@ -184,13 +213,15 @@ export function newTurn(doc, sessionId, options) {
  * segments have changed as the plugin was renamed and the server key was
  * shortened, so an exact allowlist breaks on the next rename. Match the shape
  * instead: an own search/fetch tool is one whose server segment belongs to this
- * plugin (`plugin-*web*`) and whose tool segment is `web_search`/`web_fetch`.
- * A bare `web_search`/`web_fetch` also counts: those are this plugin's names.
+ * plugin (`plugin-*web*` or an exact known server name) and whose tool segment
+ * is `web_search`/`web_fetch`. A bare `web_search`/`web_fetch` also counts.
  */
 function ownKindOfServer(server) {
   const normalized = normalizeToolSegment(server);
-  if (!/(?:^|_)plugin_(?:.*_)?web(?:_|$)/.test(normalized) && !/(?:^|_)web(?:_|$)/.test(normalized)) return undefined;
-  return "own";
+  if (/^plugin_(?:.*_)?web(?:_|$)/.test(normalized) || OWN_EXACT_SERVERS.has(normalized)) {
+    return "own";
+  }
+  return undefined;
 }
 
 export function classifyOwnTool(name) {
@@ -234,6 +265,10 @@ const WEB_VENDOR_TOKENS = new Set([
 const WEB_VENDOR_ACTION_TOKENS = new Set(["search", "fetch", "scrape", "crawl", "crawling", "extract", "reader", "ask", "research", "reason"]);
 const NON_WEB_ACTION_TOKENS = new Set(["feedback", "status", "credit", "usage", "monitor"]);
 
+function splitCamel(name) {
+  return name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2");
+}
+
 function normalizeToolSegment(name) {
   return name.toLowerCase().replace(/[-.\s]+/g, "_").replace(/^_+|_+$/g, "");
 }
@@ -245,17 +280,19 @@ export function isMcpProxyToolName(name) {
 export function isExternalWebToolName(name) {
   if (typeof name !== "string" || !name.trim() || classifyOwnTool(name)) return false;
   let server = "";
+  let serverRaw = "";
   let tool = "";
   if (name.startsWith("mcp__")) {
     const parts = name.slice(5).split("__").filter(Boolean);
     if (parts.length >= 2) {
-      server = normalizeToolSegment(parts[0]);
-      tool = normalizeToolSegment(parts.slice(1).join("__"));
+      serverRaw = normalizeToolSegment(parts[0]);
+      server = normalizeToolSegment(splitCamel(parts[0]));
+      tool = normalizeToolSegment(splitCamel(parts.slice(1).join("__")));
     } else {
-      tool = normalizeToolSegment(parts[0] ?? "");
+      tool = normalizeToolSegment(splitCamel(parts[0] ?? ""));
     }
   } else {
-    tool = normalizeToolSegment(name);
+    tool = normalizeToolSegment(splitCamel(name));
   }
   if (!tool || NON_WEB_TOOLS.has(tool)) return false;
   const toolTokens = tool.split("_");
@@ -278,15 +315,12 @@ export function isExternalWebToolName(name) {
   // A known web-search vendor (as the MCP server or a name token, e.g.
   // crawling_exa, brave_image_search) doing a search/read action.
   const vendorTagged = toolTokens.some((token) => WEB_VENDOR_TOKENS.has(token)) ||
-    (server && server.split("_").some((token) => WEB_VENDOR_TOKENS.has(token)));
+    (server && (server.split("_").some((token) => WEB_VENDOR_TOKENS.has(token)) || serverRaw.split("_").some((token) => WEB_VENDOR_TOKENS.has(token))));
   if (vendorTagged && toolTokens.some((token) => WEB_VENDOR_ACTION_TOKENS.has(token))) {
     return true;
   }
-  if (
-    server &&
-    /^(?:fetch|search|scrape|extract)$/.test(tool) &&
-    /(?:^|_)(?:web|fetch|fetcher|scrape|scraper|search|browse|crawl|exa|jina|tavily|firecrawl|brave|perplexity|searxng|duckduckgo|ddg|kagi|linkup|serper|serpapi|google|bing|agy_websearch)(?:_|$)/.test(server)
-  ) {
+  const serverRegex = /(?:^|_)(?:web|fetch|fetcher|scrape|scraper|search|browse|crawl|exa|jina|tavily|firecrawl|brave|perplexity|searxng|duckduckgo|ddg|kagi|linkup|serper|serpapi|google|bing|agy_websearch)(?:_|$)/;
+  if (server && /^(?:fetch|search|scrape|extract)$/.test(tool) && (serverRegex.test(server) || serverRegex.test(serverRaw))) {
     return true;
   }
   return false;
@@ -316,7 +350,7 @@ function nameTokens(tool) {
   const raw = tool.startsWith("mcp__")
     ? (() => { const parts = tool.slice(5).split("__").filter(Boolean); return parts.length >= 2 ? parts.slice(1).join("__") : parts[0] ?? ""; })()
     : tool;
-  return normalizeToolSegment(raw.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2"));
+  return normalizeToolSegment(splitCamel(raw));
 }
 
 function kindFromName(bare) {
@@ -364,12 +398,15 @@ export function externalWebToolKind(name, input) {
 }
 
 export async function hookPayload() {
-  let raw = "";
-  for await (const chunk of process.stdin) raw += chunk;
+  const chunks = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8");
   return raw.trim() ? JSON.parse(raw) : {};
 }
 
 export function hookFailure(error) {
   console.error(`Kimi Web Tools mode-state error: ${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 2;
+  process.exitCode = 1;
 }

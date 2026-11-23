@@ -53,8 +53,17 @@ function clipMiddle(text, maximum) {
 export function extractPromptInput(rawPrompt) {
   if (typeof rawPrompt === "string") return { text: rawPrompt, hasImages: false };
   const parts = Array.isArray(rawPrompt) ? rawPrompt : [];
+  const texts = [];
+  for (const part of parts) {
+    if (!part || typeof part !== "object") continue;
+    if ((part.type === "text" || part.type === "output_text") && typeof part.text === "string") {
+      texts.push(part.text);
+    } else if (typeof part.output_text === "string") {
+      texts.push(part.output_text);
+    }
+  }
   return {
-    text: parts.filter((part) => part?.type === "text" && typeof part.text === "string").map((part) => part.text).join("\n"),
+    text: texts.join("\n"),
     hasImages: parts.some((part) => part?.type === "image" || part?.type === "image_url"),
   };
 }
@@ -188,7 +197,8 @@ export function extractKimiSessionContext(sessionId, kimiCodeHome, maxBytes = 65
 }
 
 export function buildSmartClassifierState(promptText, hasImages, sessionContext = {}) {
-  const state = { user_prompt: promptText.trim().slice(0, 1500) };
+  const trimmedPrompt = typeof promptText === "string" ? promptText.trim() : "";
+  const state = { user_prompt: trimmedPrompt.slice(0, 1500) };
   if (hasImages) state.has_images = true;
   const reply = nonEmptyString(sessionContext?.lastAssistantReply);
   if (reply) state.last_assistant_reply = clipMiddle(reply, 700);
@@ -198,7 +208,7 @@ export function buildSmartClassifierState(promptText, hasImages, sessionContext 
     if (recent.length) state.recent_tools = recent;
   }
   const previous = nonEmptyString(sessionContext?.prevUserText);
-  if (promptText.length <= 24 && previous) state.recent_user_context = previous.slice(0, 250);
+  if (trimmedPrompt.length <= 24 && previous) state.recent_user_context = previous.slice(0, 250);
   return state;
 }
 
@@ -290,20 +300,61 @@ function parseProbabilities(value) {
   return probabilities;
 }
 
-function parseJsonContent(content) {
-  const text = extractPromptInput(content).text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-  try {
-    return JSON.parse(text);
-  } catch {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      try {
-        return JSON.parse(text.slice(start, end + 1));
-      } catch {}
+function parseJsonObjectCandidates(text) {
+  const candidates = [];
+  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === "\"") {
+        inString = true;
+      } else if (ch === "{") {
+        depth++;
+      } else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(text.slice(start, i + 1));
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              if (Object.keys(SMART_QUESTIONS).some((key) => Object.hasOwn(parsed, key))) {
+                return parsed;
+              }
+              candidates.push(parsed);
+            }
+          } catch {}
+          break;
+        }
+      }
     }
-    throw classifierError("invalid-response", "Smart classifier returned invalid JSON");
   }
+  return candidates[0];
+}
+
+function parseJsonContent(content) {
+  const raw = extractPromptInput(content).text.trim();
+  const stripped = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  for (const candidate of [stripped, raw]) {
+    if (!candidate) continue;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {}
+  }
+  const found = parseJsonObjectCandidates(raw);
+  if (found) return found;
+  throw classifierError("invalid-response", "Smart classifier returned invalid JSON");
 }
 
 export async function classifySmartTurn(input) {
@@ -393,19 +444,7 @@ export async function classifySmartTurn(input) {
   }
 }
 
-function profileAuthenticated(platform, kimiCodeHome) {
-  try {
-    const file = path.join(kimiHome(kimiCodeHome), "web-tools", "browser-profiles", platform, "dsh-profile-meta.json");
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size > 16384) return false;
-    const metadata = JSON.parse(fs.readFileSync(file, "utf8"));
-    return metadata?.authenticated === true || metadata?.sessionEstablished === true;
-  } catch {
-    return false;
-  }
-}
-
-export function usableSearchRoutes(cfg, credentials = {}, platformStates = {}, kimiCodeHome, env = process.env) {
+export function usableSearchRoutes(cfg, credentials = {}, _platformStates = {}, _kimiCodeHome, env = process.env) {
   if (cfg?.enabled === false) return { webProviders: [], platforms: [] };
   const credentialValue = (ref) => nonEmptyString(credentials[ref]) || nonEmptyString(env?.[ref]);
   const builtIns = ["exa", "tavily", "brave", "you", "jina", "firecrawl", "parallel", "searxng", "keenable"];
@@ -421,11 +460,11 @@ export function usableSearchRoutes(cfg, credentials = {}, platformStates = {}, k
   for (const name of candidates) {
     if (typeof name !== "string" || cfg?.providerEnabled?.[name] === false) continue;
     const credential = `WEB_TOOLS_${name.toUpperCase()}`;
-    if (name === "searxng" && (nonEmptyString(cfg?.providerBaseUrls?.searxng) || credentialValue(credential))) {
-      webProviders.push(name);
+    if (name === "searxng") {
+      if (nonEmptyString(cfg?.providerBaseUrls?.searxng)) webProviders.push(name);
       continue;
     }
-    if (builtIns.includes(name) && name !== "searxng" && credentialValue(credential)) {
+    if (builtIns.includes(name) && credentialValue(credential)) {
       webProviders.push(name);
       continue;
     }
@@ -439,22 +478,10 @@ export function usableSearchRoutes(cfg, credentials = {}, platformStates = {}, k
       webProviders.push(name);
     }
   }
-  const platforms = [];
-  for (const platform of ["xiaohongshu", "x"]) {
-    const state = platformStates?.[platform];
-    if (cfg?.platformEnabled?.[platform] === false || state?.enabled === false) continue;
-    if (typeof state?.authenticated === "boolean") {
-      if (state.authenticated) platforms.push(platform);
-      continue;
-    }
-    if (state?.sessionEstablished === true || profileAuthenticated(platform, kimiCodeHome)) {
-      platforms.push(platform);
-    }
-  }
-  return { webProviders, platforms };
+  return { webProviders, platforms: [] };
 }
 
-export function hasUsableSearchProvider(cfg, credentials = {}, platformStates = {}, kimiCodeHome, env = process.env) {
-  const routes = usableSearchRoutes(cfg, credentials, platformStates, kimiCodeHome, env);
-  return routes.webProviders.length > 0 || routes.platforms.length > 0;
+export function hasUsableSearchProvider(cfg, credentials = {}, _platformStates = {}, _kimiCodeHome, env = process.env) {
+  const routes = usableSearchRoutes(cfg, credentials, _platformStates, _kimiCodeHome, env);
+  return routes.webProviders.length > 0;
 }

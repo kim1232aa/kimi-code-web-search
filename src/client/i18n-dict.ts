@@ -381,6 +381,7 @@ export const zhDict: Record<string, string> = {
   developerEditCancel: "取消",
   developerParseError: "JSON 格式错误",
   developerEditHint: "保存后即时生效",
+  manage: "管理",
   prefsDefaultValueHint: "默认：{v}",
   keyCountLabel: "{n} 个",
   collapse: "收起",
@@ -492,12 +493,15 @@ export const zhDict: Record<string, string> = {
   customProviderTag: "自定义",
   builtinProviderTag: "内置",
   method: "请求方法",
+  httpMethod: "请求方法",
   encoding: "参数编码",
   encodingQuery: "URL 查询参数",
   encodingJson: "JSON 请求体",
   encodingForm: "表单 (Form urlencoded)",
   searchPath: "搜索相对路径",
   searchPathPlaceholder: "/search",
+  searxngDefaultHint: "默认无需密钥",
+  apiKeyConfigured: "已配置",
 };
 
 /** en page copy, checked complete against the zh key set. */
@@ -987,10 +991,13 @@ export const enDict: Record<string, string> = {
   customProviderTag: "Custom",
   builtinProviderTag: "Built-in",
   method: "HTTP Method",
+  httpMethod: "HTTP Method",
   encoding: "Encoding",
   encodingQuery: "URL query params",
   encodingJson: "JSON body",
   encodingForm: "Form (urlencoded)",
   searchPath: "Relative search path",
   searchPathPlaceholder: "/search",
+  searxngDefaultHint: "No key required by default",
+  apiKeyConfigured: "Configured",
 };

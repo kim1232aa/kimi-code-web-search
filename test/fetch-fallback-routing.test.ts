@@ -1,8 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createFetchProvider, createPoolStore, type WebToolsRuntimeConfig } from "../src/host/registry.ts";
+import { createFetchProvider, createPoolStore, createSearchProvider, type WebToolsRuntimeConfig } from "../src/host/registry.ts";
 import type { ProviderAdapterLike } from "../src/host/registry.ts";
 import { GenericFetchError, type GenericFetchResult } from "../src/host/generic-fetch.ts";
+import { extractSearchHints } from "../src/host/search-hints.ts";
 
 function stubConfig(overrides: Partial<WebToolsRuntimeConfig> = {}): WebToolsRuntimeConfig {
   return {
@@ -414,5 +415,207 @@ describe("fetch fallback routing: Native -> Generic fallback", () => {
       /Bad Request/i,
     );
     assert.deepEqual(calls, ["exa"], "non-retryable native error must stop the chain without trying builtin http");
+  });
+
+  it("fetch auth-rotation falls back cleanly to next provider and builtin-http when last key fails auth", async () => {
+    const calls: string[] = [];
+    const poolStore = createPoolStore(async (name) => (name === "exa" ? "exa-bad-1,exa-bad-2" : "fc-good"));
+    const adapters: Record<string, ProviderAdapterLike> = {
+      exa: {
+        name: "exa",
+        needsBaseUrl: false,
+        fetchCapable: true,
+        async search() { return { sources: [] }; },
+        async fetch(_url: string, key: string) {
+          calls.push(`exa:${key}`);
+          throw Object.assign(new Error("401 unauthorized"), { code: "auth" });
+        },
+      },
+      firecrawl: {
+        name: "firecrawl",
+        needsBaseUrl: false,
+        fetchCapable: true,
+        async search() { return { sources: [] }; },
+        async fetch(_url: string, key: string) {
+          calls.push(`firecrawl:${key}`);
+          return { text: "Firecrawl rescued" };
+        },
+      },
+    };
+
+    const provider1 = createFetchProvider(
+      () => stubConfig({ fetchOrder: ["exa", "firecrawl"], enabledProviders: { exa: true, firecrawl: true } }),
+      async (name) => (name === "exa" ? "exa-bad-1,exa-bad-2" : "fc-good"),
+      adapters,
+      poolStore,
+    );
+
+    const res1 = await provider1.fetch({ url: "https://example.org/auth-fallback" });
+    assert.equal(res1.backend, "firecrawl");
+    assert.equal(res1.body.content, "Firecrawl rescued");
+    assert.deepEqual(calls, ["exa:exa-bad-1", "exa:exa-bad-2", "firecrawl:fc-good"]);
+    const exaPool = await poolStore.poolOf("exa");
+    assert.ok(exaPool.every((e) => !e.healthy && e.inFlight === 0));
+
+    // Single-key auth failure falls back to builtin-http without throwing "no healthy keys left"
+    const calls2: string[] = [];
+    const singlePool = createPoolStore(async () => "only-bad-key");
+    const provider2 = createFetchProvider(
+      () => stubConfig({ defaultProvider: "exa", fallbackOrder: [], enabledProviders: { exa: true } }),
+      async () => "only-bad-key",
+      {
+        exa: {
+          name: "exa",
+          needsBaseUrl: false,
+          fetchCapable: true,
+          async search() { return { sources: [] }; },
+          async fetch(_url: string, key: string) {
+            calls2.push(`exa:${key}`);
+            throw Object.assign(new Error("401 unauthorized"), { code: "auth" });
+          },
+        },
+      },
+      singlePool,
+      undefined,
+      async (url: string): Promise<GenericFetchResult> => {
+        calls2.push("http");
+        return {
+          url,
+          finalUrl: url,
+          statusCode: 200,
+          contentType: "text/html",
+          content: "Builtin fallback",
+          truncated: false,
+          backend: "builtin-http",
+          extraction: "defuddle",
+        };
+      },
+    );
+    const res2 = await provider2.fetch({ url: "https://example.org/http-fallback" });
+    assert.equal(res2.backend, "builtin-http");
+    assert.deepEqual(calls2, ["exa:only-bad-key", "http"]);
+  });
+
+  it("rotates across multi-key pools on quota errors in both search and fetch before falling back", async () => {
+    const searchCalls: string[] = [];
+    const searchAdapters: Record<string, ProviderAdapterLike> = {
+      tavily: {
+        name: "tavily",
+        needsBaseUrl: false,
+        fetchCapable: true,
+        async search(_q: string, _n: number | undefined, key: string) {
+          searchCalls.push(`tavily:${key}`);
+          if (key === "tvly-empty") throw Object.assign(new Error("402 quota"), { code: "quota" });
+          return { sources: [{ url: "https://example.org/from-k2" }] };
+        },
+        async fetch() { return { text: "" }; },
+      },
+      exa: {
+        name: "exa",
+        needsBaseUrl: false,
+        fetchCapable: true,
+        async search() {
+          searchCalls.push("exa");
+          return { sources: [{ url: "https://example.org/exa" }] };
+        },
+        async fetch() { return { text: "" }; },
+      },
+    };
+    const searchPool = createPoolStore(async () => "tvly-empty,tvly-full");
+    const searchProvider = createSearchProvider(
+      () => stubConfig({ defaultProvider: "tavily", fallbackOrder: ["exa"], enabledProviders: { tavily: true, exa: true } }),
+      async () => "tvly-empty,tvly-full",
+      { record() {} },
+      searchAdapters,
+      searchPool,
+    );
+    const searchRes = await searchProvider.search({ query: "quota test" });
+    assert.equal(searchRes.sources[0].url, "https://example.org/from-k2");
+    assert.deepEqual(searchCalls, ["tavily:tvly-empty", "tavily:tvly-full"]);
+    const tvlyPool = await searchPool.poolOf("tavily");
+    assert.equal(tvlyPool[0].healthy, false);
+    assert.equal(tvlyPool[1].healthy, true);
+
+    // Fetch multi-key quota rotation: key1 quota -> key2 quota -> fallback to builtin-http
+    const fetchCalls: string[] = [];
+    const fetchPool = createPoolStore(async () => "exa-q1,exa-q2");
+    const fetchProvider = createFetchProvider(
+      () => stubConfig({ defaultProvider: "exa", fallbackOrder: [], enabledProviders: { exa: true } }),
+      async () => "exa-q1,exa-q2",
+      {
+        exa: {
+          name: "exa",
+          needsBaseUrl: false,
+          fetchCapable: true,
+          async search() { return { sources: [] }; },
+          async fetch(_url: string, key: string) {
+            fetchCalls.push(`exa:${key}`);
+            throw Object.assign(new Error("402 quota"), { code: "quota" });
+          },
+        },
+      },
+      fetchPool,
+      undefined,
+      async (url: string): Promise<GenericFetchResult> => {
+        fetchCalls.push("http");
+        return {
+          url,
+          finalUrl: url,
+          statusCode: 200,
+          contentType: "text/html",
+          content: "HTTP fallback after multi-key quota",
+          truncated: false,
+          backend: "builtin-http",
+          extraction: "defuddle",
+        };
+      },
+    );
+    const fetchRes = await fetchProvider.fetch({ url: "https://example.org/quota" });
+    assert.equal(fetchRes.backend, "builtin-http");
+    assert.deepEqual(fetchCalls, ["exa:exa-q1", "exa:exa-q2", "http"]);
+  });
+
+  it("normalizes provider name in inflightSearches coalescing key", async () => {
+    let calls = 0;
+    const provider = createSearchProvider(
+      () => stubConfig({ defaultProvider: "exa", fallbackOrder: [], enabledProviders: { exa: true } }),
+      async () => "k1",
+      { record() {} },
+      {
+        exa: {
+          name: "exa",
+          needsBaseUrl: false,
+          fetchCapable: false,
+          async search() {
+            calls += 1;
+            await new Promise((r) => setTimeout(r, 20));
+            return { sources: [{ url: "https://example.org/1" }] };
+          },
+          async fetch() { throw new Error("unused"); },
+        },
+      },
+    );
+
+    const [a, b] = await Promise.all([
+      provider.search({ query: "coalesce me", provider: "Exa" }),
+      provider.search({ query: "coalesce me", provider: " exa " }),
+    ]);
+    assert.equal(calls, 1);
+    assert.equal(a.sources[0].url, b.sources[0].url);
+  });
+
+  it("search-hints preserves 小红书, rednote, 推特, twitter, 在X上, and X: in cleanQuery", () => {
+    const cases = [
+      "小红书 机械键盘测评",
+      "在小红书上搜索 咖啡店推荐",
+      "rednote 护肤心得",
+      "X: OpenAI release",
+      "在X上搜索 Anthropic 动态",
+      "推特 twitter AI 新闻",
+    ];
+    for (const q of cases) {
+      const hints = extractSearchHints(q);
+      assert.equal(hints.cleanQuery, q, `cleanQuery must preserve platform words for "${q}"`);
+    }
   });
 });

@@ -72,41 +72,96 @@ export function isPrivateOrRestrictedIpv4(ip: string): boolean {
 }
 
 /**
+ * Parse an IPv6 address literal (including compressed `::` and embedded dotted-decimal IPv4)
+ * into eight 16-bit words. Returns null if malformed.
+ */
+export function parseIpv6Words(ip: string): number[] | null {
+  let addr = ip.toLowerCase().trim();
+  const zoneIdx = addr.indexOf("%");
+  if (zoneIdx !== -1) addr = addr.slice(0, zoneIdx);
+  if (addr.startsWith("[") && addr.endsWith("]")) addr = addr.slice(1, -1);
+
+  // Convert trailing embedded IPv4 (e.g. ::ffff:127.0.0.1, ::127.0.0.1, 64:ff9b::127.0.0.1) to two hex words
+  if (addr.includes(".")) {
+    const lastColon = addr.lastIndexOf(":");
+    if (lastColon === -1) return null;
+    const v4 = addr.slice(lastColon + 1);
+    if (isIP(v4) !== 4) return null;
+    const octets = v4.split(".").map((p) => Number.parseInt(p, 10));
+    const hi = ((octets[0] << 8) | octets[1]).toString(16);
+    const lo = ((octets[2] << 8) | octets[3]).toString(16);
+    addr = `${addr.slice(0, lastColon + 1)}${hi}:${lo}`;
+  }
+
+  const dbl = addr.split("::");
+  if (dbl.length > 2) return null;
+
+  let groups: string[];
+  if (dbl.length === 2) {
+    const left = dbl[0] ? dbl[0].split(":") : [];
+    const right = dbl[1] ? dbl[1].split(":") : [];
+    const missing = 8 - left.length - right.length;
+    if (missing < 1) return null;
+    groups = [...left, ...Array<string>(missing).fill("0"), ...right];
+  } else {
+    groups = addr.split(":");
+    if (groups.length !== 8) return null;
+  }
+
+  const words: number[] = [];
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+    words.push(Number.parseInt(g, 16));
+  }
+  return words;
+}
+
+/**
  * Check if an IPv6 address falls within private, loopback, or link-local ranges.
  */
 export function isPrivateOrRestrictedIpv6(ip: string): boolean {
-  const normalized = ip.toLowerCase();
-  // Loopback (::1) or unspecified (::)
-  if (normalized === "::1" || normalized === "::" || normalized === "0:0:0:0:0:0:0:1" || normalized === "0:0:0:0:0:0:0:0") {
+  const words = parseIpv6Words(ip);
+  if (!words) return true; // Malformed -> block safely
+
+  const [w0, w1, w2, w3, w4, w5, w6, w7] = words;
+  const first96Zero = w0 === 0 && w1 === 0 && w2 === 0 && w3 === 0 && w4 === 0;
+
+  // Unspecified (::), loopback (::1), and IPv4-compatible IPv6 (::/96, e.g. ::127.0.0.1 / ::7f00:1)
+  if (first96Zero && w5 === 0) {
+    if (w6 === 0 && (w7 === 0 || w7 === 1)) return true;
+    const v4 = `${(w6 >> 8) & 0xff}.${w6 & 0xff}.${(w7 >> 8) & 0xff}.${w7 & 0xff}`;
+    return isPrivateOrRestrictedIpv4(v4);
+  }
+
+  // IPv4-mapped IPv6 (::ffff:0:0/96, including uncompressed 0000:0000:0000:0000:0000:ffff:...)
+  if (first96Zero && w5 === 0xffff) {
+    const v4 = `${(w6 >> 8) & 0xff}.${w6 & 0xff}.${(w7 >> 8) & 0xff}.${w7 & 0xff}`;
+    return isPrivateOrRestrictedIpv4(v4);
+  }
+
+  // NAT64 well-known prefix (64:ff9b::/96) and local-use (64:ff9b:1::/48)
+  if (w0 === 0x0064 && w1 === 0xff9b && ((w2 === 0 && w3 === 0 && w4 === 0 && w5 === 0) || w2 === 0x0001)) {
     return true;
   }
 
-  // IPv4-mapped IPv6 (e.g., ::ffff:127.0.0.1 or hex format like ::ffff:7f00:1)
-  if (normalized.startsWith("::ffff:") || normalized.startsWith("0:0:0:0:0:ffff:")) {
-    const afterFfff = normalized.split("ffff:").pop() ?? "";
-    if (isIP(afterFfff) === 4) {
-      return isPrivateOrRestrictedIpv4(afterFfff);
-    }
-    // Parse hex-encoded IPv4 (e.g. 7f00:1 -> 127.0.0.1)
-    const hexParts = afterFfff.split(":");
-    if (hexParts.length === 2) {
-      const high = Number.parseInt(hexParts[0], 16);
-      const low = Number.parseInt(hexParts[1], 16);
-      if (!Number.isNaN(high) && !Number.isNaN(low)) {
-        const ipStr = `${(high >> 8) & 255}.${high & 255}.${(low >> 8) & 255}.${low & 255}`;
-        return isPrivateOrRestrictedIpv4(ipStr);
-      }
-    }
-    return true; // Malformed or ambiguous IPv4-mapped address -> block safely
+  // 6to4 (2002::/16) embedding private/restricted IPv4 in words 1..2
+  if (w0 === 0x2002) {
+    const v4 = `${(w1 >> 8) & 0xff}.${w1 & 0xff}.${(w2 >> 8) & 0xff}.${w2 & 0xff}`;
+    if (isPrivateOrRestrictedIpv4(v4)) return true;
   }
 
-  // Unique local address fc00::/7 (fc00... to fdff...)
-  if (/^f[cd][0-9a-f]{2}:/i.test(normalized) || normalized.startsWith("fc") || normalized.startsWith("fd")) {
+  // Unique local address fc00::/7 (fc00..fdff)
+  if ((w0 & 0xfe00) === 0xfc00) {
     return true;
   }
 
-  // Link-local unicast fe80::/10 (fe80... to febf...)
-  if (/^fe[89ab][0-9a-f]:/i.test(normalized) || normalized.startsWith("fe8") || normalized.startsWith("fe9") || normalized.startsWith("fea") || normalized.startsWith("feb")) {
+  // Link-local unicast fe80::/10 (fe80..febf)
+  if ((w0 & 0xffc0) === 0xfe80) {
+    return true;
+  }
+
+  // Multicast ff00::/8
+  if ((w0 & 0xff00) === 0xff00) {
     return true;
   }
 
@@ -155,11 +210,12 @@ export function validateFetchUrl(rawUrl: string): URL {
     );
   }
 
-  // Extract hostname (strip brackets from IPv6 if present)
+  // Extract hostname (strip brackets from IPv6 and trailing FQDN dots)
   let hostname = parsed.hostname.toLowerCase();
   if (hostname.startsWith("[") && hostname.endsWith("]")) {
     hostname = hostname.slice(1, -1);
   }
+  hostname = hostname.replace(/\.+$/, "");
 
   // Empty or invalid hostname
   if (!hostname) {
@@ -215,21 +271,23 @@ export async function validateFetchDns(
   hostname: string,
   lookupFn: DnsLookupFn = (h, opts) => dns.lookup(h, opts),
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<Array<{ address: string; family: number }>> {
   let cleanHost = hostname.toLowerCase();
   if (cleanHost.startsWith("[") && cleanHost.endsWith("]")) {
     cleanHost = cleanHost.slice(1, -1);
   }
+  cleanHost = cleanHost.replace(/\.+$/, "");
 
   // If already a literal IP, validateFetchUrl already inspected it
-  if (isIP(cleanHost) !== 0) {
+  const literalVersion = isIP(cleanHost);
+  if (literalVersion !== 0) {
     if (isPrivateOrRestrictedIp(cleanHost)) {
       throw new FetchSecurityError(
         "WEB_FETCH_BLOCKED",
         `Access to private/restricted IP "${cleanHost}" is blocked for security reasons.`,
       );
     }
-    return;
+    return [{ address: cleanHost, family: literalVersion }];
   }
 
   if (signal?.aborted) {
@@ -241,16 +299,21 @@ export async function validateFetchDns(
     let records: Array<{ address: string; family: number }>;
 
     if (signal) {
-      records = await Promise.race([
-        lookupPromise,
-        new Promise<never>((_, reject) => {
-          signal.addEventListener(
-            "abort",
-            () => reject(new FetchSecurityError("WEB_INVALID_URL", "DNS resolution aborted by signal")),
-            { once: true },
-          );
-        }),
-      ]);
+      let onAbort: (() => void) | undefined;
+      try {
+        records = await Promise.race([
+          lookupPromise,
+          new Promise<never>((_, reject) => {
+            onAbort = () => {
+              lookupPromise.catch(() => {});
+              reject(new FetchSecurityError("WEB_INVALID_URL", "DNS resolution aborted by signal"));
+            };
+            signal.addEventListener("abort", onAbort, { once: true });
+          }),
+        ]);
+      } finally {
+        if (onAbort) signal.removeEventListener("abort", onAbort);
+      }
     } else {
       records = await lookupPromise;
     }
@@ -267,6 +330,7 @@ export async function validateFetchDns(
         );
       }
     }
+    return records;
   } catch (err: unknown) {
     if (err instanceof FetchSecurityError) throw err;
     const msg = err instanceof Error ? err.message : String(err);

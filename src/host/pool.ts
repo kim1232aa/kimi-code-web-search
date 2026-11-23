@@ -11,6 +11,8 @@
  * @module
  */
 
+import { createHash } from "node:crypto";
+
 /** One key's live state inside a provider pool. */
 export class PoolEntry {
   key: string;
@@ -28,14 +30,22 @@ export class PoolEntry {
   }
 }
 
+/** Stable opaque key identifier (12 lowercase hex chars of SHA-256) for non-secret caches. */
+export function keyIdOf(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 12);
+}
+
 /**
- * Short diagnostic hint: provider-known prefix (e.g. "tvly") + last 4 chars.
- * Deliberately NOT the first 9 chars of the raw key — enough to identify a
- * key without revealing a significant secret prefix.
+ * Short diagnostic hint: provider-known prefix (capped at 6 chars) + last 4 chars.
+ * Keys of 8 chars or fewer return "***" so short credentials are never exposed.
  */
 export function hintOf(key: string): string {
-  const prefix = key.slice(0, key.indexOf("-") > 0 ? key.indexOf("-") : 4);
-  const tail = key.length > 6 ? key.slice(-4) : key;
+  const trimmed = (key ?? "").trim();
+  if (trimmed.length <= 8) return "***";
+  const dash = trimmed.indexOf("-");
+  const prefixLen = dash > 0 ? Math.min(dash, 6) : 4;
+  const prefix = trimmed.slice(0, prefixLen);
+  const tail = trimmed.slice(-4);
   return `${prefix}-…${tail}`;
 }
 

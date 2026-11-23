@@ -16,6 +16,7 @@ export async function firecrawlQuota(apiKey: string, signal?: AbortSignal): Prom
     signal,
   });
   if (!res.ok) {
+    void res.body?.cancel?.().catch(() => {});
     if (res.status === 401 || res.status === 403) throw providerError("auth", `Firecrawl credit-usage auth failed (HTTP ${res.status})`, res.status);
     if (res.status === 429) throw providerError("rate-limit", "Firecrawl rate limit exceeded (HTTP 429)", res.status);
     throw providerError("server", `Firecrawl credit-usage failed (HTTP ${res.status})`, res.status);

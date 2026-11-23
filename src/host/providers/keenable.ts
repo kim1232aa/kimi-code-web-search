@@ -10,7 +10,7 @@
  * Search-only: web_fetch falls back to the built-in generic fetcher.
  * @module
  */
-import { providerError, throwIfHttp, resolveContext, type ProviderAdapter, type Source } from "./types.ts";
+import { providerError, throwIfHttp, resolveContext, safeHttpUrl, type ProviderAdapter, type Source } from "./types.ts";
 import { fetchWithProxy } from "../fetch-proxy.ts";
 import { endpointViewOf } from "../endpoints.ts";
 import type { SearchHints } from "../search-hints.ts";
@@ -34,7 +34,7 @@ export function parseKeenableSearchJson(body: unknown, limit: number): Source[] 
   if (!Array.isArray(results)) return [];
   const sources: Source[] = [];
   for (const r of results as Array<Record<string, unknown>>) {
-    const url = typeof r?.url === "string" ? r.url : "";
+    const url = safeHttpUrl(r?.url);
     if (!url) continue;
     const s: Source = { url };
     if (typeof r.title === "string" && r.title) s.title = r.title;

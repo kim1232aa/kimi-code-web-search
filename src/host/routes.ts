@@ -34,7 +34,7 @@ import {
   type CustomProviderConfig,
   type CustomSourceTestView,
 } from "../shared/custom-provider-types.ts";
-import { sanitizeBaseUrlOverrides, validateWebToolsSettings } from "./config.ts";
+import { DEFAULT_PROVIDER, sanitizeBaseUrlOverrides, validateWebToolsSettings } from "./config.ts";
 import { classifySmartTurn, resolveSmartCredential } from "../../hooks/smart-classifier.mjs";
 import { isLocalOrPrivateHost, resolvesToPrivateIp, type LookupAllFn, type OutboundAuthorization } from "./provider-transport.ts";
 
@@ -115,11 +115,15 @@ function writeError(res: WebToolsHttpResponse, status: number, code: string, mes
 
 /** Read a JSON request body (structural async-iterator like better-sidebar). */
 async function readJsonBody(req: WebToolsHttpRequest): Promise<unknown> {
-  let raw = "";
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
   for await (const chunk of req) {
-    raw += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
-    if (raw.length > 1_000_000) throw new Error("payload too large");
+    const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buf.byteLength;
+    if (totalBytes > 1_000_000) throw new Error("payload too large");
+    chunks.push(buf);
   }
+  const raw = Buffer.concat(chunks).toString("utf8");
   if (raw.trim() === "") return {};
   try {
     return JSON.parse(raw);
@@ -207,23 +211,30 @@ export function isGatewayAuthenticated(req: WebToolsHttpRequest): boolean {
   return Boolean(req && typeof req === "object" && AUTHENTICATED_REQUESTS.has(req));
 }
 
+const PROXY_HEADERS = [
+  "x-forwarded-for",
+  "x-real-ip",
+  "x-forwarded-proto",
+  "x-forwarded-host",
+  "forwarded",
+  "via",
+  "cf-connecting-ip",
+  "true-client-ip",
+] as const;
+
 export function isProxiedRequest(req: WebToolsHttpRequest): boolean {
-  const xff = req.headers?.["x-forwarded-for"];
-  const xrip = req.headers?.["x-real-ip"];
-  const xfp = req.headers?.["x-forwarded-proto"];
-  return (
-    (typeof xff === "string" && xff.trim().length > 0) ||
-    (Array.isArray(xff) && xff.length > 0) ||
-    (typeof xrip === "string" && xrip.trim().length > 0) ||
-    (Array.isArray(xrip) && xrip.length > 0) ||
-    (typeof xfp === "string" && xfp.trim().length > 0)
-  );
+  return PROXY_HEADERS.some((header) => {
+    const val = req.headers?.[header];
+    return (typeof val === "string" && val.trim().length > 0) || (Array.isArray(val) && val.length > 0);
+  });
 }
 
 export function isDirectLoopbackRequest(req: WebToolsHttpRequest): boolean {
   if (isProxiedRequest(req)) return false;
-  const host = authorityHost(req.headers?.host);
-  if (host && !isLoopbackHost(host)) return false;
+  const rawHost = req.headers?.host;
+  const hasHost = (typeof rawHost === "string" && rawHost.trim().length > 0) || (Array.isArray(rawHost) && rawHost.length > 0);
+  const host = authorityHost(rawHost);
+  if (hasHost && !isLoopbackHost(host)) return false;
   const peer = peerAddressOf(req);
   if (peer !== undefined) return isLoopbackAddress(peer);
   return false;
@@ -279,7 +290,9 @@ function isSameOrigin(req: WebToolsHttpRequest): boolean {
     // Derive the ACTUAL request scheme from the connection (TLS peers expose
     // socket.encrypted) and compare strictly: scheme + host + port.
     const socket = (req as unknown as { socket?: { encrypted?: unknown } }).socket;
-    const forwardedProto = typeof req.headers?.["x-forwarded-proto"] === "string" ? req.headers["x-forwarded-proto"].toLowerCase() : "";
+    const rawXfp = req.headers?.["x-forwarded-proto"];
+    const xfpStr = Array.isArray(rawXfp) ? rawXfp[0] : rawXfp;
+    const forwardedProto = typeof xfpStr === "string" ? (xfpStr.split(",")[0] ?? "").trim().toLowerCase() : "";
     const requestScheme = forwardedProto ? (forwardedProto.endsWith(":") ? forwardedProto : `${forwardedProto}:`) : (socket?.encrypted ? "https:" : "http:");
     if (originUrl.protocol !== requestScheme) return false;
     return originUrl.host.toLowerCase() === requestUrl.host.toLowerCase();
@@ -351,7 +364,7 @@ async function handleConfigGet(deps: RouteDeps): Promise<ConfigView> {
   const { smartSearch, exemptWhenNoProvider, recognizeExternalWebTools, requiredEvidence, fetchOrder } = validateWebToolsSettings(cfg);
   const smartCredential = resolveSmartCredential(smartSearch, await readSmartCredentials(deps, smartSearch.provider));
   const enabled = cfg.enabled !== false;
-  const defaultProvider = (cfg.defaultProvider as string) ?? "tavily";
+  const defaultProvider = (typeof cfg.defaultProvider === "string" && cfg.defaultProvider.trim()) || DEFAULT_PROVIDER;
   const enabledMap = (cfg.providerEnabled as Record<string, boolean>) ?? {};
   const baseUrls = (cfg.providerBaseUrls as Record<string, string>) ?? {};
   const providerOpts = (cfg.providerOptions as Record<string, Record<string, unknown>>) ?? {};
@@ -402,7 +415,7 @@ async function handleConfigGet(deps: RouteDeps): Promise<ConfigView> {
       name: config.id,
       label: config.name,
       description: config.description ?? "",
-      enabled: enabledMap[config.id] !== undefined ? enabledMap[config.id] : config.enabled,
+      enabled: config.enabled !== false && enabledMap[config.id] !== false,
       baseUrl: config.endpoint.baseUrl,
       defaultBaseUrl: config.endpoint.baseUrl,
       baseUrlConfigured: false,
@@ -473,10 +486,29 @@ async function handleConfigSave(deps: RouteDeps, payload: unknown) {
     }
     patch.fetchOrder = normalizedFetch;
   }
-  if (p.providerBaseUrls && typeof p.providerBaseUrls === "object") {
+  if (p.providerBaseUrls && typeof p.providerBaseUrls === "object" && !Array.isArray(p.providerBaseUrls)) {
+    for (const raw of Object.values(p.providerBaseUrls as Record<string, unknown>)) {
+      if (typeof raw !== "string") continue;
+      const trimmed = raw.trim();
+      if (trimmed === "") continue;
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.search || parsed.hash) {
+          throw new RouteError("invalid-url", "Service address must not contain a query string or fragment", 400);
+        }
+      } catch (err) {
+        if (err instanceof RouteError) throw err;
+      }
+    }
     // Normalize on the way in: a malformed entry is dropped (restoring the
     // official endpoint) instead of being persisted and failing at request time.
-    patch.providerBaseUrls = sanitizeBaseUrlOverrides(p.providerBaseUrls);
+    const sanitized = sanitizeBaseUrlOverrides(p.providerBaseUrls);
+    for (const key of Object.keys(sanitized)) {
+      if (sanitized[key].includes("?") || sanitized[key].includes("#")) {
+        delete sanitized[key];
+      }
+    }
+    patch.providerBaseUrls = sanitized;
   }
   if (p.providerEnabled && typeof p.providerEnabled === "object") patch.providerEnabled = p.providerEnabled;
   if (typeof p.exemptWhenNoProvider === "boolean") patch.exemptWhenNoProvider = p.exemptWhenNoProvider;
@@ -1273,7 +1305,10 @@ const ENDPOINTS: Record<string, (deps: RouteDeps, payload: unknown) => Promise<u
     return importFromPi({
       readConfig: deps.readConfig,
       writeConfig: deps.writeConfig,
-      readCredential: (ref) => deps.readCredential(ref),
+      readCredential: async (ref) => {
+        const resolved = await deps.readCredential(ref);
+        return { value: resolved.source === "local" ? resolved.value : undefined };
+      },
       writeCredential: (ref, value) => deps.writeCredential(ref, value),
       setGlobalMode: deps.searchMode ? (mode) => { deps.searchMode!.set("global", mode); } : undefined,
     });

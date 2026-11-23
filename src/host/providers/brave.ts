@@ -12,7 +12,8 @@
  *   (X-RateLimit-Limit / X-RateLimit-Remaining / X-RateLimit-Reset).
  * @module
  */
-import { providerError, throwIfHttp, resolveContext, type ProviderAdapter } from "./types.ts";
+import { providerError, throwIfHttp, resolveContext, safeHttpUrl, type ProviderAdapter } from "./types.ts";
+import { keyIdOf } from "../pool.ts";
 import type { QuotaSnapshot } from "../quota.ts";
 import { fetchWithProxy } from "../fetch-proxy.ts";
 import { endpointViewOf } from "../endpoints.ts";
@@ -123,7 +124,7 @@ export const BraveProvider: ProviderAdapter = {
         const generic = Array.isArray(raw?.grounding?.generic) ? raw.grounding.generic : [];
         const sources = generic
           .map((g: Record<string, unknown>) => {
-            const url = typeof g?.url === "string" ? g.url : "";
+            const url = safeHttpUrl(g?.url);
             if (!url) return null;
             const s: { url: string; title?: string; snippet?: string } = { url };
             if (typeof g.title === "string" && g.title) s.title = g.title;
@@ -145,7 +146,8 @@ export const BraveProvider: ProviderAdapter = {
       // - 429 (rate-limited — should not blast the same key again; let outer pool/fallback handle it)
       // - >= 500 (server errors)
       if (res.status === 403 || res.status === 404) {
-        // Safe to degrade to classic Web Search
+        // Release response body before degrading to classic Web Search
+        void res.body?.cancel?.().catch(() => {});
       } else {
         throwIfHttp("Brave LLM Context", res);
       }
@@ -173,7 +175,7 @@ export const BraveProvider: ProviderAdapter = {
     const results = Array.isArray(raw?.web?.results) ? raw.web.results : [];
     const sources = results
       .map((r: Record<string, unknown>) => {
-        const u = typeof r?.url === "string" ? r.url : "";
+        const u = safeHttpUrl(r?.url);
         if (!u) return null;
         const s: { url: string; title?: string; snippet?: string; publishedAt?: string } = { url: u };
         if (typeof r.title === "string" && r.title) s.title = r.title;
@@ -190,6 +192,15 @@ export const BraveProvider: ProviderAdapter = {
   },
 };
 
+const BRAVE_KEY_ID_RE = /^[a-f0-9]{12}$/;
+
+/** Normalize either a raw Brave API key or an already-hashed 12-hex keyId into a non-secret cache key. */
+export function braveCacheKeyOf(apiKey: string): string {
+  const trimmed = (apiKey ?? "").trim();
+  if (!trimmed) return "";
+  return BRAVE_KEY_ID_RE.test(trimmed) ? trimmed : keyIdOf(trimmed);
+}
+
 export class BraveQuotaManager {
   private cache = new Map<string, QuotaSnapshot>();
   private persistHook?: (apiKey: string, snapshot: QuotaSnapshot) => void;
@@ -201,11 +212,14 @@ export class BraveQuotaManager {
 
   seed(apiKey: string, snapshot: QuotaSnapshot): void {
     if (this.disposed) return;
-    this.cache.set(apiKey, snapshot);
+    const id = braveCacheKeyOf(apiKey);
+    if (!id) return;
+    this.cache.set(id, snapshot);
   }
 
   async getQuota(apiKey: string): Promise<QuotaSnapshot> {
-    return this.cache.get(apiKey) ?? {
+    const id = braveCacheKeyOf(apiKey);
+    return (id ? this.cache.get(id) : undefined) ?? {
       supported: false,
       authoritative: false,
       unit: "requests",
@@ -217,9 +231,10 @@ export class BraveQuotaManager {
 
   recordFromHeaders(apiKey: string, headers: Headers): QuotaSnapshot {
     const snapshot = braveQuotaFromHeaders(headers);
-    if (!this.disposed) {
-      this.cache.set(apiKey, snapshot);
-      this.persistHook?.(apiKey, snapshot);
+    const id = braveCacheKeyOf(apiKey);
+    if (!this.disposed && id) {
+      this.cache.set(id, snapshot);
+      this.persistHook?.(id, snapshot);
     }
     return snapshot;
   }
@@ -231,7 +246,7 @@ export class BraveQuotaManager {
   }
 }
 
-/** Last-known Brave quota snapshots, keyed by API key (default manager fallback). */
+/** Last-known Brave quota snapshots, keyed by hashed keyId (default manager fallback). */
 const defaultQuotaManager = new BraveQuotaManager();
 
 /** Set the persistence callback (host wires this to its settings store). */
@@ -270,7 +285,7 @@ export function braveQuotaFromHeaders(headers: Headers, fetchedAt = Date.now()):
     // Per the Brave docs, a monthly limit of 0 means UNLIMITED — there is no
     // meaningful "remaining" count, so do not report remaining=0 as "0 left".
     if (monthlyLimit > 0) {
-      snapshot.remaining = monthlyRemaining ?? 0;
+      if (monthlyRemaining !== undefined) snapshot.remaining = monthlyRemaining;
       snapshot.note = "From Brave rate-limit response headers";
     } else {
       // 0 monthly limit = pay-as-you-go with no fixed monthly quota window.
@@ -291,8 +306,8 @@ export function braveQuotaFromHeaders(headers: Headers, fetchedAt = Date.now()):
  */
 function parseBravePair(value: string | null): number | undefined {
   if (!value) return undefined;
-  const parts = value.split(",").map((s) => Number(s.trim()));
-  if (parts.length < 2) return undefined; // per-second burst only, no monthly info
-  const monthly = parts[1];
+  const parts = value.split(",").map((s) => s.trim());
+  if (parts.length < 2 || parts[1] === "") return undefined; // per-second burst only or empty monthly segment
+  const monthly = Number(parts[1]);
   return Number.isFinite(monthly) ? monthly : undefined;
 }

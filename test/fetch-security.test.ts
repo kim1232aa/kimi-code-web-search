@@ -231,4 +231,84 @@ describe("fetch-security: SSRF, URL, and DNS validation", () => {
     const mockPublicLookup = async () => [{ address: "93.184.216.34", family: 4 }];
     await validateFetchDns("example.com", mockPublicLookup);
   });
+
+  it("blocks FQDN trailing-dot local/internal hostnames", () => {
+    const fqdnBlocked = [
+      "http://localhost./admin",
+      "http://app.localhost./debug",
+      "http://service.internal./secret",
+      "http://printer.local./status",
+    ];
+    for (const url of fqdnBlocked) {
+      assert.throws(
+        () => validateFetchUrl(url),
+        (err: unknown) => {
+          assert(err instanceof FetchSecurityError);
+          assert.equal(err.code, "WEB_FETCH_BLOCKED");
+          return true;
+        },
+        `Expected ${url} to be blocked with WEB_FETCH_BLOCKED`,
+      );
+    }
+  });
+
+  it("blocks IPv4-compatible, NAT64, private 6to4, and uncompressed IPv4-mapped IPv6 forms", () => {
+    const blockedIpv6 = [
+      "http://[::127.0.0.1]/",
+      "http://[::7f00:1]/",
+      "http://[64:ff9b::127.0.0.1]/",
+      "http://[64:ff9b::8.8.8.8]/",
+      "http://[2002:7f00:1::]/",
+      "http://[2002:a9fe:a9fe::]/",
+      "http://[2002:c0a8:0101::]/",
+      "http://[0000:0000:0000:0000:0000:ffff:7f00:0001]/",
+      "http://[0000:0000:0000:0000:0000:ffff:127.0.0.1]/",
+    ];
+    for (const url of blockedIpv6) {
+      assert.throws(
+        () => validateFetchUrl(url),
+        (err: unknown) => {
+          assert(err instanceof FetchSecurityError);
+          assert.equal(err.code, "WEB_FETCH_BLOCKED");
+          return true;
+        },
+        `Expected ${url} to be blocked with WEB_FETCH_BLOCKED`,
+      );
+    }
+
+    // 6to4 embedding public IPv4 (93.184.216.34 = 5db8:d822) remains allowed
+    const pub6to4 = validateFetchUrl("http://[2002:5db8:d822::1]/");
+    assert.equal(pub6to4.hostname, "[2002:5db8:d822::1]");
+  });
+
+  it("validateFetchDns removes abort listener on completion and swallows late aborted lookup rejection", async () => {
+    const controller = new AbortController();
+    let listeners = 0;
+    const origAdd = controller.signal.addEventListener.bind(controller.signal);
+    const origRemove = controller.signal.removeEventListener.bind(controller.signal);
+    controller.signal.addEventListener = ((type: string, fn: any, opts?: any) => {
+      if (type === "abort") listeners += 1;
+      return origAdd(type, fn, opts);
+    }) as any;
+    controller.signal.removeEventListener = ((type: string, fn: any, opts?: any) => {
+      if (type === "abort") listeners -= 1;
+      return origRemove(type, fn, opts);
+    }) as any;
+
+    await validateFetchDns("example.com", async () => [{ address: "93.184.216.34", family: 4 }], controller.signal);
+    assert.equal(listeners, 0, "abort listener must be removed after DNS completes");
+
+    let rejectLookup!: (err: Error) => void;
+    const lookupPromise = new Promise<Array<{ address: string; family: number }>>((_, reject) => {
+      rejectLookup = reject;
+    });
+    const pending = validateFetchDns("slow.example.com", () => lookupPromise, controller.signal);
+    controller.abort(new Error("aborted"));
+    await assert.rejects(() => pending, (err: unknown) => err instanceof FetchSecurityError);
+    assert.equal(listeners, 0);
+
+    // Trigger late lookup rejection to ensure no unhandledRejection occurs
+    rejectLookup(new Error("late DNS failure"));
+    await new Promise((r) => setTimeout(r, 10));
+  });
 });

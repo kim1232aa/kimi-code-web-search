@@ -24,7 +24,7 @@
  *     key can call.
  * @module
  */
-import { providerError, throwIfHttp, resolveContext, type ProviderAdapter, type Source } from "./types.ts";
+import { providerError, throwIfHttp, resolveContext, safeHttpUrl, type ProviderAdapter, type Source } from "./types.ts";
 import { fetchWithProxy } from "../fetch-proxy.ts";
 import { endpointViewOf } from "../endpoints.ts";
 import type { ParallelProviderOptions } from "../../shared/provider-options.ts";
@@ -190,8 +190,9 @@ export function parseParallelSearchResults(body: unknown, maxResults: number): S
       publish_date?: unknown;
       excerpts?: unknown;
     };
-    if (typeof url !== "string" || url.length === 0) continue;
-    const source: Source = { url };
+    const safeUrl = safeHttpUrl(url);
+    if (!safeUrl) continue;
+    const source: Source = { url: safeUrl };
     if (typeof title === "string" && title) source.title = title;
     const excerptText = Array.isArray(excerpts)
       ? excerpts

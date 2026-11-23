@@ -246,7 +246,8 @@ export function createSearchProvider(
     },
 
     async search(request: { query: string; maxResults?: number; provider?: string }, signal?: AbortSignal) {
-      const inflightKey = `${request.provider ?? ""}\u0000${request.maxResults ?? ""}\u0000${request.query}`;
+      const normalizedProvider = typeof request.provider === "string" ? request.provider.trim().toLowerCase() : "";
+      const inflightKey = `${normalizedProvider}\u0000${request.maxResults ?? ""}\u0000${request.query}`;
       const shared = inflightSearches.get(inflightKey);
       if (shared !== undefined) return shared;
       const pending = (async () => {
@@ -381,9 +382,10 @@ export function createSearchProvider(
                 break;
               }
               // retryable:
-              if (err.code === "auth") {
-                // key indicted → mark unhealthy, try the next key in this pool
+              if (err.code === "auth" || (err.code === "quota" && entries.length > 1)) {
+                // key indicted or quota exhausted in multi-key pool → mark unhealthy, try the next key in this pool
                 markUnhealthy(entries, index);
+                lastError = err;
                 attempts.push({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
                 stats.record({ provider: providerName, outcome: `failed:${err.code}`, latencyMs });
                 usable = entries.filter((e) => e.healthy);
@@ -560,14 +562,15 @@ export function createFetchProvider(
         // Key failover mirrors the search path: on AUTH failures try the next
         // healthy key in this provider's pool before moving down the chain.
         let index = selectIndex(entries);
-        let entry = entries[index];
+        let entry: PoolEntry | undefined = entries[index];
         if (entry) reserveKey(entries, index);
         try {
           while (entry) {
+            const currentEntry = entry;
             try {
               const { text } = await runWithTimeout(
                 (sig) =>
-                  adapter.fetch(request.url, entry.key, fetchBaseUrl, {
+                  adapter.fetch(request.url, currentEntry.key, fetchBaseUrl, {
                     signal: sig,
                     options: providerOptions,
                   }),
@@ -586,7 +589,10 @@ export function createFetchProvider(
             } catch (error) {
               const err = toProviderError(error);
               const decision = classifyFailure(err);
-              if (err.code !== "auth" || decision === "terminal" || decision === "non-retryable") {
+              const canRotatePool =
+                decision === "retryable" &&
+                (err.code === "auth" || (err.code === "quota" && entries.length > 1));
+              if (!canRotatePool) {
                 if (err.code === "auth") markUnhealthy(entries, index);
                 if (err.code === "rate-limit" && typeof err.retryAfterMs === "number" && err.retryAfterMs > 0) {
                   healthStore?.cooldownFor(providerName, err.retryAfterMs, "rate-limit");
@@ -605,11 +611,19 @@ export function createFetchProvider(
                 }
                 break;
               }
-              // auth retryable: rotate to the next healthy key in this pool
+              // auth or multi-key quota retryable: rotate to the next healthy key in this pool
               markUnhealthy(entries, index);
+              lastNativeError = err;
               attempts.push({ provider: providerName, outcome: `failed:${err.code}` });
+              const mappedErr = toWebError(error);
+              mappedErr.attempts = attempts;
+              lastExecutedError = mappedErr;
               usable = entries.filter((e) => e.healthy);
               releaseKey(entries, index);
+              if (usable.length === 0) {
+                entry = undefined;
+                break;
+              }
               index = selectIndex(entries);
               entry = entries[index];
               if (entry) reserveKey(entries, index);

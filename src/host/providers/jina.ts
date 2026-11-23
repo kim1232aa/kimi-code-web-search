@@ -12,7 +12,7 @@
  *   parse failure must degrade to "quota unavailable", never break search.
  * @module
  */
-import { providerError, throwIfHttp, resolveContext, type ProviderAdapter, type Source } from "./types.ts";
+import { providerError, throwIfHttp, resolveContext, safeHttpUrl, type ProviderAdapter, type Source } from "./types.ts";
 import type { QuotaSnapshot } from "../quota.ts";
 import { fetchWithProxy } from "../fetch-proxy.ts";
 import { endpointViewOf } from "../endpoints.ts";
@@ -138,9 +138,10 @@ export function parseJinaSearchJson(body: unknown, maxResults: number): Source[]
       description?: unknown;
       publishedTime?: unknown;
     };
-    if (typeof url !== "string" || url.length === 0) continue;
+    const safeUrl = safeHttpUrl(url);
+    if (!safeUrl) continue;
     sources.push({
-      url,
+      url: safeUrl,
       ...(typeof title === "string" && title ? { title } : {}),
       ...(typeof description === "string" && description ? { snippet: description } : {}),
       ...(typeof publishedTime === "string" && publishedTime ? { publishedAt: publishedTime } : {}),
@@ -170,6 +171,7 @@ export async function jinaQuota(apiKey: string, signal?: AbortSignal): Promise<Q
     signal,
   }, { provider: "jina" });
   if (!res.ok) {
+    void res.body?.cancel?.().catch(() => {});
     if (res.status === 401 || res.status === 403) throw providerError("auth", `Jina balance auth failed (HTTP ${res.status})`, res.status);
     if (res.status === 429) throw providerError("rate-limit", "Jina rate limit exceeded (HTTP 429)", res.status);
     throw providerError("server", `Jina balance failed (HTTP ${res.status})`, res.status);

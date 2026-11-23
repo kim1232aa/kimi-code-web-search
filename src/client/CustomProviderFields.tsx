@@ -10,7 +10,7 @@
  *
  * @module
  */
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { CSSProperties } from "react";
 import { text, surface, state as stateColor } from "./theme.ts";
 import type { TFunc } from "./WebToolsSection.tsx";
@@ -110,6 +110,37 @@ const iconBtnStyle: CSSProperties = {
   justifyContent: "center",
 };
 
+interface KeyValueRow {
+  id: number;
+  key: string;
+  value: string;
+}
+
+function recordToRows(record: Record<string, string> | undefined, nextId: () => number): KeyValueRow[] {
+  return Object.entries(record ?? {}).map(([key, value]) => ({
+    id: nextId(),
+    key,
+    value,
+  }));
+}
+
+function rowsToRecord(rows: KeyValueRow[]): Record<string, string> | undefined {
+  const out: Record<string, string> = {};
+  for (const row of rows) {
+    const k = row.key.trim();
+    if (k) out[k] = row.value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function recordsEqual(a?: Record<string, string>, b?: Record<string, string>): boolean {
+  const ae = Object.entries(a ?? {});
+  const be = Object.entries(b ?? {});
+  if (ae.length !== be.length) return false;
+  const bMap = b ?? {};
+  return ae.every(([k, v]) => Object.hasOwn(bMap, k) && bMap[k] === v);
+}
+
 export function CustomProviderFields(props: CustomProviderFieldsProps) {
   const {
     t,
@@ -138,6 +169,32 @@ export function CustomProviderFields(props: CustomProviderFieldsProps) {
     draft.request?.paramsTemplate && Object.keys(draft.request.paramsTemplate).length > 0 ? "template" : "standard",
   );
 
+  const nextRowIdRef = useRef(1);
+  const allocRowId = () => nextRowIdRef.current++;
+
+  const [headerRows, setHeaderRows] = useState<KeyValueRow[]>(() =>
+    recordToRows(draft.request?.headers, allocRowId),
+  );
+  const [paramRows, setParamRows] = useState<KeyValueRow[]>(() =>
+    recordToRows(draft.request?.paramsTemplate, allocRowId),
+  );
+
+  useEffect(() => {
+    setHeaderRows((prev) =>
+      recordsEqual(rowsToRecord(prev), draft.request?.headers)
+        ? prev
+        : recordToRows(draft.request?.headers, allocRowId),
+    );
+  }, [draft.request?.headers]);
+
+  useEffect(() => {
+    setParamRows((prev) =>
+      recordsEqual(rowsToRecord(prev), draft.request?.paramsTemplate)
+        ? prev
+        : recordToRows(draft.request?.paramsTemplate, allocRowId),
+    );
+  }, [draft.request?.paramsTemplate]);
+
   useEffect(() => {
     if (draft.request?.bodyTemplate) {
       setBodyMode("template");
@@ -156,110 +213,68 @@ export function CustomProviderFields(props: CustomProviderFieldsProps) {
     }
   }, [draft.protocol]);
 
-  const updateHeaderKey = (oldKey: string, newKey: string) => {
-    const cur = { ...(draft.request?.headers ?? {}) };
-    const val = cur[oldKey] ?? "";
-    delete cur[oldKey];
-    if (newKey.trim()) {
-      cur[newKey.trim()] = val;
-    }
+  const commitHeaders = (nextRows: KeyValueRow[]) => {
+    setHeaderRows(nextRows);
     onChange({
       request: {
         ...draft.request,
-        headers: Object.keys(cur).length > 0 ? cur : undefined,
+        headers: rowsToRecord(nextRows),
       },
     });
   };
 
-  const updateHeaderValue = (key: string, val: string) => {
-    const cur = { ...(draft.request?.headers ?? {}) };
-    cur[key] = val;
-    onChange({
-      request: {
-        ...draft.request,
-        headers: cur,
-      },
-    });
+  const updateHeaderKey = (id: number, newKey: string) => {
+    commitHeaders(headerRows.map((row) => (row.id === id ? { ...row, key: newKey } : row)));
   };
 
-  const removeHeader = (key: string) => {
-    const cur = { ...(draft.request?.headers ?? {}) };
-    delete cur[key];
-    onChange({
-      request: {
-        ...draft.request,
-        headers: Object.keys(cur).length > 0 ? cur : undefined,
-      },
-    });
+  const updateHeaderValue = (id: number, val: string) => {
+    commitHeaders(headerRows.map((row) => (row.id === id ? { ...row, value: val } : row)));
+  };
+
+  const removeHeader = (id: number) => {
+    commitHeaders(headerRows.filter((row) => row.id !== id));
   };
 
   const addHeader = () => {
-    const cur = { ...(draft.request?.headers ?? {}) };
+    const existingKeys = new Set(headerRows.map((r) => r.key.trim()).filter(Boolean));
     let newKey = "X-Custom-Header";
     let counter = 1;
-    while (newKey in cur) {
+    while (existingKeys.has(newKey)) {
       newKey = `X-Custom-Header-${counter++}`;
     }
-    cur[newKey] = "{{apiKey}}";
+    commitHeaders([...headerRows, { id: allocRowId(), key: newKey, value: "{{apiKey}}" }]);
+  };
+
+  const commitParams = (nextRows: KeyValueRow[]) => {
+    setParamRows(nextRows);
     onChange({
       request: {
         ...draft.request,
-        headers: cur,
+        paramsTemplate: rowsToRecord(nextRows),
       },
     });
   };
 
-  const updateParamKey = (oldKey: string, newKey: string) => {
-    const cur = { ...(draft.request?.paramsTemplate ?? {}) };
-    const val = cur[oldKey] ?? "";
-    delete cur[oldKey];
-    if (newKey.trim()) {
-      cur[newKey.trim()] = val;
-    }
-    onChange({
-      request: {
-        ...draft.request,
-        paramsTemplate: Object.keys(cur).length > 0 ? cur : undefined,
-      },
-    });
+  const updateParamKey = (id: number, newKey: string) => {
+    commitParams(paramRows.map((row) => (row.id === id ? { ...row, key: newKey } : row)));
   };
 
-  const updateParamValue = (key: string, val: string) => {
-    const cur = { ...(draft.request?.paramsTemplate ?? {}) };
-    cur[key] = val;
-    onChange({
-      request: {
-        ...draft.request,
-        paramsTemplate: cur,
-      },
-    });
+  const updateParamValue = (id: number, val: string) => {
+    commitParams(paramRows.map((row) => (row.id === id ? { ...row, value: val } : row)));
   };
 
-  const removeParam = (key: string) => {
-    const cur = { ...(draft.request?.paramsTemplate ?? {}) };
-    delete cur[key];
-    onChange({
-      request: {
-        ...draft.request,
-        paramsTemplate: Object.keys(cur).length > 0 ? cur : undefined,
-      },
-    });
+  const removeParam = (id: number) => {
+    commitParams(paramRows.filter((row) => row.id !== id));
   };
 
   const addParam = () => {
-    const cur = { ...(draft.request?.paramsTemplate ?? {}) };
+    const existingKeys = new Set(paramRows.map((r) => r.key.trim()).filter(Boolean));
     let newKey = "query";
     let counter = 1;
-    while (newKey in cur) {
+    while (existingKeys.has(newKey)) {
       newKey = `param${counter++}`;
     }
-    cur[newKey] = "{{query}}";
-    onChange({
-      request: {
-        ...draft.request,
-        paramsTemplate: cur,
-      },
-    });
+    commitParams([...paramRows, { id: allocRowId(), key: newKey, value: "{{query}}" }]);
   };
 
   const handleAccessModeChange = (mode: CustomAccessMode) => {
@@ -308,6 +323,8 @@ export function CustomProviderFields(props: CustomProviderFieldsProps) {
       },
     });
 
+    setHeaderRows([]);
+    setParamRows([]);
     setAdvancedOpen(mode === "custom");
   };
 
@@ -569,11 +586,20 @@ export function CustomProviderFields(props: CustomProviderFieldsProps) {
                   <select
                     style={{ ...inputStyle, cursor: "pointer" }}
                     value={draft.endpoint.method}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      const method = e.target.value as CustomMethod;
+                      if (method === "GET") {
+                        setBodyJsonError("");
+                        onValidationErrorChange?.(null);
+                      }
                       onChange({
-                        endpoint: { ...draft.endpoint, method: e.target.value as CustomMethod },
-                      })
-                    }
+                        endpoint: {
+                          ...draft.endpoint,
+                          method,
+                          ...(method === "GET" ? { encoding: "query" as CustomEncoding } : {}),
+                        },
+                      });
+                    }}
                   >
                     <option value="GET">GET</option>
                     <option value="POST">POST</option>
@@ -592,11 +618,25 @@ export function CustomProviderFields(props: CustomProviderFieldsProps) {
                       { value: "query", label: t("encodingQuery") },
                     ]}
                     value={draft.endpoint.encoding}
-                    onChange={(encoding) =>
+                    onChange={(encoding) => {
+                      if (encoding !== "json") {
+                        setBodyJsonError("");
+                        onValidationErrorChange?.(null);
+                      } else if (bodyMode === "template") {
+                        try {
+                          JSON.parse(bodyTemplateText);
+                          setBodyJsonError("");
+                          onValidationErrorChange?.(null);
+                        } catch {
+                          const err = t("bodyTemplateInvalid");
+                          setBodyJsonError(err);
+                          onValidationErrorChange?.(err);
+                        }
+                      }
                       onChange({
                         endpoint: { ...draft.endpoint, encoding },
-                      })
-                    }
+                      });
+                    }}
                   />
                 </div>
               )}
@@ -720,6 +760,7 @@ export function CustomProviderFields(props: CustomProviderFieldsProps) {
                     onChange={(mode) => {
                       setParamsMode(mode);
                       if (mode === "standard") {
+                        setParamRows([]);
                         onChange({
                           request: {
                             ...draft.request,
@@ -732,10 +773,12 @@ export function CustomProviderFields(props: CustomProviderFieldsProps) {
                           q: "{{query}}",
                           limit: "{{maxResults}}",
                         };
+                        const nextParams = draft.request?.paramsTemplate ?? defaultParams;
+                        setParamRows(recordToRows(nextParams, allocRowId));
                         onChange({
                           request: {
                             ...draft.request,
-                            paramsTemplate: draft.request?.paramsTemplate ?? defaultParams,
+                            paramsTemplate: nextParams,
                           },
                         });
                       }
@@ -774,23 +817,23 @@ export function CustomProviderFields(props: CustomProviderFieldsProps) {
                   ) : (
                     <div style={{ marginTop: 8 }}>
                       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                        {Object.entries(draft.request?.paramsTemplate ?? {}).map(([pKey, pVal], idx) => (
-                          <div key={idx} style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 8, alignItems: "center" }}>
+                        {paramRows.map((row) => (
+                          <div key={row.id} style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 8, alignItems: "center" }}>
                             <input
                               style={inputStyle}
-                              value={pKey}
+                              value={row.key}
                               placeholder={t("paramKeyPlaceholder")}
-                              onChange={(e) => updateParamKey(pKey, e.target.value)}
+                              onChange={(e) => updateParamKey(row.id, e.target.value)}
                             />
                             <input
                               style={inputStyle}
-                              value={pVal}
+                              value={row.value}
                               placeholder={t("paramValPlaceholder")}
-                              onChange={(e) => updateParamValue(pKey, e.target.value)}
+                              onChange={(e) => updateParamValue(row.id, e.target.value)}
                             />
                             <button
                               type="button"
-                              onClick={() => removeParam(pKey)}
+                              onClick={() => removeParam(row.id)}
                               style={iconBtnStyle}
                               title={t("deleteLabel") || "Delete"}
                             >
@@ -850,23 +893,23 @@ export function CustomProviderFields(props: CustomProviderFieldsProps) {
                   {t("customHeadersDesc")}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  {Object.entries(draft.request?.headers ?? {}).map(([hKey, hVal], idx) => (
-                    <div key={idx} style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 8, alignItems: "center" }}>
+                  {headerRows.map((row) => (
+                    <div key={row.id} style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 8, alignItems: "center" }}>
                       <input
                         style={inputStyle}
-                        value={hKey}
+                        value={row.key}
                         placeholder={t("headerNamePlaceholder")}
-                        onChange={(e) => updateHeaderKey(hKey, e.target.value)}
+                        onChange={(e) => updateHeaderKey(row.id, e.target.value)}
                       />
                       <input
                         style={inputStyle}
-                        value={hVal}
+                        value={row.value}
                         placeholder={t("headerValuePlaceholder")}
-                        onChange={(e) => updateHeaderValue(hKey, e.target.value)}
+                        onChange={(e) => updateHeaderValue(row.id, e.target.value)}
                       />
                       <button
                         type="button"
-                        onClick={() => removeHeader(hKey)}
+                        onClick={() => removeHeader(row.id)}
                         style={iconBtnStyle}
                         title={t("deleteLabel") || "Delete"}
                       >

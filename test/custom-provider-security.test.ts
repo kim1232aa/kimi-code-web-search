@@ -24,6 +24,8 @@ import {
   assertHeaderName,
   truncateUnicodeSafe,
   assertAddressAllowed,
+  createPinnedDispatcher,
+  defaultConnect,
   isLoopbackUrl,
   preflightDns,
   transact,
@@ -409,4 +411,96 @@ process.stdout.write(String(configPlaneTrust({ headers: { host: "127.0.0.1:3080"
   const harness = run("case.test.mjs");
   assert.equal(harness.status, 0, harness.stderr);
   assert.equal(harness.stdout.trim(), "host");
+});
+
+test("Security: preflightDns enforces entry.port on allowPrivate authorizations", async () => {
+  const policy: OutboundPolicy = {
+    authorizations: [{ host: "internal.gateway", port: 8080, allowPrivate: true }],
+  };
+  const lookupAll = async () => [{ address: "10.0.0.5", family: 4 }];
+
+  const ok = await preflightDns("internal.gateway", "authorized", policy, { lookupAll }, 8080);
+  assert.equal(ok.allowPrivate, true);
+
+  await assert.rejects(
+    () => preflightDns("internal.gateway", "public", policy, { lookupAll }, 9999),
+    (err: unknown) => err instanceof TransportError && err.code === "destination-blocked",
+  );
+  await assert.rejects(
+    () => preflightDns("127.0.0.1", "public", { authorizations: [{ host: "127.0.0.1", port: 8080, allowPrivate: true }] }, { lookupAll }, 9999),
+    (err: unknown) => err instanceof TransportError && err.code === "destination-blocked",
+  );
+});
+
+test("Security: assertAddressAllowed blocks uncompressed/NAT64/6to4/compatible metadata even when allowPrivate=true", () => {
+  const metadataForms = [
+    "0000:0000:0000:0000:0000:ffff:a9fe:a9fe",
+    "::169.254.169.254",
+    "64:ff9b::169.254.169.254",
+    "2002:a9fe:a9fe::1",
+  ];
+  for (const ip of metadataForms) {
+    assert.throws(
+      () => assertAddressAllowed(ip, true),
+      (err: unknown) => err instanceof TransportError && err.code === "destination-blocked",
+      `Expected ${ip} to be strictly forbidden`,
+    );
+  }
+});
+
+test("Security: transact returns truncated:true instead of invalid JSON parse error when body exceeds cap", async () => {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ results: [{ url: "https://example.com", title: "x".repeat(500) }] }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const port = (server.address() as { port: number }).port;
+  try {
+    const res = await transact({
+      url: `http://127.0.0.1:${port}/search`,
+      method: "GET",
+      headers: {},
+      label: "Truncated JSON",
+      trust: "authorized",
+      policy: {
+        authorizations: [{ host: "127.0.0.1", port, allowPrivate: true, allowHttp: true }],
+        maxResponseBytes: 32,
+      },
+    });
+    assert.equal(res.truncated, true);
+    assert.equal(res.json, undefined);
+  } finally {
+    server.close();
+  }
+});
+
+test("Security: createPinnedDispatcher accepts default-port empty string and bracketed IPv6 servername", async () => {
+  const dispatcher = await createPinnedDispatcher({
+    address: "127.0.0.1",
+    port: 80,
+    servername: "[::1]",
+    useTls: false,
+    connectTimeoutMs: 500,
+    connect: ((_opts: unknown) => {
+      throw new Error("expected-connect-reached");
+    }) as typeof defaultConnect,
+    signal: new AbortController().signal,
+  });
+  try {
+    const err = await new Promise<Error>((resolve) => {
+      (dispatcher as any).dispatch(
+        { origin: "http://[::1]", path: "/", method: "GET" },
+        {
+          onError(e: Error) {
+            resolve(e);
+          },
+        },
+      );
+    }).catch((e) => e as Error);
+    // Reached connector (not blocked by unapproved authority :0 or [::1] mismatch)
+    assert.doesNotMatch(err.message, /unapproved authority/i);
+  } finally {
+    await (dispatcher as { destroy: () => Promise<void> }).destroy();
+  }
 });

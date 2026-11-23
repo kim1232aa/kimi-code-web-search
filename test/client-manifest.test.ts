@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { zhDict, enDict } from "../src/client/i18n-dict.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -39,9 +40,14 @@ test("package.json declares kimi-code-web-search 0.4.0 with zero @deepseek-ai/* 
   for (const name of Object.keys(allDeps)) {
     assert.ok(!name.startsWith("@deepseek-ai/"), `must not depend on ${name}`);
   }
-  for (const required of ["defuddle", "linkedom", "undici", "ws", "react", "react-dom"]) {
+  for (const required of ["defuddle", "linkedom", "undici"]) {
     assert.ok(Object.hasOwn(pkg.dependencies ?? {}, required), `missing dependency ${required}`);
   }
+  for (const buildOnly of ["react", "react-dom"]) {
+    assert.ok(Object.hasOwn(pkg.devDependencies ?? {}, buildOnly), `missing devDependency ${buildOnly}`);
+    assert.ok(!Object.hasOwn(pkg.dependencies ?? {}, buildOnly), `${buildOnly} is bundled into dist/client and should stay in devDependencies`);
+  }
+  assert.ok(!Object.hasOwn(allDeps, "ws") && !Object.hasOwn(allDeps, "@types/ws"), "unused ws dependency must be removed");
 });
 
 test("kimi.plugin.json declares MCP server, hooks, commands, skills, and SYSTEM.md", () => {
@@ -150,4 +156,23 @@ test("built dist/client/app.js never references @deepseek-ai/* packages", () => 
   if (!existsSync(bundlePath)) return;
   const bundle = readFileSync(bundlePath, "utf8");
   assert.ok(!bundle.includes("@deepseek-ai/"), "client bundle must not reference @deepseek-ai/*");
+});
+
+test("build config & manifest parity: version matches, host build excludes client, i18n keys balanced", () => {
+  const pkg = readPkg();
+  const manifest = readPluginManifest();
+  assert.equal(pkg.version, manifest.version, "package.json and kimi.plugin.json versions must match");
+  assert.ok(!String(pkg.description ?? "").includes("social platform research"), "stale description must be removed");
+  assert.ok(String(pkg.scripts?.["build:host"] ?? "").includes("rmSync('lib'"), "build:host must clean lib/ before tsc");
+
+  const tsconfigBuild = JSON.parse(readFileSync(join(root, "tsconfig.build.json"), "utf8")) as { include?: string[] };
+  assert.deepEqual(tsconfigBuild.include, ["src/host/**/*.ts", "src/shared/**/*.ts"]);
+
+  const zhKeys = new Set(Object.keys(zhDict));
+  const enKeys = new Set(Object.keys(enDict));
+  assert.deepEqual([...zhKeys].filter((k) => !enKeys.has(k)), [], "zhDict has keys missing from enDict");
+  assert.deepEqual([...enKeys].filter((k) => !zhKeys.has(k)), [], "enDict has keys missing from zhDict");
+  for (const key of ["searxngDefaultHint", "apiKeyConfigured", "httpMethod", "manage"]) {
+    assert.ok(zhKeys.has(key) && enKeys.has(key), `missing i18n key ${key}`);
+  }
 });

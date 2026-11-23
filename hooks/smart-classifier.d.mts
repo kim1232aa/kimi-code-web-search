@@ -100,18 +100,11 @@ export interface SearchRouteConfig {
   fallbackOrder?: readonly string[];
   providerBaseUrls?: Readonly<Record<string, string>>;
   providerEnabled?: Readonly<Record<string, boolean>>;
-  platformEnabled?: Readonly<Record<string, boolean>>;
   customProviders?: ReadonlyArray<{
     id: string;
     enabled?: boolean;
     auth?: { mode: string };
   }>;
-}
-
-export interface SearchPlatformState {
-  enabled?: boolean;
-  authenticated?: boolean;
-  sessionEstablished?: boolean;
 }
 
 export interface UsableSearchRoutes {
@@ -124,5 +117,5 @@ export function extractKimiSessionContext(sessionId: string | undefined, kimiCod
 export function buildSmartClassifierState(promptText: string, hasImages?: boolean, sessionContext?: KimiSessionContext): SmartClassifierState;
 export function resolveSmartCredential(smartConfig?: Partial<SmartSearchConfig>, credentials?: SmartCredentials, env?: SmartCredentials): SmartCredential;
 export function classifySmartTurn(input: SmartClassifierInput): Promise<SmartClassifierResult>;
-export function usableSearchRoutes(cfg?: SearchRouteConfig, credentials?: SmartCredentials, platformStates?: Readonly<Record<string, SearchPlatformState>>, kimiCodeHome?: string, env?: SmartCredentials): UsableSearchRoutes;
-export function hasUsableSearchProvider(cfg?: SearchRouteConfig, credentials?: SmartCredentials, platformStates?: Readonly<Record<string, SearchPlatformState>>, kimiCodeHome?: string, env?: SmartCredentials): boolean;
+export function usableSearchRoutes(cfg?: SearchRouteConfig, credentials?: SmartCredentials, _platformStates?: unknown, _kimiCodeHome?: string, env?: SmartCredentials): UsableSearchRoutes;
+export function hasUsableSearchProvider(cfg?: SearchRouteConfig, credentials?: SmartCredentials, _platformStates?: unknown, _kimiCodeHome?: string, env?: SmartCredentials): boolean;

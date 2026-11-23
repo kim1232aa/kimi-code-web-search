@@ -19,8 +19,10 @@ import {
   createPoolStore,
 } from "../src/host/registry.ts";
 import { createProviderHealthStore } from "../src/host/provider-health.ts";
+import { createCustomAdapter } from "../src/host/providers/custom-compatible.ts";
 import type { CustomProviderConfig } from "../src/shared/custom-provider-types.ts";
 import type { TransportRequest, TransportResponse } from "../src/host/provider-transport.ts";
+import type { ProviderError } from "../src/host/providers/types.ts";
 
 function createMockConfig(id: string, name: string, authMode: "none" | "bearer" = "bearer"): CustomProviderConfig {
   return {
@@ -351,4 +353,51 @@ test("Registry: policyForCustomSource sets allowProxy correctly for public, priv
     { host: "192.168.1.50", port: 8080, allowPrivate: true, allowHttp: true, allowProxy: false },
   ]);
   assert.equal(authWithoutProxyResult.policy.allowProxy, false, "Authorized source must honor explicit allowProxy: false");
+
+  // 4. IPv6 literal baseUrl strips brackets when matching OutboundAuthorization
+  const ipv6Config: CustomProviderConfig = {
+    ...createMockConfig("custom_v6", "IPv6 Search"),
+    endpoint: {
+      baseUrl: "https://[fd00::1]:8443",
+      searchPath: "/search",
+      method: "POST",
+      encoding: "json",
+    },
+  };
+  const v6Auth = policyForCustomSource(ipv6Config, [
+    { host: "fd00::1", port: 8443, allowPrivate: true },
+  ]);
+  assert.equal(v6Auth.trust, "authorized");
+});
+
+test("Registry: custom-compatible adapter classifies 402 quota, 408 timeout, and 429 Retry-After", async () => {
+  const cfg = createMockConfig("custom_http_codes", "Codes Test", "none");
+  const makeAdapter = (status: number, headers = new Headers()) =>
+    createCustomAdapter(cfg, {
+      transport: async () => ({
+        status,
+        ok: false,
+        contentType: "application/json",
+        text: "",
+        truncated: false,
+        headers,
+      }),
+      credentials: { read: async () => "" },
+      refs: {},
+      policy: { authorizations: [] },
+      trust: "public",
+    });
+
+  await assert.rejects(
+    () => makeAdapter(402).search("q", 5, "", undefined),
+    (err: unknown) => (err as ProviderError).code === "quota",
+  );
+  await assert.rejects(
+    () => makeAdapter(408).search("q", 5, "", undefined),
+    (err: unknown) => (err as ProviderError).code === "timeout",
+  );
+  await assert.rejects(
+    () => makeAdapter(429, new Headers({ "retry-after": "12" })).search("q", 5, "", undefined),
+    (err: unknown) => (err as ProviderError).code === "rate-limit" && (err as ProviderError).retryAfterMs === 12_000,
+  );
 });

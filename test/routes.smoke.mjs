@@ -7,8 +7,11 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
-import { registerRoutes, API_PREFIX } from "../src/host/routes.ts";
+import os from "node:os";
+import path from "node:path";
+import { registerRoutes, API_PREFIX, isProxiedRequest, isDirectLoopbackRequest, configPlaneTrust } from "../src/host/routes.ts";
 
 /** Minimal mock webServer that captures the registered handler. */
 function mockServer() {
@@ -449,4 +452,110 @@ test("config/save validates and persists fetchOrder while rejecting unknown fetc
   const badRes = fakeReqRes("POST", `${API_PREFIX}/config/save`, { fetchOrder: ["exa", "not-a-provider"] });
   await localHandler()(badRes.req, badRes.res);
   assert.equal(badRes.res.statusCode, 400, badRes.res.body);
+});
+
+test("security helpers detect proxy headers, malformed Host, and normalized x-forwarded-proto", () => {
+  for (const [hdr, val] of [
+    ["x-forwarded-proto", ["https"]],
+    ["forwarded", "for=192.0.2.1"],
+    ["via", "1.1 proxy"],
+    ["cf-connecting-ip", "198.51.100.1"],
+    ["true-client-ip", "198.51.100.2"],
+    ["x-forwarded-host", "example.com"],
+  ]) {
+    assert.equal(isProxiedRequest({ headers: { [hdr]: val } }), true, `expected proxy detection for ${hdr}`);
+  }
+  assert.equal(isDirectLoopbackRequest({ headers: { host: "bad host" }, socket: { remoteAddress: "127.0.0.1" } }), false);
+  assert.equal(
+    configPlaneTrust({
+      headers: { host: "127.0.0.1:3080", origin: "https://127.0.0.1:3080", "x-forwarded-proto": "HTTPS, http" },
+      socket: { remoteAddress: "127.0.0.1" },
+    }),
+    false,
+    "proxied loopback peer is still rejected when not gateway-authenticated",
+  );
+  assert.equal(
+    configPlaneTrust({
+      headers: { host: "127.0.0.1:3080", origin: "https://127.0.0.1:3080", "x-forwarded-proto": "HTTPS, http" },
+    }),
+    "host",
+  );
+});
+
+test("routes readJsonBody decodes split multi-byte UTF-8 chunks cleanly", async () => {
+  let received;
+  const localDeps = { ...deps, searchMode: { view: (id) => ({ mode: "auto", id }), set: (id, m) => ({ mode: m, id }) } };
+  const { server: s, getHandler: g } = mockServer();
+  registerRoutes({ webServer: s, webRuntime: { trustedHosts: [] } }, localDeps);
+  const buf = Buffer.from('{"sessionId":"中文会话"}', "utf8");
+  const split = buf.indexOf(0xe4) + 1;
+  const req = {
+    url: `${API_PREFIX}/search-mode/get`,
+    method: "POST",
+    headers: { host: "127.0.0.1:3080" },
+    async *[Symbol.asyncIterator]() {
+      yield buf.subarray(0, split);
+      yield buf.subarray(split);
+    },
+  };
+  const res = { statusCode: 0, headers: {}, body: "", writeHead(st, h) { this.statusCode = st; this.headers = h; }, end(b) { this.body = String(b ?? ""); } };
+  await g()(req, res);
+  assert.equal(res.statusCode, 200, res.body);
+  received = JSON.parse(res.body);
+  assert.equal(received.value.id, "中文会话");
+});
+
+test("config/get uses DEFAULT_PROVIDER (exa), ANDs custom enabled flags; config/save rejects query/hash; import/pi checks source === local", async (t) => {
+  const piDir = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-wt-pi-smoke-"));
+  const prevPiDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = piDir;
+  t.after(() => {
+    if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+    fs.rmSync(piDir, { recursive: true, force: true });
+  });
+  fs.writeFileSync(path.join(piDir, "web-search.json"), JSON.stringify({ exaApiKey: "exa-pi-new" }));
+
+  const writtenCreds = {};
+  const localDeps = {
+    ...deps,
+    readConfig: () => ({
+      enabled: true,
+      providerEnabled: { custom_disabled01: true },
+      customProviders: [{
+        schemaVersion: 1,
+        id: "custom_disabled01",
+        name: "Disabled Custom",
+        enabled: false,
+        protocol: "generic-json",
+        endpoint: { baseUrl: "https://api.example.com", searchPath: "/search", method: "GET", encoding: "query" },
+        auth: { mode: "none" },
+        revision: 1,
+      }],
+    }),
+    readCredential: async (ref) => ({ configured: ref === "WEB_TOOLS_EXA", source: "env", writable: true, value: "env-secret" }),
+    writeCredential: async (ref, val) => { writtenCreds[ref] = val; },
+  };
+  const { server: s, getHandler: g } = mockServer();
+  registerRoutes({ webServer: s, webRuntime: { trustedHosts: [] } }, localDeps);
+  const invoke = async (method, payload) => {
+    const { req, res } = fakeReqRes("POST", `${API_PREFIX}/${method}`, payload);
+    await g()(req, res);
+    return { status: res.statusCode, body: JSON.parse(res.body || "{}") };
+  };
+
+  const cfg = await invoke("config/get", {});
+  assert.equal(cfg.status, 200);
+  assert.equal(cfg.body.value.defaultProvider, "exa");
+  const custom = cfg.body.value.providers.find((p) => p.name === "custom_disabled01");
+  assert.equal(custom.enabled, false);
+
+  const badQuery = await invoke("config/save", { providerBaseUrls: { exa: "https://proxy.example.com?token=1" } });
+  assert.equal(badQuery.status, 400);
+  const badHash = await invoke("config/save", { providerBaseUrls: { exa: "https://proxy.example.com#frag" } });
+  assert.equal(badHash.status, 400);
+
+  const imported = await invoke("import/pi", {});
+  assert.equal(imported.status, 200);
+  assert.equal(writtenCreds.WEB_TOOLS_EXA, "exa-pi-new", "env-sourced credential must not be merged into credentials.json");
 });

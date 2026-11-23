@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh-CN.md)
 
-Multi-provider web search & fetch plugin for [Kimi Code CLI](https://www.kimi.com/code), with a per-session **Search Mode** policy, a **Jev smart classifier**, Xiaohongshu / X research, and a local **Web UI dashboard**.
+Multi-provider web search & fetch plugin for [Kimi Code CLI](https://www.kimi.com/code), with a per-session **Search Mode** policy, a **Jev smart classifier**, and a local **Web UI dashboard**.
 
 
 > The repository was renamed from `kimi-web-tools` to `kimi-code-web-search` on 2026-11-22. GitHub redirects the old URL, so existing clones keep working.
@@ -14,15 +14,14 @@ The plugin itself is free and open source (MIT). You bring your own search-provi
 ## Features
 
 - **`web_search`** — one tool across a configurable provider pool: Exa, Tavily, Brave, You.com, Firecrawl, Parallel, Jina, Keenable, self-hosted SearXNG, plus custom sources (Tavily-compatible, SearXNG JSON, or generic JSON APIs). Multi-key pools with health-aware rotation, quota tracking, and automatic fallback. Routing policies: `ordered`, `round-robin`, `random`. An optional `provider` argument picks a source to try first for cross-verification.
-- **`web_fetch`** — clean readable Markdown/text extraction from any public URL, with an independent fetch chain (`fetchOrder`) ending in built-in HTTP. For Xiaohongshu and X post URLs it returns the full post body and top comments.
-- **Social platform research** — prefix a query with `小红书:` or `X:` to search inside the platform (requires a logged-in browser session, configured in the dashboard). The gateway strips the prefix before typing into the platform search box.
+- **`web_fetch`** — clean readable Markdown/text extraction from any public URL, with an independent fetch chain (`fetchOrder`) ending in built-in HTTP.
 - **Four Search Modes**, enforced through Kimi Code lifecycle hooks:
   - `auto` (智能联网) — research on demand, answer from context otherwise.
   - `smart` (Jev 判定) — a small classifier decides per turn whether web research is required. Backends: TypeSafe System One (`jev-latest` by default), OpenRouter, or any OpenAI-compatible endpoint. Fails open on errors/timeouts unless you set `failOpen: false`.
   - `required` (始终联网) — every user turn must complete a real search before the reply ends. By default only a search counts (`requiredEvidence: "search"`); switch to `"search-or-fetch"` to also accept a URL read. Recognized external web tools (e.g. other MCP search servers) count too. A Stop-hook gate steers once when nothing was searched or every lookup failed, then lets the turn end with failures reported as unverified — no infinite loops.
   - `off` (关闭联网) — this plugin's web tools are blocked; other plugins are unaffected.
 - **Anti-hallucination prompt discipline** — search what the request actually depends on, verify against primary sources, never retry a failing provider, never fill gaps from memory ("未搜到不等于不存在" / absence of hits ≠ non-existence).
-- **Web UI dashboard** at `http://127.0.0.1:18492` — provider keys & quotas, drag-and-drop routing order, Smart/Jev panel with a classifier test action, mode switches (global or per-session), platform login, light/dark theme, English/中文 UI.
+- **Web UI dashboard** at `http://127.0.0.1:18492` — provider keys & quotas, drag-and-drop routing order, Smart/Jev panel with a classifier test action, mode switches (global or per-session), light/dark theme, English/中文 UI.
 - **Pi import** — one command migrates API keys, endpoints, routing, and search mode from a local Pi agent setup (`always-search.ts` + `pi-web-access`).
 - **Subagent-aware enforcement** — subagent activity, system-trigger turns, and session cleanup are handled so the required-mode gate never misfires on background turns.
 
@@ -68,7 +67,7 @@ Kimi copies the prepared folder to `$KIMI_CODE_HOME/plugins/managed/web/`. After
 ### Local gateway first run
 
 1. From the built checkout or unpacked plugin, run `node ./bin/gateway-daemon.mjs ensure`, then open `http://127.0.0.1:18492`. With no remote URL configured, `web_search` and `web_fetch` can start the local gateway on demand. `web_status`, `web_mode`, and `/web:dashboard` do not start it.
-2. Configure a usable search source on that gateway: add a provider key (e.g. `WEB_TOOLS_EXA`) or configure a supported keyless source. For Xiaohongshu / X native browsing, configure a supported browser on the gateway host.
+2. Configure a usable search source on that gateway: add a provider key (e.g. `WEB_TOOLS_EXA`) or configure a supported keyless source (such as SearXNG).
 3. Run `/web:status` in the new Kimi session, then try one real search. A healthy process or connected MCP server does not prove that a search provider works.
 
 Provider keys configured in the dashboard are stored on the gateway host in `$KIMI_CODE_HOME/web-tools/credentials.json`, not in `mcp.json`.
@@ -90,8 +89,8 @@ Imports provider keys, base URLs, routing, classifier credentials (`auth.json`),
 
 | Tool | Purpose |
 | --- | --- |
-| `mcp__plugin-web_s__web_search` | Web / platform search across the provider pool; optional `provider` override |
-| `mcp__plugin-web_s__web_fetch` | URL → clean Markdown; full post + comments for 小红书 / X URLs |
+| `mcp__plugin-web_s__web_search` | Web search across the provider pool; optional `provider` override |
+| `mcp__plugin-web_s__web_fetch` | URL → clean readable Markdown/text |
 | `mcp__plugin-web_s__web_mode` | Get / set / toggle the Search Mode |
 | `mcp__plugin-web_s__web_status` | Search engines that can actually run a query |
 
@@ -199,7 +198,7 @@ kimi
 ### Remote policy limitations
 
 - **Direct HTTP is a tools connection, not a plugin install.** It does not install the Skill, slash commands, or hooks. If you keep the plugin enabled for its hooks, `web-remote` can count as an external search when `recognizeExternalWebTools` is enabled and the receipt is recorded. The bundled `off` hook does not block this separate MCP entry.
-- **Neither connection shares the client's turn state with the gateway.** In both remote paths, a request carrying a client-only `turn_id` can fail with `Stale or unknown turn`; an unbound request can also be rejected if the gateway itself is in `required` mode. Status and mode queries describe the gateway, not the client's policy. Do not assume cross-host Jev, `required`, or `off` is equivalent to running both parts on one host. Leave the search-provider keys on the gateway.
+- **Neither connection shares the client's turn state with the gateway.** Client-side turn tracking and hooks use the client's local `mode-state.json`, while status and mode queries over a remote bridge describe the gateway rather than the client's policy. Do not assume cross-host Jev, `required`, or `off` is equivalent to running both parts on one host. Leave the search-provider keys on the gateway.
 
 ### MCP troubleshooting
 
@@ -227,7 +226,6 @@ Package exports: `kimi-code-web-search` (host API), `kimi-code-web-search/gatewa
 - **Tool renames vs. old sessions.** Kimi Code freezes a session's declared tool list at session start. If the plugin's tool names change (as they did in v0.4.0, `kimi-web-tools` → `web` (the repo is now `kimi-code-web-search`)), sessions opened *before* the change keep declaring the old names; models that call the new names can be rejected by strict upstream gateways that validate function names against the request's tool declarations. Start a new session after updating the plugin.
 - **Required mode needs the hooks loaded.** After installing/updating, run `/reload` or start a new session before relying on enforcement. Hooks fail open on execution errors.
 - **Stop-hook budget.** Kimi Code grants one continuation per turn; a second Stop always ends the turn. Failed research is reported as unverified, never silently retried forever.
-- **Platform sessions** (小红书 / X) depend on a local browser and can expire; log in again from the dashboard when needed.
 - **Receipt hooks are best-effort.** `PostToolUse` / `PostToolUseFailure` are observation-only in Kimi Code; external-tool recognition may occasionally miss a call.
 
 ## Development
@@ -238,8 +236,6 @@ npm run typecheck    # tsc --noEmit
 npm test             # node --test (Node >= 22.6)
 npm run build        # host (tsc) + client (esbuild)
 ```
-
-Browser-dependent tests (`browser-lifecycle`, `browser-session`) need a local Chrome/Chromium and are skipped in headless CI-style runs.
 
 ## License
 

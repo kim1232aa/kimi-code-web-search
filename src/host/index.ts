@@ -20,7 +20,7 @@ import type { SearchMode, VersionCheckView } from "../shared/api-types.ts";
 import { importFromPi } from "./pi-import.ts";
 import { buildPool, selectIndex, markUsed, markUnhealthy, resetHealth } from "./pool.ts";
 import { credRefOf, getProvider, PROVIDER_LIST, quotaOf } from "./providers/index.ts";
-import { seedBraveQuota, setBraveQuotaPersist } from "./providers/brave.ts";
+import { braveCacheKeyOf, seedBraveQuota, setBraveQuotaPersist } from "./providers/brave.ts";
 import { createQuotaPersistScheduler } from "./quota-persist.ts";
 import type { ProviderError } from "./providers/types.ts";
 import { isKeylessSelfHosted } from "./providers/types.ts";
@@ -47,8 +47,6 @@ import {
 } from "./custom-provider-schema.ts";
 import type { CustomProviderConfig, CustomSourceErrorCode, CustomSourceTestView, CustomProviderDraft } from "../shared/custom-provider-types.ts";
 
-import { extractSearchHints } from "./search-hints.ts";
-
 /** Cordis plugin name used by loader diagnostics. */
 export const name = "dsh-web-tools";
 
@@ -62,23 +60,11 @@ export const inject = ["webServer", "settings", "credentials", "web", "agents", 
  */
 export const Config = PluginConfig;
 
-const RELEASES_API = "https://api.github.com/repos/A3Boy/dsh-web-tools/releases/latest";
-const RELEASES_URL = "https://github.com/A3Boy/dsh-web-tools/releases";
+export const RELEASES_API = "https://api.github.com/repos/kim1232aa/kimi-code-web-search/releases/latest";
+export const RELEASES_URL = "https://github.com/kim1232aa/kimi-code-web-search/releases";
 const VERSION_CACHE_MS = 6 * 60 * 60 * 1000;
 let versionCache: { fetchedAt: number; value: VersionCheckView } | null = null;
 
-/**
- * Web engines must not receive raw platform routing markers ("X:", "小红书:").
- * `cleanQuery` also drops explicit `site:` operators, so those are re-attached.
- */
-function withoutPlatformMarker(query: string, hints: ReturnType<typeof extractSearchHints>): string {
-  if (!hints.platform || !hints.cleanQuery || hints.cleanQuery === hints.rawQuery) return query;
-  const operators = [
-    ...(hints.domains?.include ?? []).map((domain) => `site:${domain}`),
-    ...(hints.domains?.exclude ?? []).map((domain) => `-site:${domain}`),
-  ];
-  return [hints.cleanQuery, ...operators].join(" ");
-}
 /** Release lookup is best-effort: startup and settings must work offline. */
 async function checkVersion(): Promise<VersionCheckView> {
   if (versionCache && Date.now() - versionCache.fetchedAt < VERSION_CACHE_MS) return versionCache.value;
@@ -265,15 +251,11 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
 
   const generalFetchProvider = createFetchProvider(resolveRuntimeConfig, resolveKeys, undefined, poolStore, healthStore, undefined, resolveSnapshot);
 
-  // A provider override names a configured web engine. Platform routing
-  // markers ("小红书:", "X:") are stripped so engines never see them.
   const routedSearchProvider = {
     id: PROVIDER_ID,
     available: () => generalSearchProvider.available(),
-    search: async (request: { query: string; maxResults?: number; provider?: string }, signal?: AbortSignal) => {
-      const query = withoutPlatformMarker(request.query, extractSearchHints(request.query));
-      return generalSearchProvider.search({ ...request, query }, signal);
-    },
+    search: (request: { query: string; maxResults?: number; provider?: string }, signal?: AbortSignal) =>
+      generalSearchProvider.search(request, signal),
   };
   ctx.web.registerSearchProvider(routedSearchProvider as never);
 
@@ -288,6 +270,12 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
   async function testProviderSearch(providerName: string, query: string) {
     const adapter = getProvider(providerName);
     const started = Date.now();
+    const rawTimeout = readConfig().providerAttemptTimeoutMs;
+    const timeoutMs = typeof rawTimeout === "number" && Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 15_000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`test timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer.unref?.();
+    const signal = controller.signal;
     try {
       // Keyless self-hosted providers (SearXNG) work without any key.
       let key = "";
@@ -302,7 +290,7 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
         const entry = entries[index];
         key = (entry?.key ?? "").trim();
         try {
-          const outcome = await adapter.search(query, 1, key, readConfig().providerBaseUrls[providerName]);
+          const outcome = await adapter.search(query, 1, key, readConfig().providerBaseUrls[providerName], { signal });
           markUsed(entries, index);
           if (!entry.healthy) entry.healthy = true;
           const latencyMs = Date.now() - started;
@@ -314,12 +302,14 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
           };
         } catch (e) {
           // Same policy as the executor: only an auth failure indicts the key.
-          const err = toProviderError(e);
+          const err = signal.aborted
+            ? Object.assign(new Error(`provider timed out after ${timeoutMs}ms`), { code: "timeout" as const })
+            : toProviderError(e);
           if (err.code === "auth") markUnhealthy(entries, index);
           throw err;
         }
       }
-      const outcome = await adapter.search(query, 1, key, readConfig().providerBaseUrls[providerName]);
+      const outcome = await adapter.search(query, 1, key, readConfig().providerBaseUrls[providerName], { signal });
       const latencyMs = Date.now() - started;
       return {
         ok: true,
@@ -328,14 +318,15 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
         title: outcome.sources[0]?.title,
       };
     } catch (e) {
-      const err = toProviderError(e);
+      const err = signal.aborted
+        ? Object.assign(new Error(`provider timed out after ${timeoutMs}ms`), { code: "timeout" as const })
+        : toProviderError(e);
       return { ok: false, error: { code: err.code, message: err.message } };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
-  /** Run the REAL search path (default provider + fallback) for the card.
-   *  Delegates to the same provider used by agent web_search, so Test Search
-   *  never drifts from production behavior. */
   /** Run the REAL search path (default provider + fallback) for the card.
    *  Delegates to the same provider used by agent web_search, so Test Search
    *  never drifts from production behavior. Total latency measured here. */
@@ -456,9 +447,25 @@ export function apply(ctx: WebToolsContext, config?: unknown) {
     const cfg = readConfig();
     syncGlobalOutboundAuthorizations();
     const braveCache = cfg.braveQuotaCache ?? {};
-    braveQuotaPersist.seed(braveCache);
+    const cleanHashed: Record<string, QuotaSnapshot> = {};
+    const toMigrate = new Map<string, QuotaSnapshot>();
     for (const [key, snap] of Object.entries(braveCache)) {
-      if (key && snap && typeof snap === "object") seedBraveQuota(key, snap as QuotaSnapshot);
+      if (!key || !snap || typeof snap !== "object") continue;
+      const normalized = braveCacheKeyOf(key);
+      if (!normalized) continue;
+      seedBraveQuota(normalized, snap as QuotaSnapshot);
+      if (normalized === key) {
+        cleanHashed[normalized] = snap as QuotaSnapshot;
+      } else if (!Object.hasOwn(cleanHashed, normalized)) {
+        toMigrate.set(normalized, snap as QuotaSnapshot);
+      } else {
+        toMigrate.set(normalized, cleanHashed[normalized]);
+        delete cleanHashed[normalized];
+      }
+    }
+    braveQuotaPersist.seed(cleanHashed);
+    for (const [id, snap] of toMigrate) {
+      braveQuotaPersist.record(id, snap);
     }
   });
   // Coalesced: a settings write costs ~2.5s on DSH 0.1.7 (profile patch +

@@ -1,7 +1,7 @@
 {
   "name": "web",
   "version": "0.4.0",
-  "description": "Multi-provider web search, web fetch, social platform research (Xiaohongshu & X), per-session Search Mode policy, and standalone Web UI Dashboard for Kimi Code.",
+  "description": "Multi-provider web search, web fetch, per-session Search Mode policy, and standalone Web UI Dashboard for Kimi Code.",
   "keywords": [
     "web-search",
     "web-fetch",
@@ -11,8 +11,6 @@
     "firecrawl",
     "jina",
     "searxng",
-    "xiaohongshu",
-    "x",
     "mcp"
   ],
   "license": "MIT",
@@ -31,7 +29,7 @@
     {
       "event": "UserPromptSubmit",
       "command": "node ./hooks/user-prompt-submit.mjs",
-      "timeout": 10
+      "timeout": 15
     },
     {
       "event": "PreToolUse",
@@ -41,13 +39,13 @@
     },
     {
       "event": "PostToolUse",
-      "matcher": "(web|Web|search|Search|fetch|Fetch|url|URL|Url|scrape|Scrape|crawl|Crawl|extract|Extract|reader|Reader|browse|Browse|page|Page|source|Source|mcp|MCP|tavily|Tavily|firecrawl|Firecrawl|perplexity|Perplexity|jina|Jina|exa|Exa|serp|Serp|duckduckgo|DuckDuckGo|searxng|SearXNG|kagi|Kagi|linkup|Linkup|brave|Brave)",
+      "matcher": "(web|WEB|Web|search|SEARCH|Search|fetch|FETCH|Fetch|url|URL|Url|scrape|Scrape|crawl|Crawl|extract|Extract|reader|Reader|browse|Browse|page|Page|source|Source|mcp|MCP|tavily|Tavily|firecrawl|Firecrawl|perplexity|Perplexity|jina|Jina|exa|Exa|serp|Serp|duckduckgo|DuckDuckGo|ddg|DDG|Ddg|searxng|SearXNG|kagi|Kagi|linkup|Linkup|brave|Brave|research|Research|reason|Reason|(?:^|[^a-zA-Z])ask(?:$|[^a-z])|Ask(?:$|[^a-z]))",
       "command": "node ./hooks/post-tool-receipt.mjs",
       "timeout": 5
     },
     {
       "event": "PostToolUseFailure",
-      "matcher": "(web|Web|search|Search|fetch|Fetch|url|URL|Url|scrape|Scrape|crawl|Crawl|extract|Extract|reader|Reader|browse|Browse|page|Page|source|Source|mcp|MCP|tavily|Tavily|firecrawl|Firecrawl|perplexity|Perplexity|jina|Jina|exa|Exa|serp|Serp|duckduckgo|DuckDuckGo|searxng|SearXNG|kagi|Kagi|linkup|Linkup|brave|Brave)",
+      "matcher": "(web|WEB|Web|search|SEARCH|Search|fetch|FETCH|Fetch|url|URL|Url|scrape|Scrape|crawl|Crawl|extract|Extract|reader|Reader|browse|Browse|page|Page|source|Source|mcp|MCP|tavily|Tavily|firecrawl|Firecrawl|perplexity|Perplexity|jina|Jina|exa|Exa|serp|Serp|duckduckgo|DuckDuckGo|ddg|DDG|Ddg|searxng|SearXNG|kagi|Kagi|linkup|Linkup|brave|Brave|research|Research|reason|Reason|(?:^|[^a-zA-Z])ask(?:$|[^a-z])|Ask(?:$|[^a-z]))",
       "command": "node ./hooks/post-tool-receipt.mjs",
       "timeout": 5
     },

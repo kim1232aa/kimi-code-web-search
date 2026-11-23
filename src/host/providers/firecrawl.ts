@@ -9,7 +9,7 @@
  *
  * @module
  */
-import { providerError, throwIfHttp, resolveContext, type ProviderAdapter } from "./types.ts";
+import { providerError, throwIfHttp, resolveContext, safeHttpUrl, type ProviderAdapter } from "./types.ts";
 import { fetchWithProxy } from "../fetch-proxy.ts";
 import { endpointViewOf } from "../endpoints.ts";
 import type { FirecrawlProviderOptions } from "../../shared/provider-options.ts";
@@ -122,7 +122,7 @@ export const FirecrawlProvider: ProviderAdapter = {
             : [];
     const sources = results
       .map((r: Record<string, unknown>) => {
-        const url = typeof r?.url === "string" ? r.url : "";
+        const url = safeHttpUrl(r?.url);
         if (!url) return null;
         const s: { url: string; title?: string; snippet?: string; publishedAt?: string } = { url };
         if (typeof r.title === "string" && r.title) s.title = r.title;

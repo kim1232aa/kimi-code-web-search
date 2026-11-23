@@ -18,7 +18,15 @@
  */
 import { parseHTML } from "linkedom";
 import { Defuddle } from "defuddle/node";
-import { fetchWithProxy } from "./fetch-proxy.ts";
+import {
+  fetchWithProxy,
+  proxyFromEnv,
+  proxyFromSystem,
+  shouldBypassProxy,
+  withBodyLifetime,
+  destroySafely,
+} from "./fetch-proxy.ts";
+import { createPinnedDispatcher, defaultConnect } from "./provider-transport.ts";
 import {
   validateFetchUrl,
   validateFetchDns,
@@ -97,6 +105,20 @@ function classifyContentType(contentTypeHeader: string | null): "html" | "text" 
     return "html";
   }
 
+  // Explicitly unsupported formats MUST be checked before +xml / +json suffixes (e.g. image/svg+xml)
+  if (
+    mime.startsWith("image/") ||
+    mime.startsWith("audio/") ||
+    mime.startsWith("video/") ||
+    mime === "application/pdf" ||
+    mime === "application/zip" ||
+    mime === "application/octet-stream" ||
+    mime === "application/x-msdownload" ||
+    mime === "application/x-executable"
+  ) {
+    return "unsupported";
+  }
+
   if (
     mime === "text/plain" ||
     mime === "text/markdown" ||
@@ -109,20 +131,6 @@ function classifyContentType(contentTypeHeader: string | null): "html" | "text" 
     mime.endsWith("+xml")
   ) {
     return "text";
-  }
-
-  // Explicitly unsupported formats
-  if (
-    mime.startsWith("image/") ||
-    mime.startsWith("audio/") ||
-    mime.startsWith("video/") ||
-    mime === "application/pdf" ||
-    mime === "application/zip" ||
-    mime === "application/octet-stream" ||
-    mime === "application/x-msdownload" ||
-    mime === "application/x-executable"
-  ) {
-    return "unsupported";
   }
 
   return "unsupported";
@@ -149,6 +157,11 @@ async function readStreamBounded(
   try {
     while (true) {
       if (signal?.aborted) {
+        try {
+          await reader.cancel();
+        } catch {
+          // ignore cancel failure
+        }
         throw new GenericFetchError("WEB_ABORTED", "Fetch aborted by signal");
       }
       const { done, value } = await reader.read();
@@ -173,6 +186,13 @@ async function readStreamBounded(
         totalBytes += value.byteLength;
       }
     }
+  } catch (err) {
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore cancel failure
+    }
+    throw err;
   } finally {
     reader.releaseLock();
   }
@@ -204,7 +224,7 @@ export async function fetchGenericWebPage(
 
   const externalSignal = options.signal;
   const timeoutMs = options.timeoutMs ?? DEFAULT_GENERIC_FETCH_TIMEOUT_MS;
-  const customFetch = options.customFetchWithProxy ?? fetchWithProxy;
+  const customFetch = options.customFetchWithProxy ?? legacyCustomFetch;
   const customDnsLookup = options.customDnsLookup;
 
   // Setup abort controller with timeout budget
@@ -239,11 +259,13 @@ export async function fetchGenericWebPage(
   }
 
   try {
-    const validateAndResolveUrl = async (rawUrl: string): Promise<URL> => {
+    const validateAndResolveUrl = async (
+      rawUrl: string,
+    ): Promise<{ parsed: URL; addresses: Array<{ address: string; family: number }> }> => {
       try {
         const parsed = validateFetchUrl(rawUrl);
-        await validateFetchDns(parsed.hostname, customDnsLookup, controller.signal);
-        return parsed;
+        const addresses = await validateFetchDns(parsed.hostname, customDnsLookup, controller.signal);
+        return { parsed, addresses };
       } catch (err: unknown) {
         if (controller.signal.aborted) {
           throw new GenericFetchError(
@@ -259,7 +281,9 @@ export async function fetchGenericWebPage(
       }
     };
 
-    let currentParsedUrl = await validateAndResolveUrl(initialUrl);
+    const initialResolved = await validateAndResolveUrl(initialUrl);
+    let currentParsedUrl = initialResolved.parsed;
+    let currentAddresses = initialResolved.addresses;
     let currentUrl = currentParsedUrl.href;
     let hopCount = 0;
     let response: Response | undefined;
@@ -281,17 +305,54 @@ export async function fetchGenericWebPage(
         );
       }
 
+      const fetchInit: RequestInit = {
+        method: "GET",
+        headers: {
+          "User-Agent": DEFAULT_USER_AGENT,
+          Accept: "text/html,application/xhtml+xml,application/json,text/plain,text/markdown;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+        },
+        redirect: "manual",
+        signal: controller.signal,
+      };
+
       try {
-        response = await customFetch(currentUrl, {
-          method: "GET",
-          headers: {
-            "User-Agent": DEFAULT_USER_AGENT,
-            Accept: "text/html,application/xhtml+xml,application/json,text/plain,text/markdown;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-          },
-          redirect: "manual",
-          signal: controller.signal,
-        });
+        const proxyApplies =
+          !shouldBypassProxy(currentParsedUrl) && (proxyFromEnv() ?? proxyFromSystem()) !== undefined;
+        if (customFetch) {
+          response = await customFetch(currentUrl, fetchInit);
+        } else if (proxyApplies) {
+          response = await fetchWithProxy(currentUrl, fetchInit);
+        } else {
+          // Direct default fetch: pin socket to the pre-validated DNS address to eliminate TOCTOU DNS rebinding.
+          const port = currentParsedUrl.port
+            ? Number(currentParsedUrl.port)
+            : currentParsedUrl.protocol === "https:"
+              ? 443
+              : 80;
+          const servername = currentParsedUrl.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+          const pinnedDispatcher = await createPinnedDispatcher({
+            address: currentAddresses[0].address,
+            port,
+            servername,
+            useTls: currentParsedUrl.protocol === "https:",
+            connectTimeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, 10_000) : 10_000,
+            connect: defaultConnect,
+            signal: controller.signal,
+          });
+          try {
+            const rawResponse = await fetch(currentUrl, {
+              ...fetchInit,
+              dispatcher: pinnedDispatcher,
+            } as unknown as RequestInit);
+            response = withBodyLifetime(rawResponse, () => {
+              void destroySafely(pinnedDispatcher);
+            });
+          } catch (innerErr) {
+            await destroySafely(pinnedDispatcher);
+            throw innerErr;
+          }
+        }
       } catch (err: unknown) {
         if (controller.signal.aborted) {
           throw new GenericFetchError(
@@ -315,6 +376,7 @@ export async function fetchGenericWebPage(
         response.status === 308
       ) {
         const location = response.headers.get("location");
+        void response.body?.cancel?.().catch(() => {});
         if (!location) {
           throw new GenericFetchError("WEB_HTTP_ERROR", `Redirect status ${response.status} missing Location header`, {
             statusCode: response.status,
@@ -332,8 +394,9 @@ export async function fetchGenericWebPage(
 
         // Re-validate target URL and DNS for SSRF / loopback / private IP
         const validatedNext = await validateAndResolveUrl(nextUrl);
-        currentParsedUrl = validatedNext;
-        currentUrl = validatedNext.href;
+        currentParsedUrl = validatedNext.parsed;
+        currentAddresses = validatedNext.addresses;
+        currentUrl = currentParsedUrl.href;
 
         hopCount++;
         continue;
@@ -348,6 +411,7 @@ export async function fetchGenericWebPage(
 
     // Handle HTTP error status codes (4xx, 5xx)
     if (!response.ok) {
+      void response.body?.cancel?.().catch(() => {});
       throw new GenericFetchError(
         "WEB_HTTP_ERROR",
         `HTTP fetch failed with status ${response.status} (${response.statusText || "Error"})`,
@@ -359,6 +423,7 @@ export async function fetchGenericWebPage(
     const typeKind = classifyContentType(rawContentType);
 
     if (typeKind === "unsupported") {
+      void response.body?.cancel?.().catch(() => {});
       throw new GenericFetchError(
         "WEB_UNSUPPORTED_CONTENT_TYPE",
         `Unsupported Content-Type "${rawContentType || "unknown"}". Only HTML, text, markdown, json, and xml are supported.`,

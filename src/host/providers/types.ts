@@ -168,8 +168,8 @@ export function providerError(code: ProviderErrorCode, message: string, status?:
  *  - `Retry-After: Wed, 21 Oct 2026 07:28:00 GMT` (HTTP-date)
  * Returns undefined when the header is absent or unparseable.
  */
-export function parseRetryAfter(res: Response, now = Date.now()): number | undefined {
-  const raw = res.headers.get("retry-after");
+export function parseRetryAfter(res: { headers?: { get?: (name: string) => string | null } }, now = Date.now()): number | undefined {
+  const raw = res.headers?.get?.("retry-after");
   if (!raw) return undefined;
   const trimmed = raw.trim();
   // Try delta-seconds first
@@ -194,5 +194,20 @@ export function throwIfHttp(label: string, res: Response): void {
   if (res.ok) return;
   const code = classifyHttpStatus(res.status);
   const retryAfterMs = code === "rate-limit" ? parseRetryAfter(res) : undefined;
+  void res.body?.cancel?.().catch(() => {});
   throw providerError(code, `${label} failed (HTTP ${res.status}, ${code})`, res.status, retryAfterMs);
+}
+
+/** Accept only absolute http(s) URLs for search result links. */
+export function safeHttpUrl(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    return parsed.href;
+  } catch {
+    return undefined;
+  }
 }

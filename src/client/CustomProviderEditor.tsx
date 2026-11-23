@@ -112,7 +112,7 @@ export function CustomProviderEditor(props: CustomProviderEditorProps) {
     setError("");
     setValidationError(null);
     setAddToOrder(!isEditing);
-  }, [provider, isEditing]);
+  }, [open, provider, isEditing]);
 
   if (!open) return null;
 
@@ -296,6 +296,7 @@ export function CustomProviderEditor(props: CustomProviderEditorProps) {
 
         {/* Form Fields */}
         <CustomProviderFields
+          key={provider?.name ?? "__new__"}
           t={t}
           draft={draft}
           credentialValue={credentialValue}

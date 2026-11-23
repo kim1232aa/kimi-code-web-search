@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { DEFAULT_SETTINGS, validateWebToolsSettings, type WebToolsSettings } from "./config.ts";
 import type { SearchMode } from "../shared/api-types.ts";
 import type { TurnState } from "./search-mode-runtime.ts";
@@ -52,22 +53,52 @@ function isValidMode(val: unknown): val is SearchMode {
   return val === "auto" || val === "smart" || val === "required" || val === "off";
 }
 
+const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
+const WIN_RETRYABLE_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+function renameWithRetrySync(from: string, to: string): void {
+  const delaysMs = [10, 25, 50, 100];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      const retryable = code === "EBUSY" || (process.platform === "win32" && code !== undefined && WIN_RETRYABLE_RENAME_CODES.has(code));
+      if (retryable && attempt < delaysMs.length) {
+        Atomics.wait(waitBuffer, 0, 0, delaysMs[attempt]);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 function writeAtomicSync(filePath: string, content: string, mode?: number): void {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
-  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   const out = fs.openSync(tmpPath, "w", mode);
   try {
-    fs.writeFileSync(out, content, "utf8");
-    // Durability: fsync before rename so a crash cannot leave a truncated or
-    // empty file behind (rename alone only guarantees visibility).
-    fs.fsyncSync(out);
-  } finally {
-    fs.closeSync(out);
+    try {
+      fs.writeFileSync(out, content, "utf8");
+      // Durability: fsync before rename so a crash cannot leave a truncated or
+      // empty file behind (rename alone only guarantees visibility).
+      fs.fsyncSync(out);
+    } finally {
+      fs.closeSync(out);
+    }
+    renameWithRetrySync(tmpPath, filePath);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // Best-effort cleanup of temp file when write or rename fails
+    }
+    throw err;
   }
-  fs.renameSync(tmpPath, filePath);
   if (mode !== undefined) {
     try {
       fs.chmodSync(filePath, mode);
@@ -123,16 +154,45 @@ export class LocalStorage {
     }
   }
 
+  private readJsonObject(filePath: string): Record<string, unknown> | null {
+    let text: string;
+    try {
+      text = fs.readFileSync(filePath, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+        return null;
+      }
+      // Transient/permission read errors (EBUSY, EPERM, EACCES, EMFILE) must
+      // propagate untouched rather than backing up and erasing an intact file.
+      throw err;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        backupCorruptFile(filePath);
+        return null;
+      }
+      throw err;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      backupCorruptFile(filePath);
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  }
+
   // -------------------------------------------------------------------------
   // config.json
   // -------------------------------------------------------------------------
 
   readConfig(): WebToolsSettings {
-    if (!fs.existsSync(this.configPath)) {
+    const raw = this.readJsonObject(this.configPath);
+    if (raw === null) {
       return validateWebToolsSettings(DEFAULT_SETTINGS);
     }
     try {
-      const raw = JSON.parse(fs.readFileSync(this.configPath, "utf8"));
       return validateWebToolsSettings(raw);
     } catch {
       // A corrupt config must not be silently replaced by the next save;
@@ -154,28 +214,17 @@ export class LocalStorage {
   // -------------------------------------------------------------------------
 
   readAllCredentials(): Record<string, string> {
-    if (!fs.existsSync(this.credentialsPath)) {
+    const parsed = this.readJsonObject(this.credentialsPath);
+    if (parsed === null) {
       return {};
     }
-    try {
-      const parsed = JSON.parse(fs.readFileSync(this.credentialsPath, "utf8"));
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        // Structurally valid JSON but not a credential map: back it up too,
-        // otherwise the next setCredential write would erase it entirely.
-        backupCorruptFile(this.credentialsPath);
-        return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === "string" && v.length > 0) {
+        out[k] = v;
       }
-      const out: Record<string, string> = {};
-      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof v === "string" && v.length > 0) {
-          out[k] = v;
-        }
-      }
-      return out;
-    } catch {
-      backupCorruptFile(this.credentialsPath);
-      return {};
     }
+    return out;
   }
 
   writeAllCredentials(creds: Record<string, string>): void {

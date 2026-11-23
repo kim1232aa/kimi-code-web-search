@@ -9,7 +9,7 @@
  *
  * @module
  */
-import { providerError, classifyHttpStatus, resolveContext, parseRetryAfter, type ProviderAdapter } from "./types.ts";
+import { providerError, classifyHttpStatus, resolveContext, parseRetryAfter, safeHttpUrl, type ProviderAdapter } from "./types.ts";
 import { fetchWithProxy } from "../fetch-proxy.ts";
 import { endpointViewOf } from "../endpoints.ts";
 import type { ExaProviderOptions } from "../../shared/provider-options.ts";
@@ -105,7 +105,7 @@ async function throwExaError(res: Response): Promise<never> {
     tag = typeof body?.error?.tag === "string" ? body.error.tag : undefined;
     message = typeof body?.error?.message === "string" ? body.error.message : undefined;
   } catch {
-    // Non-JSON body — fall through to status-based classification.
+    if (!res.bodyUsed) void res.body?.cancel?.().catch(() => {});
   }
 
   // Retry-After header (seconds) — present on 429, sometimes on 503.
@@ -176,7 +176,7 @@ export const ExaProvider: ProviderAdapter = {
     const results = Array.isArray(raw?.results) ? raw.results : [];
     const sources = results
       .map((r: Record<string, unknown>) => {
-        const url = typeof r?.url === "string" ? r.url : "";
+        const url = safeHttpUrl(r?.url);
         if (!url) return null;
         const s: { url: string; title?: string; snippet?: string; publishedAt?: string } = { url };
         if (typeof r.title === "string" && r.title) s.title = r.title;

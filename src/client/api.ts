@@ -66,6 +66,7 @@ import type {
   CustomProviderDraft,
   CustomSourceTestView,
 } from "../shared/custom-provider-types.ts";
+import type { ProviderOptionView } from "../shared/provider-options.ts";
 
 export type {
   ConfigView,
@@ -92,6 +93,7 @@ export type {
   CustomSourceTestView,
   CustomSourceErrorCode,
 } from "../shared/custom-provider-types.ts";
+export type { ProviderOptionView } from "../shared/provider-options.ts";
 
 export const api = {
   configGet: () => call<ConfigView>("config/get"),
@@ -110,11 +112,11 @@ export const api = {
   searchModeGet: (sessionId: string) => call<SearchModeView>("search-mode/get", { sessionId }),
   searchModeSet: (sessionId: string, mode: SearchMode) => call<SearchModeView>("search-mode/set", { sessionId, mode }),
   providerOptionsSet: (provider: string, options: Record<string, unknown>) =>
-    call<{ saved: true; options: any }>("provider-options/set", { provider, options }),
+    call<ProviderOptionView>("provider-options/set", { provider, options }),
   providerOptionsReset: (provider: string) =>
-    call<{ reset: true; options: any }>("provider-options/reset", { provider }),
+    call<ProviderOptionView>("provider-options/reset", { provider }),
   providerOptionsBatch: (providers: Record<string, Record<string, unknown> | null>) =>
-    call<Record<string, any>>("provider-options/batch", { providers }),
+    call<Record<string, ProviderOptionView>>("provider-options/batch", { providers }),
   routingSet: (policy: SearchRoutingPolicy, orderedProviders: string[]) =>
     call<{ saved: true; policy: SearchRoutingPolicy; defaultProvider: string; fallbackOrder: string[] }>("routing/set", { policy, orderedProviders }),
   sourcesDescribe: () =>

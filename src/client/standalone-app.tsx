@@ -85,7 +85,9 @@ export function StandaloneApp() {
     activeLocale = init;
     return init;
   });
-  const [authState, setAuthState] = useState<"checking" | "authenticated" | "unauthenticated">("checking");
+  const [authState, setAuthState] = useState<"checking" | "authenticated" | "unauthenticated" | "error">("checking");
+  const [passwordConfigured, setPasswordConfigured] = useState(true);
+  const [authCheckNonce, setAuthCheckNonce] = useState(0);
   const [passwordInput, setPasswordInput] = useState("");
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSubmitting, setAuthSubmitting] = useState(false);
@@ -109,23 +111,36 @@ export function StandaloneApp() {
 
   useEffect(() => {
     let cancelled = false;
+    setAuthState("checking");
+    setAuthError(null);
     fetch("/web-tools/auth/session")
-      .then((res) => res.json())
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
       .then((data) => {
         if (cancelled) return;
-        if (data?.ok && data?.value?.authenticated) {
+        if (!data?.ok || !data?.value) {
+          setAuthError(data?.error?.message ?? null);
+          setAuthState("error");
+          return;
+        }
+        setPasswordConfigured(data.value.passwordConfigured !== false);
+        if (data.value.authenticated) {
           setAuthState("authenticated");
         } else {
           setAuthState("unauthenticated");
         }
       })
-      .catch(() => {
-        if (!cancelled) setAuthState("authenticated");
+      .catch((err) => {
+        if (cancelled) return;
+        setAuthError(err instanceof Error ? err.message : String(err));
+        setAuthState("error");
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [authCheckNonce]);
 
   useEffect(() => {
     if (authState !== "authenticated") return;
@@ -137,8 +152,8 @@ export function StandaloneApp() {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ action: "get", sessionId }),
         });
-        if (res.status === 401) {
-          if (!cancelled) setAuthState("unauthenticated");
+        if (res.status === 401 || res.status === 503) {
+          if (!cancelled) setAuthCheckNonce((n) => n + 1);
           return;
         }
         const data = await res.json();
@@ -228,6 +243,180 @@ export function StandaloneApp() {
     );
   }
 
+  if (authState === "error") {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: surface.bg, color: text.primary, padding: 20 }}>
+        <div
+          style={{
+            width: "100%",
+            maxWidth: 380,
+            background: surface.layer1,
+            border: `1px solid ${surface.border}`,
+            borderRadius: 12,
+            padding: 24,
+            display: "flex",
+            flexDirection: "column",
+            gap: 14,
+            boxShadow: "var(--dsw-shadow-lv3)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 7,
+                  background: "var(--dsw-alias-button-primary-fill)",
+                  color: "#fff",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontWeight: 700,
+                  fontSize: 13,
+                }}
+              >
+                K
+              </div>
+              <span style={{ fontSize: 15, fontWeight: 600 }}>Kimi Web Tools</span>
+            </div>
+            <button
+              type="button"
+              onClick={toggleTheme}
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 7,
+                border: `1px solid ${surface.border}`,
+                background: surface.layer2,
+                color: text.secondary,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                cursor: "pointer",
+                padding: 0,
+              }}
+            >
+              {theme === "light" ? <MoonIcon /> : <SunIcon />}
+            </button>
+          </div>
+          <div style={{ fontSize: 12, color: text.tertiary, lineHeight: "18px" }}>
+            {lang === "en"
+              ? "Unable to verify gateway session status. Check that the gateway is reachable and try again."
+              : "无法验证网关会话状态，请确认网关服务正常运行后重试。"}
+          </div>
+          {authError && (
+            <div style={{ fontSize: 12, color: "var(--dsw-alias-state-error-primary)" }}>
+              {authError}
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => setAuthCheckNonce((n) => n + 1)}
+            style={{
+              height: 36,
+              borderRadius: 8,
+              border: "none",
+              background: "var(--dsw-alias-button-primary-fill)",
+              color: "#fff",
+              fontSize: 13,
+              fontWeight: 500,
+              cursor: "pointer",
+            }}
+          >
+            {lang === "en" ? "Retry" : "重试"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (authState === "unauthenticated" && !passwordConfigured) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: surface.bg, color: text.primary, padding: 20 }}>
+        <div
+          style={{
+            width: "100%",
+            maxWidth: 420,
+            background: surface.layer1,
+            border: `1px solid ${surface.border}`,
+            borderRadius: 12,
+            padding: 24,
+            display: "flex",
+            flexDirection: "column",
+            gap: 14,
+            boxShadow: "var(--dsw-shadow-lv3)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 7,
+                  background: "var(--dsw-alias-button-primary-fill)",
+                  color: "#fff",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontWeight: 700,
+                  fontSize: 13,
+                }}
+              >
+                K
+              </div>
+              <span style={{ fontSize: 15, fontWeight: 600 }}>Kimi Web Tools</span>
+            </div>
+            <button
+              type="button"
+              onClick={toggleTheme}
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 7,
+                border: `1px solid ${surface.border}`,
+                background: surface.layer2,
+                color: text.secondary,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                cursor: "pointer",
+                padding: 0,
+              }}
+            >
+              {theme === "light" ? <MoonIcon /> : <SunIcon />}
+            </button>
+          </div>
+          <div style={{ fontSize: 13, fontWeight: 600, color: text.primary }}>
+            {lang === "en" ? "Gateway Password Not Configured" : "网关未配置访问密码"}
+          </div>
+          <div style={{ fontSize: 12, color: text.secondary, lineHeight: "19px" }}>
+            {lang === "en"
+              ? "Public dashboard access requires a gateway password. Set the KIMI_WEB_TOOLS_PASSWORD environment variable or create a public-password file under $KIMI_CODE_HOME/web-tools/ on the gateway host, then retry."
+              : "非本机访问仪表盘需先配置网关密码。请在网关主机设置环境变量 KIMI_WEB_TOOLS_PASSWORD 或创建 $KIMI_CODE_HOME/web-tools/public-password 文件，配置完成后点击重试。"}
+          </div>
+          <button
+            type="button"
+            onClick={() => setAuthCheckNonce((n) => n + 1)}
+            style={{
+              height: 36,
+              borderRadius: 8,
+              border: "none",
+              background: "var(--dsw-alias-button-primary-fill)",
+              color: "#fff",
+              fontSize: 13,
+              fontWeight: 500,
+              cursor: "pointer",
+            }}
+          >
+            {lang === "en" ? "Retry" : "重试"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (authState === "unauthenticated") {
     return (
       <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: surface.bg, color: text.primary, padding: 20 }}>
@@ -290,7 +479,7 @@ export function StandaloneApp() {
           <div style={{ fontSize: 12, color: text.tertiary, lineHeight: "18px" }}>
             {lang === "en"
               ? "Enter the gateway access password to configure search providers, API keys, and Search Mode."
-              : "请输入网关访问密码以管理搜索源 API Key、多 Key 轮询池、联网模式与社交平台登录。"}
+              : "请输入网关访问密码以管理搜索源 API Key、多 Key 轮询池与联网模式。"}
           </div>
           <input
             id="passwordInput"

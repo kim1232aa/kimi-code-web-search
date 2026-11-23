@@ -41,8 +41,15 @@ function readGatewayJson() {
   }
 }
 
+export function connectHostFor(host) {
+  const stripped = String(host || "127.0.0.1").trim().replace(/^\[|\]$/g, "");
+  const mapped = stripped === "0.0.0.0" ? "127.0.0.1" : stripped === "::" ? "::1" : stripped;
+  return mapped.includes(":") ? `[${mapped}]` : mapped;
+}
+
 async function checkGatewayHealth(host = DEFAULT_HOST, port = DEFAULT_PORT, timeoutMs = 1500) {
-  const url = `http://${host}:${port}/health`;
+  const connectHost = connectHostFor(host);
+  const url = `http://${connectHost}:${port}/health`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
@@ -55,7 +62,7 @@ async function checkGatewayHealth(host = DEFAULT_HOST, port = DEFAULT_PORT, time
         healthy: true,
         host,
         port,
-        url: `http://${host}:${port}`,
+        url: `http://${connectHost}:${port}`,
         version: json.value.version,
         pid: json.value.pid,
       };
@@ -78,7 +85,7 @@ function gatewayBuildPath() {
 
 export async function probeLocalGateway(host = DEFAULT_HOST, port = DEFAULT_PORT) {
   const saved = readGatewayJson();
-  return checkGatewayHealth(saved?.host || host, saved?.port || port);
+  return checkGatewayHealth(connectHostFor(saved?.host || host), saved?.port || port);
 }
 
 async function runForeground(host = DEFAULT_HOST, port = DEFAULT_PORT) {
@@ -117,15 +124,19 @@ async function runForeground(host = DEFAULT_HOST, port = DEFAULT_PORT) {
 
 function resolveNodeExecutable() {
   const name = process.platform === "win32" ? "node.exe" : "node";
+  const pathDirs = (process.env.PATH || "")
+    .split(path.delimiter)
+    .map((dir) => dir.trim().replace(/^"+|"+$/g, ""))
+    .filter(Boolean);
   const candidates = [
     ...(/^(node|nodejs)(\.exe)?$/i.test(path.basename(process.execPath)) ? [process.execPath] : []),
-    ...((process.env.PATH || "").split(path.delimiter).filter(Boolean).map(dir => path.join(dir, name))),
-    "/usr/bin/node", "/usr/local/bin/node",
+    ...pathDirs.map((dir) => path.join(dir, name)),
+    ...(process.platform === "win32" ? [] : ["/usr/bin/node", "/usr/local/bin/node"]),
   ];
   for (const candidate of candidates) {
     try {
       fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
+      if (fs.statSync(candidate).isFile()) return candidate;
     } catch (error) {
       if (!["ENOENT", "EACCES", "ENOTDIR"].includes(error.code)) throw error;
     }
@@ -159,6 +170,7 @@ export async function ensureGatewayDaemon(host = DEFAULT_HOST, port = DEFAULT_PO
     child = spawn(nodeExecutable, [fileURLToPath(import.meta.url), "--serve"], {
       cwd: PROJECT_ROOT,
       detached: true,
+      windowsHide: true,
       stdio: ["ignore", outFd, outFd],
       env: {
         ...process.env,
@@ -188,7 +200,7 @@ export async function ensureGatewayDaemon(host = DEFAULT_HOST, port = DEFAULT_PO
     }
   }
 
-  throw new Error(`Gateway daemon failed to become healthy on http://${host}:${port} within 8s; log: ${logPath}`);
+  throw new Error(`Gateway daemon failed to become healthy on http://${connectHostFor(host)}:${port} within 8s; log: ${logPath}`);
 }
 
 function removeGatewayJson() {
@@ -279,7 +291,7 @@ async function main() {
         {
           running: Boolean(health),
           pid: saved?.pid ?? null,
-          ...(health || { host: DEFAULT_HOST, port: DEFAULT_PORT, url: `http://${DEFAULT_HOST}:${DEFAULT_PORT}` }),
+          ...(health || { host: DEFAULT_HOST, port: DEFAULT_PORT, url: `http://${connectHostFor(DEFAULT_HOST)}:${DEFAULT_PORT}` }),
         },
         null,
         2,

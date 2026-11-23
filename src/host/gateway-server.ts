@@ -19,7 +19,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { apply } from "./index.ts";
 import {
@@ -218,11 +218,15 @@ function mcpToolText(name: string, value: unknown): string {
 }
 
 async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
-  let raw = "";
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
   for await (const chunk of req) {
-    raw += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
-    if (raw.length > 1_000_000) throw new Error("payload too large");
+    const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buf.byteLength;
+    if (totalBytes > 1_000_000) throw new Error("payload too large");
+    chunks.push(buf);
   }
+  const raw = Buffer.concat(chunks).toString("utf8");
   if (raw.trim() === "") return {};
   const parsed = JSON.parse(raw);
   return parsed && typeof parsed === "object" && !Array.isArray(parsed)
@@ -252,15 +256,16 @@ function contentTypeFor(filePath: string): string {
 }
 
 function safeEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a, "utf8");
-  const bufB = Buffer.from(b, "utf8");
-  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
+  const hashA = createHash("sha256").update(a, "utf8").digest();
+  const hashB = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(hashA, hashB);
 }
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 5;
 const LOGIN_LOCK_BASE_MS = 60_000;
 const LOGIN_LOCK_MAX_MS = 15 * 60_000;
+const MAX_LOGIN_FAILURE_ENTRIES = 2048;
 
 /**
  * Server-side session store: random, revocable tokens instead of a
@@ -270,7 +275,7 @@ const LOGIN_LOCK_MAX_MS = 15 * 60_000;
  */
 class GatewaySessions {
   private readonly tokens = new Map<string, number>();
-  private readonly failures = new Map<string, { count: number; lockedUntil: number }>();
+  private readonly failures = new Map<string, { count: number; lockedUntil: number; updatedAt: number }>();
 
   issue(): string {
     const now = Date.now();
@@ -297,20 +302,47 @@ class GatewaySessions {
     if (typeof token === "string" && token.length > 0) this.tokens.delete(token);
   }
 
+  private isFailureExpired(entry: { lockedUntil: number; updatedAt: number }, now: number): boolean {
+    return entry.lockedUntil > 0
+      ? now - entry.lockedUntil > LOGIN_LOCK_MAX_MS
+      : now - entry.updatedAt > LOGIN_LOCK_MAX_MS;
+  }
+
   /** Remaining lockout in ms for a client key; 0 when login is allowed. */
   lockoutRemainingMs(key: string): number {
     const entry = this.failures.get(key);
     if (!entry) return 0;
-    const remaining = entry.lockedUntil - Date.now();
-    return remaining > 0 ? remaining : 0;
+    const now = Date.now();
+    const remaining = entry.lockedUntil - now;
+    if (remaining > 0) return remaining;
+    if (this.isFailureExpired(entry, now)) {
+      this.failures.delete(key);
+    }
+    return 0;
   }
 
   recordFailure(key: string): void {
-    const entry = this.failures.get(key) ?? { count: 0, lockedUntil: 0 };
+    const now = Date.now();
+    const existing = this.failures.get(key);
+    if (existing) this.failures.delete(key);
+    const entry = existing && !this.isFailureExpired(existing, now)
+      ? existing
+      : { count: 0, lockedUntil: 0, updatedAt: now };
     entry.count += 1;
+    entry.updatedAt = now;
     if (entry.count >= LOGIN_MAX_FAILURES) {
       const exponent = Math.min(entry.count - LOGIN_MAX_FAILURES, 5);
-      entry.lockedUntil = Date.now() + Math.min(LOGIN_LOCK_BASE_MS * 2 ** exponent, LOGIN_LOCK_MAX_MS);
+      entry.lockedUntil = now + Math.min(LOGIN_LOCK_BASE_MS * 2 ** exponent, LOGIN_LOCK_MAX_MS);
+    }
+    if (this.failures.size >= MAX_LOGIN_FAILURE_ENTRIES) {
+      for (const [k, v] of this.failures) {
+        if (this.isFailureExpired(v, now)) this.failures.delete(k);
+      }
+      while (this.failures.size >= MAX_LOGIN_FAILURE_ENTRIES) {
+        const oldestKey = this.failures.keys().next().value;
+        if (oldestKey === undefined) break;
+        this.failures.delete(oldestKey);
+      }
     }
     this.failures.set(key, entry);
   }
@@ -324,10 +356,13 @@ class GatewaySessions {
 function loginRateKey(req: http.IncomingMessage): string {
   const peer = req.socket.remoteAddress ?? "unknown";
   if (peer === "127.0.0.1" || peer === "::1" || peer === "::ffff:127.0.0.1") {
-    const xff = req.headers["x-forwarded-for"];
-    const first = Array.isArray(xff) ? xff[0] : xff;
-    const client = typeof first === "string" ? first.split(",")[0].trim() : "";
-    if (client) return client;
+    const rawXff = req.headers["x-forwarded-for"];
+    const xffJoined = Array.isArray(rawXff) ? rawXff.join(",") : rawXff;
+    if (typeof xffJoined === "string") {
+      const parts = xffJoined.split(",").map((s) => s.trim()).filter(Boolean);
+      const client = parts[parts.length - 1];
+      if (client) return client;
+    }
   }
   return peer;
 }
@@ -373,6 +408,14 @@ function hasValidPasswordAuth(req: http.IncomingMessage, password: string, sessi
   }
   const cookies = parseCookies(req.headers.cookie);
   return sessions.isValid(cookies[AUTH_COOKIE_NAME]);
+}
+
+function optionalPositiveInteger(value: unknown): number | undefined {
+  try {
+    return positiveInteger(value, "turn_id");
+  } catch {
+    return undefined;
+  }
 }
 
 /** The session's current smart decision, falling back to the last recorded one after a turn reset. */
@@ -521,7 +564,8 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
   }
 
   async function usableSearchEngineNames(): Promise<string[]> {
-    const configView = (await callInternalApi("config/get")) as { providers?: Array<Record<string, unknown>> };
+    const configView = (await callInternalApi("config/get")) as { enabled?: boolean; providers?: Array<Record<string, unknown>> };
+    if (configView.enabled === false) return [];
     const names: string[] = [];
     for (const item of configView.providers ?? []) {
       if (!item || item.enabled === false) continue;
@@ -557,7 +601,8 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
     if (storage.getEffectiveSessionMode(sessionId) === "off") {
       throw new Error(WEB_DISABLED_DENIAL);
     }
-    const turnId = storage.bindToolTurn(sessionId, positiveInteger(args.turn_id ?? args.turnId, "turn_id"));
+    const rawTurnId = Object.hasOwn(args, "turn_id") ? args.turn_id : args.turnId;
+    const turnId = storage.bindToolTurn(sessionId, optionalPositiveInteger(rawTurnId));
     if (name === "web_search") {
       const query = typeof args.query === "string" ? args.query.trim() : "";
       if (!query) throw new Error("query is required");
@@ -598,7 +643,13 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
 
   const server = http.createServer(async (req, res) => {
     try {
-      const parsedUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
+      } catch {
+        writeJson(res, 400, { ok: false, error: { code: "bad-request", message: "Malformed request URL or Host header" } });
+        return;
+      }
       const pathname = parsedUrl.pathname;
       const wtReq = req as unknown as WebToolsHttpRequest;
 
@@ -736,7 +787,10 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
         }
         gatewaySessions.recordSuccess(rateKey);
         const token = gatewaySessions.issue();
-        const isHttps = req.headers["x-forwarded-proto"] === "https";
+        const rawXfp = req.headers["x-forwarded-proto"];
+        const xfpStr = Array.isArray(rawXfp) ? rawXfp[0] : rawXfp;
+        const forwardedProto = typeof xfpStr === "string" ? (xfpStr.split(",")[0] ?? "").trim().toLowerCase() : "";
+        const isHttps = forwardedProto === "https";
         const cookie = `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${isHttps ? "; Secure" : ""}`;
         writeJson(res, 200, { ok: true, value: { authenticated: true } }, { "set-cookie": cookie });
         return;
@@ -801,7 +855,20 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
       // 4. Internal MCP Execution Endpoints (`/web-tools/mcp/*`)
       if (pathname.startsWith("/web-tools/mcp/")) {
         const mcpAction = pathname.slice("/web-tools/mcp/".length);
-        const payload = req.method === "POST" ? await readJsonBody(req) : {};
+        let payload: Record<string, unknown> = {};
+        if (req.method === "POST") {
+          try {
+            payload = await readJsonBody(req);
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : "Invalid JSON body";
+            const isTooLarge = msg === "payload too large";
+            writeJson(res, isTooLarge ? 413 : 400, {
+              ok: false,
+              error: { code: isTooLarge ? "payload-too-large" : "bad-request", message: msg },
+            });
+            return;
+          }
+        }
         if (mcpAction === "search" || mcpAction === "fetch") {
           try {
             const sessionId = typeof payload.sessionId === "string" && payload.sessionId.trim() ? payload.sessionId.trim() : "global";
@@ -810,7 +877,8 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
               return;
             }
             payload.sessionId = sessionId;
-            payload.turnId = storage.bindToolTurn(sessionId, positiveInteger(payload.turnId, "turn_id"));
+            const rawTurnId = Object.hasOwn(payload, "turnId") ? payload.turnId : payload.turn_id;
+            payload.turnId = storage.bindToolTurn(sessionId, optionalPositiveInteger(rawTurnId));
             if (mcpAction === "search") payload.maxResults = positiveInteger(payload.maxResults, "max_results", 20) ?? 8;
           } catch (error) {
             writeJson(res, 400, { ok: false, error: { code: "bad-request", message: error instanceof Error ? error.message : String(error) } });
@@ -1112,6 +1180,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
       }
       await new Promise<void>((resolve) => {
         server.close(() => resolve());
+        server.closeAllConnections?.();
       });
     },
   };

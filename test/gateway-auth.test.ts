@@ -5,6 +5,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -115,4 +116,115 @@ test("login issues a revocable session cookie", async (t) => {
 
   const revoked = await post(`${handle.url}/web-tools/api/config/get`, {}, { cookie: sessionCookie });
   assert.equal(revoked.status, 401, "logout must actually revoke the session token");
+});
+
+function rawHttpRequest(
+  port: number,
+  options: { method?: string; path: string; headers?: Record<string, string>; chunks?: Buffer[] },
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: "127.0.0.1", port, method: options.method ?? "GET", path: options.path, headers: options.headers },
+      (res) => {
+        const out: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => out.push(chunk));
+        res.on("end", () => {
+          resolve({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(out).toString("utf8") });
+        });
+      },
+    );
+    req.on("error", reject);
+    for (const chunk of options.chunks ?? []) {
+      req.write(chunk);
+    }
+    req.end();
+  });
+}
+
+test("malformed Host returns 400 and /web-tools/mcp/* handles bad JSON, >1MB payloads, split UTF-8, and GET mode", async (t) => {
+  const handle = await authGateway(t);
+  const auth = { authorization: `Bearer ${PASSWORD}` };
+
+  const badHost = await rawHttpRequest(handle.port, { path: "/health", headers: { host: "bad host" } });
+  assert.equal(badHost.status, 400);
+
+  const rawBadJson = await rawHttpRequest(handle.port, {
+    method: "POST",
+    path: "/web-tools/mcp/search",
+    headers: { ...auth, "content-type": "application/json" },
+    chunks: [Buffer.from("{broken", "utf8")],
+  });
+  assert.equal(rawBadJson.status, 400);
+
+  const oversized = await rawHttpRequest(handle.port, {
+    method: "POST",
+    path: "/web-tools/mcp/search",
+    headers: { ...auth, "content-type": "application/json" },
+    chunks: [Buffer.alloc(1_000_001, 0x61)],
+  });
+  assert.equal(oversized.status, 413);
+
+  const getMode = await fetch(`${handle.url}/web-tools/mcp/mode`, { headers: auth });
+  assert.equal(getMode.status, 200);
+
+  // Split a 3-byte UTF-8 character across two chunks.
+  const payload = Buffer.from('{"action":"get","sessionId":"中文会话"}', "utf8");
+  const splitIdx = payload.indexOf(0xe4) + 1;
+  const splitRes = await rawHttpRequest(handle.port, {
+    method: "POST",
+    path: "/web-tools/mcp/mode",
+    headers: { ...auth, "content-type": "application/json" },
+    chunks: [payload.subarray(0, splitIdx), payload.subarray(splitIdx)],
+  });
+  assert.equal(splitRes.status, 200);
+  const splitJson = JSON.parse(splitRes.body) as { value: { sessionId: string } };
+  assert.equal(splitJson.value.sessionId, "中文会话");
+});
+
+test("login rate-limits on rightmost X-Forwarded-For IP and normalizes X-Forwarded-Proto for Secure cookie", async (t) => {
+  const handle = await authGateway(t);
+  for (let i = 0; i < 5; i++) {
+    const bad = await post(`${handle.url}/web-tools/auth/login`, { password: "wrong" }, {
+      "x-forwarded-for": `spoof-${i}, 203.0.113.10`,
+    });
+    assert.equal(bad.status, 401);
+  }
+  const locked = await post(`${handle.url}/web-tools/auth/login`, { password: PASSWORD }, {
+    "x-forwarded-for": "another-spoof, 203.0.113.10",
+  });
+  assert.equal(locked.status, 429, "lockout key must use rightmost X-Forwarded-For IP");
+
+  const okOtherIp = await post(`${handle.url}/web-tools/auth/login`, { password: PASSWORD }, {
+    "x-forwarded-for": "spoof-0, 203.0.113.11",
+    "x-forwarded-proto": "HTTPS, http",
+  });
+  assert.equal(okOtherIp.status, 200);
+  assert.match(okOtherIp.headers.get("set-cookie") ?? "", /;\s*Secure\b/);
+});
+
+test("web_status returns usable: [] when globally disabled and handle.close() drains keep-alive quickly", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-wt-auth-close-"));
+  const handle = await startGatewayServer({ host: "127.0.0.1", port: 0, baseDir, projectRoot: ROOT, password: PASSWORD });
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+
+  handle.storage.writeConfig({ enabled: false });
+  handle.storage.setCredential("WEB_TOOLS_EXA", "exa-key-123");
+  const statusRes = await post(`${handle.url}/web-tools/mcp/status`, {}, { authorization: `Bearer ${PASSWORD}` });
+  assert.equal(statusRes.status, 200);
+  const statusJson = (await statusRes.json()) as { value: { usable: string[] } };
+  assert.deepEqual(statusJson.value.usable, []);
+
+  // Open an idle keep-alive socket and verify close() does not wait 5s.
+  const agent = new http.Agent({ keepAlive: true });
+  await new Promise<void>((resolve, reject) => {
+    const req = http.get({ host: "127.0.0.1", port: handle.port, path: "/health", agent }, (res) => {
+      res.resume();
+      res.on("end", resolve);
+    });
+    req.on("error", reject);
+  });
+  const started = Date.now();
+  await handle.close();
+  agent.destroy();
+  assert.ok(Date.now() - started < 1500, "handle.close() should close keep-alive connections promptly");
 });

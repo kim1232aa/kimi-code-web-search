@@ -29,7 +29,16 @@ import {
   type TransportRequest,
   type TransportResponse,
 } from "../provider-transport.ts";
-import { providerError, resolveContext, type ProviderAdapter, type SearchOutcome, type Source } from "./types.ts";
+import {
+  classifyHttpStatus,
+  parseRetryAfter,
+  providerError,
+  resolveContext,
+  safeHttpUrl,
+  type ProviderAdapter,
+  type SearchOutcome,
+  type Source,
+} from "./types.ts";
 import {
   PROTOCOL_DEFAULTS,
   type CustomProviderConfig,
@@ -388,18 +397,7 @@ function readString(root: unknown, segments: readonly (string | number)[]): stri
 }
 
 /** Accept only absolute http(s) result URLs. */
-export function normalizeResultUrl(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  if (trimmed === "") return undefined;
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
-    return parsed.href;
-  } catch {
-    return undefined;
-  }
-}
+export const normalizeResultUrl = safeHttpUrl;
 
 // ---------------------------------------------------------------------------
 // adapter factory
@@ -446,17 +444,22 @@ export function createCustomAdapter(config: CustomProviderConfig, deps: CustomAd
         asProviderError(err, label);
       }
 
-      if (response.status === 401 || response.status === 403) {
-        throw providerError("auth", `${label}: rejected the credential (HTTP ${response.status})`, response.status);
-      }
-      if (response.status === 429) {
-        throw providerError("rate-limit", `${label}: rate limited (HTTP 429)`, 429);
-      }
-      if (response.status >= 500) {
-        throw providerError("server", `${label}: server error (HTTP ${response.status})`, response.status);
-      }
       if (!response.ok) {
-        throw providerError("bad-request", `${label}: request failed (HTTP ${response.status})`, response.status);
+        const code = classifyHttpStatus(response.status);
+        const retryAfterMs = code === "rate-limit" ? parseRetryAfter(response) : undefined;
+        const message =
+          code === "auth"
+            ? `${label}: rejected the credential (HTTP ${response.status})`
+            : code === "quota"
+              ? `${label}: quota or credits exhausted (HTTP ${response.status})`
+              : code === "timeout"
+                ? `${label}: request timed out (HTTP ${response.status})`
+                : code === "rate-limit"
+                  ? `${label}: rate limited (HTTP 429)`
+                  : code === "server"
+                    ? `${label}: server error (HTTP ${response.status})`
+                    : `${label}: request failed (HTTP ${response.status})`;
+        throw providerError(code, message, response.status, retryAfterMs);
       }
       if (response.truncated) {
         throw providerError(

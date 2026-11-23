@@ -16,6 +16,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import * as esbuild from "esbuild";
 import React from "react";
 import { ICON_ALIASES, NULL_ICON, resolveIcon, type IconAliasSpec } from "../src/client/compat-icons.ts";
 
@@ -89,19 +94,52 @@ test("an unknown future rename degrades to a null renderer, never to undefined",
 });
 
 test("standalone primitives & icons.ts resolve all 10 icons from stroke-suffixed artwork", async () => {
-  const primitives = await import("../lib/client/primitives.js");
-  const icons = await import("../lib/client/icons.js");
+  const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const outdir = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-web-icons-"));
+  try {
+    fs.writeFileSync(path.join(outdir, "package.json"), JSON.stringify({ type: "module" }));
+    await esbuild.build({
+      entryPoints: [
+        path.join(rootDir, "src/client/primitives.tsx"),
+        path.join(rootDir, "src/client/icons.ts"),
+        path.join(rootDir, "src/client/compat-icons.ts"),
+      ],
+      outdir,
+      bundle: true,
+      splitting: true,
+      format: "esm",
+      platform: "node",
+      target: "node22",
+      jsx: "automatic",
+      plugins: [
+        {
+          name: "resolve-bare-react",
+          setup(build) {
+            build.onResolve({ filter: /^react(\/.*)?$/ }, (args) => ({
+              path: import.meta.resolve(args.path),
+              external: true,
+            }));
+          },
+        },
+      ],
+    });
+    const primitives = await import(pathToFileURL(path.join(outdir, "primitives.js")).href);
+    const icons = await import(pathToFileURL(path.join(outdir, "icons.js")).href);
+    const compat = await import(pathToFileURL(path.join(outdir, "compat-icons.js")).href);
 
-  for (const [legacyName, artworkName, nominalSize] of ICON_ALIASES) {
-    assert.equal(
-      typeof (primitives as Record<string, unknown>)[artworkName],
-      "function",
-      `primitives.tsx must export ${artworkName}`,
-    );
-    const Resolved = (icons as Record<string, unknown>)[legacyName] as React.ComponentType<any>;
-    assert.equal(typeof Resolved, "function", `icons.ts must export ${legacyName}`);
-    assert.notEqual(Resolved, NULL_ICON, `${legacyName} must not fall back to NULL_ICON`);
-    const el = (Resolved as any)({}) as React.ReactElement<any>;
-    assert.equal(el.props.size, nominalSize, `${legacyName} must carry nominal size ${nominalSize}`);
+    for (const [legacyName, artworkName, nominalSize] of ICON_ALIASES) {
+      assert.equal(
+        typeof (primitives as Record<string, unknown>)[artworkName],
+        "function",
+        `primitives.tsx must export ${artworkName}`,
+      );
+      const Resolved = (icons as Record<string, unknown>)[legacyName] as React.ComponentType<any>;
+      assert.equal(typeof Resolved, "function", `icons.ts must export ${legacyName}`);
+      assert.notEqual(Resolved, compat.NULL_ICON, `${legacyName} must not fall back to NULL_ICON`);
+      const el = (Resolved as any)({}) as React.ReactElement<any>;
+      assert.equal(el.props.size, nominalSize, `${legacyName} must carry nominal size ${nominalSize}`);
+    }
+  } finally {
+    fs.rmSync(outdir, { recursive: true, force: true });
   }
 });

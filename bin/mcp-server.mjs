@@ -5,8 +5,8 @@
  * Implements MCP protocol over stdin/stdout:
  *  - Connects to a configured remote gateway or starts the local daemon for search and fetch only.
  *  - Exposes 4 tools:
- *    1. `web_search` — Multi-provider web & social platform (Xiaohongshu / X) search
- *    2. `web_fetch`  — Full-page & social post/comment content extraction
+ *    1. `web_search` — Multi-provider web search
+ *    2. `web_fetch`  — Full-page content extraction
  *    3. `web_mode`   — View or switch Search Mode (`auto`, `smart`, `required`, `off`)
  *    4. `web_status` — List search engines that can actually run a query
  */
@@ -22,18 +22,25 @@ function requestSessionId(value) {
   return typeof value === "string" && value.trim() ? value.trim() : "global";
 }
 
+function optionalPositiveInteger(value) {
+  try {
+    return positiveInteger(value, "turn_id");
+  } catch {
+    return undefined;
+  }
+}
+
 const TOOLS = [
   {
     name: "web_search",
     description:
-      "Search the web or social platforms (Xiaohongshu / X) through the configured multi-provider routing chain (Exa, Tavily, Brave, You.com, Firecrawl, Parallel, Jina, Keenable, SearXNG, custom sources). To target Xiaohongshu or X directly, prefix the query with `小红书:` or `X:`.",
+      "Search the web through the configured multi-provider routing chain (Exa, Tavily, Brave, You.com, Firecrawl, Parallel, Jina, Keenable, SearXNG, custom sources).",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description:
-            "Search query string. Use `小红书: <topic>` or `X: <topic>` to route directly to Xiaohongshu or Twitter/X.",
+          description: "Search query string.",
         },
         max_results: {
           type: ["integer", "string"],
@@ -63,8 +70,7 @@ const TOOLS = [
   },
   {
     name: "web_fetch",
-    description:
-      "Fetch and extract clean readable text/Markdown from a web URL, or extract full post details and comments from a Xiaohongshu / Twitter(X) URL.",
+    description: "Fetch and extract clean readable text/Markdown from a web URL.",
     inputSchema: {
       type: "object",
       properties: {
@@ -143,7 +149,14 @@ function configuredGateway() {
   if (!["http:", "https:"].includes(url.protocol)) {
     throw new Error("KIMI_WEB_TOOLS_GATEWAY_URL must be an http(s) URL");
   }
-  return { url: url.origin, token: process.env.KIMI_WEB_TOOLS_GATEWAY_TOKEN?.trim() || "" };
+  if (url.username || url.password) {
+    throw new Error("KIMI_WEB_TOOLS_GATEWAY_URL must not embed credentials");
+  }
+  if (url.search || url.hash) {
+    throw new Error("KIMI_WEB_TOOLS_GATEWAY_URL must not contain a query string or fragment");
+  }
+  const basePath = url.pathname.replace(/\/+$/, "").replace(/\/mcp$/, "");
+  return { url: `${url.origin}${basePath}`, token: process.env.KIMI_WEB_TOOLS_GATEWAY_TOKEN?.trim() || "" };
 }
 
 async function callGatewayMcp(endpoint, payload, timeoutMs = 90_000) {
@@ -222,7 +235,7 @@ function formatModeOutput(value) {
   const modeNames = {
     auto: "auto (智能联网 — model decides when to search)",
     smart: "smart (Jev 判定 — Jev classifier decides per turn whether lookup is required)",
-    required: "required (始终联网 — at least one web_search or web_fetch required per turn)",
+    required: "required (始终联网 — at least one web_search required per turn)",
     off: "off (关闭联网 — web tools disabled and blocked)",
   };
   return [
@@ -243,7 +256,7 @@ async function runTool(params) {
   const sessionId = requestSessionId(args.session_id ?? args.sessionId);
   try {
     const rawTurnId = Object.hasOwn(args, "turn_id") ? args.turn_id : args.turnId;
-    const turnId = positiveInteger(rawTurnId, "turn_id");
+    const turnId = optionalPositiveInteger(rawTurnId);
     if (name === "web_search") {
       const query = typeof args.query === "string" ? args.query.trim() : "";
       if (!query) throw new Error("Missing required argument: query");
@@ -317,8 +330,22 @@ function send(message) {
 }
 
 async function dispatch(message) {
-  if (message?.jsonrpc !== "2.0" || message.id === undefined || message.id === null) return;
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    send({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } });
+    return;
+  }
+  if (message.jsonrpc !== "2.0") {
+    if (message.id !== undefined) {
+      send({ jsonrpc: "2.0", id: message.id, error: { code: -32600, message: "Invalid Request" } });
+    }
+    return;
+  }
+  if (message.id === undefined || message.id === null) return;
   const id = message.id;
+  if (typeof message.method !== "string") {
+    send({ jsonrpc: "2.0", id, error: { code: -32600, message: "Invalid Request" } });
+    return;
+  }
   try {
     const result = await handleRequest(message);
     send({ jsonrpc: "2.0", id, result: result ?? {} });
@@ -335,6 +362,7 @@ async function dispatch(message) {
 }
 
 function start() {
+  process.stdin.on("error", () => {});
   // The host can close our stdout mid-shutdown while a response is still in
   // flight; a lost pipe is a normal exit, not an unhandled crash.
   process.stdout.on("error", (err) => {

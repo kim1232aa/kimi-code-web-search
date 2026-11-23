@@ -313,4 +313,79 @@ describe("generic-fetch: Defuddle & linkedom extraction", () => {
     assert.equal(res.truncated, true);
     assert.equal(res.content.length, MAX_FETCH_BYTES);
   });
+
+  it("rejects image/svg+xml as unsupported and cancels response bodies on redirect, error, and unsupported type", async () => {
+    const mockDnsLookup = async () => [{ address: "93.184.216.34", family: 4 }];
+    let cancelledCount = 0;
+    const makeResponse = (status: number, headers: Record<string, string>) => {
+      const stream = new ReadableStream({
+        cancel() {
+          cancelledCount += 1;
+        },
+        start(c) {
+          c.enqueue(new TextEncoder().encode("<svg/>"));
+        },
+      });
+      return new Response(stream, { status, headers });
+    };
+
+    // 1. image/svg+xml rejected & cancelled
+    await assert.rejects(
+      () =>
+        fetchGenericWebPage("https://example.com/icon.svg", {
+          customFetchWithProxy: (async () => makeResponse(200, { "Content-Type": "image/svg+xml" })) as any,
+          customDnsLookup: mockDnsLookup,
+        }),
+      (err: unknown) => err instanceof GenericFetchError && err.code === "WEB_UNSUPPORTED_CONTENT_TYPE",
+    );
+    assert.equal(cancelledCount, 1);
+
+    // 2. 404 error body cancelled
+    await assert.rejects(
+      () =>
+        fetchGenericWebPage("https://example.com/missing", {
+          customFetchWithProxy: (async () => makeResponse(404, { "Content-Type": "text/plain" })) as any,
+          customDnsLookup: mockDnsLookup,
+        }),
+      (err: unknown) => err instanceof GenericFetchError && err.code === "WEB_HTTP_ERROR",
+    );
+    assert.equal(cancelledCount, 2);
+
+    // 3. 302 redirect body cancelled before following
+    let hop = 0;
+    const res = await fetchGenericWebPage("https://example.com/redir", {
+      customFetchWithProxy: (async () => {
+        hop += 1;
+        if (hop === 1) return makeResponse(302, { Location: "https://example.com/ok" });
+        return new Response("hello world", { status: 200, headers: { "Content-Type": "text/plain" } });
+      }) as any,
+      customDnsLookup: mockDnsLookup,
+    });
+    assert.equal(res.content, "hello world");
+    assert.equal(cancelledCount, 3);
+  });
+
+  it("direct default fetch pins resolved DNS IP via dispatcher when no proxy applies", async () => {
+    const savedProxy = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"].map((k) => [k, process.env[k]] as const);
+    for (const [k] of savedProxy) delete process.env[k];
+    const origFetch = globalThis.fetch;
+    let capturedDispatcher: unknown;
+    globalThis.fetch = (async (_url: string | URL, init?: RequestInit & { dispatcher?: unknown }) => {
+      capturedDispatcher = init?.dispatcher;
+      return new Response("pinned ok", { status: 200, headers: { "Content-Type": "text/plain" } });
+    }) as typeof globalThis.fetch;
+    try {
+      const res = await fetchGenericWebPage("https://example.com/pinned", {
+        customDnsLookup: async () => [{ address: "93.184.216.34", family: 4 }],
+      });
+      assert.equal(res.content, "pinned ok");
+      assert.ok(capturedDispatcher, "direct default fetch must attach a pinned dispatcher");
+    } finally {
+      globalThis.fetch = origFetch;
+      for (const [k, v] of savedProxy) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
 });

@@ -1,7 +1,7 @@
 {
   "name": "kimi-code-web-search",
   "version": "0.4.0",
-  "description": "Multi-provider web search, web fetch, and social platform research plugin & standalone gateway for Kimi Code",
+  "description": "Multi-provider web search and web fetch plugin & standalone gateway for Kimi Code",
   "type": "module",
   "license": "MIT",
   "main": "./lib/host/index.js",
@@ -16,9 +16,9 @@
     "kimi-code-web-search-import-pi": "./bin/import-pi.mjs"
   },
   "scripts": {
-    "build:host": "tsc -p tsconfig.build.json",
+    "build:host": "node -e \"import('node:fs').then((fs) => fs.rmSync('lib', { recursive: true, force: true }))\" && tsc -p tsconfig.build.json",
     "build:client": "node build-client.mjs",
-    "build": "tsc -p tsconfig.build.json && node build-client.mjs",
+    "build": "npm run build:host && npm run build:client",
     "package:plugin": "npm run build && python3 scripts/package-plugin.py",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.ts test/*.test.mjs test/*.smoke.mjs"
@@ -26,16 +26,14 @@
   "dependencies": {
     "defuddle": "^0.19.6",
     "linkedom": "^0.18.9",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "undici": "^7.5.0",
-    "ws": "^8.18.1"
+    "undici": "^7.5.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
     "@types/react": "^19.0.10",
-    "@types/ws": "^8.18.0",
     "esbuild": "^0.25.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
     "typescript": "^5.8.2"
   }
 }

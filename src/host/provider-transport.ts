@@ -34,7 +34,7 @@ import { isIP } from "node:net";
 import { lookup as dnsLookup } from "node:dns";
 import { connect as netConnect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
-import { isPrivateOrRestrictedIp } from "./fetch-security.ts";
+import { isPrivateOrRestrictedIp, parseIpv6Words } from "./fetch-security.ts";
 
 // ---------------------------------------------------------------------------
 // classification
@@ -275,54 +275,48 @@ export async function resolvesToPrivateIp(
 export function isCloudMetadataOrLinkLocal(address: string): boolean {
   const clean = address.toLowerCase().replace(/^\[|\]$/g, "");
 
-  // 1. IPv4-mapped IPv6: unmap to standard IPv4 or check hex words
-  if (clean.startsWith("::ffff:") || clean.startsWith("0:0:0:0:0:ffff:")) {
-    const tail = clean.split("ffff:").pop() ?? "";
-    if (tail.includes(".")) {
-      // Dotted-decimal, e.g. ::ffff:169.254.169.254
-      const parts = tail.split(".").map((p) => Number.parseInt(p, 10));
-      if (parts.length === 4 && parts[0] === 169 && parts[1] === 254) {
+  // 1. Direct IPv4 Link-Local & Cloud Metadata (169.254.0.0/16)
+  if (isIP(clean) === 4) {
+    const parts = clean.split(".").map((p) => Number.parseInt(p, 10));
+    return parts[0] === 169 && parts[1] === 254;
+  }
+
+  // 2. IPv6 forms (parsed across compressed/uncompressed/embedded IPv4 representations)
+  if (clean.includes(":")) {
+    const words = parseIpv6Words(clean);
+    if (words) {
+      const [w0, w1, w2, w3, w4, w5, w6, w7] = words;
+      const first96Zero = w0 === 0 && w1 === 0 && w2 === 0 && w3 === 0 && w4 === 0;
+      const is169254 = (hiWord: number) => ((hiWord >> 8) & 0xff) === 169 && (hiWord & 0xff) === 254;
+
+      // IPv4-mapped (::ffff:169.254.x.x) or IPv4-compatible (::169.254.x.x)
+      if (first96Zero && (w5 === 0xffff || w5 === 0) && is169254(w6)) {
         return true;
       }
-    } else {
-      // Hex form, e.g. ::ffff:a9fe:a9fe or ::ffff:a9fe:1
-      const hexParts = tail.split(":");
-      if (hexParts.length >= 1) {
-        const firstHex = Number.parseInt(hexParts[0], 16);
-        // 169.254 in hex is 0xa9fe (169 = 0xa9, 254 = 0xfe)
-        if (firstHex === 0xa9fe) {
-          return true;
-        }
+      // NAT64 (64:ff9b::169.254.x.x / 64:ff9b:1::169.254.x.x)
+      if (w0 === 0x0064 && w1 === 0xff9b && ((w2 === 0 && w3 === 0 && w4 === 0 && w5 === 0) || w2 === 0x0001) && is169254(w6)) {
+        return true;
       }
+      // 6to4 (2002:a9fe:xxxx::)
+      if (w0 === 0x2002 && is169254(w1)) {
+        return true;
+      }
+      // IPv6 Link-Local (fe80::/10)
+      if ((w0 & 0xffc0) === 0xfe80) {
+        return true;
+      }
+      // Well-known IMDSv6 endpoint (fd00:ec2::254)
+      if (w0 === 0xfd00 && w1 === 0x0ec2 && w2 === 0 && w3 === 0 && w4 === 0 && w5 === 0 && w6 === 0 && w7 === 0x0254) {
+        return true;
+      }
+      return false;
     }
   }
 
-  // 2. Direct IPv4 Link-Local & Cloud Metadata (169.254.0.0/16)
-  if (clean.startsWith("169.254.")) {
-    return true;
-  }
-  const v4Parts = clean.split(".").map((p) => Number.parseInt(p, 10));
-  if (v4Parts.length === 4 && v4Parts[0] === 169 && v4Parts[1] === 254) {
-    return true;
-  }
-
-  // 3. IPv6 Link-Local (fe80::/10: first 10 bits 1111 1110 10 -> 0xfe80..0xfebf)
-  const firstWord = clean.split(":")[0];
-  if (firstWord && firstWord.length <= 4) {
-    const val = Number.parseInt(firstWord, 16);
-    if (!Number.isNaN(val) && (val & 0xffc0) === 0xfe80) {
-      return true;
-    }
-  }
-  if (/^fe[89ab][0-9a-f](:|$)/i.test(clean)) {
-    return true;
-  }
-
-  // 4. Well-known IMDSv6 endpoint
-  if (clean === "fd00:ec2::254") {
-    return true;
-  }
-
+  // Fallback for non-standard/partial literal checks
+  if (clean.startsWith("169.254.")) return true;
+  if (/^fe[89ab][0-9a-f](:|$)/i.test(clean)) return true;
+  if (clean === "fd00:ec2::254") return true;
   return false;
 }
 
@@ -441,13 +435,14 @@ export async function preflightDns(
   trust: DestinationTrust,
   policy: OutboundPolicy,
   deps: Pick<TransportDeps, "lookupAll">,
+  port?: number,
 ): Promise<DnsPreflight> {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
   const literal = isIP(host);
 
   // A literal address bypasses DNS entirely.
   if (literal !== 0) {
-    const allowPrivate = trust === "official" || isAuthorizedPrivate(host, policy);
+    const allowPrivate = trust === "official" || isAuthorizedPrivate(host, policy, port);
     assertAddressAllowed(host, allowPrivate);
     return { addresses: [{ address: host, family: literal }], allowPrivate };
   }
@@ -462,15 +457,20 @@ export async function preflightDns(
     throw new TransportError("network", `DNS lookup for "${host}" returned no addresses`);
   }
 
-  const allowPrivate = trust === "official" || policy.authorizations.some((entry) => entry.allowPrivate && hostMatchesAuthorization(host, entry));
+  const allowPrivate = trust === "official" || isAuthorizedPrivate(host, policy, port);
   for (const record of records) {
     assertAddressAllowed(record.address, allowPrivate);
   }
   return { addresses: records, allowPrivate };
 }
 
-function isAuthorizedPrivate(host: string, policy: OutboundPolicy): boolean {
-  return policy.authorizations.some((entry) => entry.allowPrivate && hostMatchesAuthorization(host, entry));
+function isAuthorizedPrivate(host: string, policy: OutboundPolicy, port?: number): boolean {
+  return policy.authorizations.some(
+    (entry) =>
+      entry.allowPrivate &&
+      hostMatchesAuthorization(host, entry) &&
+      (entry.port === undefined || (port !== undefined && entry.port === port)),
+  );
 }
 
 /**
@@ -528,7 +528,7 @@ export async function transact(
   // dialed directly even when Windows has a system proxy configured. Without
   // this, a self-hosted source on 192.168.x.x could be saved and authorized and
   // still fail every search with `proxy-required`.
-  const preflight = await preflightDns(parsed.hostname, request.trust, policy, deps);
+  const preflight = await preflightDns(parsed.hostname, request.trust, policy, deps, port);
   const pinned = preflight.addresses[0];
   const useTls = parsed.protocol === "https:";
   const privateDestination = preflight.addresses.some((record) => isPrivateOrRestrictedIp(record.address));
@@ -613,7 +613,7 @@ export async function transact(
 
     const { text, truncated } = await readBounded(response, maxBytes, signal.signal);
     let json: unknown;
-    if (looksLikeJson(contentType, text)) {
+    if (!truncated && looksLikeJson(contentType, text)) {
       try {
         json = JSON.parse(text);
       } catch {
@@ -709,9 +709,13 @@ export async function createPinnedDispatcher(options: {
   let baseConnector: any;
   if (options.connect === defaultConnect && typeof undici.buildConnector === "function") {
     baseConnector = undici.buildConnector({
-      lookup: (_hostname: string, _opts: any, cb: (err: Error | null, addresses: Array<{ address: string; family: number }>) => void) => {
+      lookup: (_hostname: string, opts: any, cb: (err: Error | null, addresses: any, family?: number) => void) => {
         const family = options.address.includes(":") ? 6 : 4;
-        cb(null, [{ address: options.address, family }]);
+        if (opts?.all) {
+          cb(null, [{ address: options.address, family }]);
+        } else {
+          cb(null, options.address, family);
+        }
       },
       timeout: options.connectTimeoutMs,
     });
@@ -721,9 +725,11 @@ export async function createPinnedDispatcher(options: {
     // undici passes the authority it is about to dial. It must be exactly the
     // authority this transport approved, otherwise the client resolved (or
     // was redirected to) something we never authorized.
-    const requestedPort = opts.port === undefined ? options.port : Number(opts.port);
-    const requestedHost = String(opts.hostname ?? options.servername);
-    if (requestedHost !== options.servername || !Number.isFinite(requestedPort) || requestedPort !== options.port) {
+    // Note: undici passes port: "" when a URL uses the scheme's default port.
+    const requestedPort = opts.port === undefined || opts.port === "" ? options.port : Number(opts.port);
+    const requestedHost = String(opts.hostname ?? options.servername).replace(/^\[|\]$/g, "").toLowerCase();
+    const expectedHost = options.servername.replace(/^\[|\]$/g, "").toLowerCase();
+    if (requestedHost !== expectedHost || !Number.isFinite(requestedPort) || requestedPort !== options.port) {
       const err = new TransportError(
         "destination-blocked",
         `Connection attempt for unapproved authority ${requestedHost}:${String(requestedPort)}`,
@@ -849,7 +855,7 @@ function isDestinationBlocked(message: string): boolean {
 }
 
 export function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
   if (host === "localhost" || host === "::1" || host === "0:0:0:0:0:0:0:1") return true;
   if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) {
     return Number(host.split(".")[0]) === 127;
@@ -875,7 +881,7 @@ export function isLoopbackUrl(urlStr: string): boolean {
  * Normal public domain names (e.g. example.com, api.tavily.com) return false.
  */
 export function isLocalOrPrivateHost(hostname: string): boolean {
-  const clean = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const clean = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
   if (isLoopbackHost(clean)) return true;
   if (isCloudMetadataOrLinkLocal(clean)) return true;
   const ipVer = isIP(clean);

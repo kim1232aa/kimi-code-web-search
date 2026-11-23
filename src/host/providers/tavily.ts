@@ -13,7 +13,7 @@
  *
  * @module
  */
-import { providerError, classifyHttpStatus, resolveContext, parseRetryAfter, type ProviderAdapter } from "./types.ts";
+import { providerError, classifyHttpStatus, resolveContext, parseRetryAfter, safeHttpUrl, type ProviderAdapter } from "./types.ts";
 import { fetchWithProxy } from "../fetch-proxy.ts";
 import { endpointViewOf } from "../endpoints.ts";
 import type { TavilyProviderOptions } from "../../shared/provider-options.ts";
@@ -134,7 +134,7 @@ async function throwTavilyError(res: Response): Promise<never> {
     const body = await res.json();
     message = typeof body?.detail?.error === "string" ? body.detail.error : undefined;
   } catch {
-    // Non-JSON body — fall through to status-based classification.
+    if (!res.bodyUsed) void res.body?.cancel?.().catch(() => {});
   }
 
   const retryAfterRaw = res.headers.get("retry-after");
@@ -189,7 +189,7 @@ export const TavilyProvider: ProviderAdapter = {
     const results = Array.isArray(raw?.results) ? raw.results : [];
     const sources = results
       .map((r: Record<string, unknown>) => {
-        const url = typeof r?.url === "string" ? r.url : "";
+        const url = safeHttpUrl(r?.url);
         if (!url) return null;
         const s: { url: string; title?: string; snippet?: string; publishedAt?: string } = { url };
         if (typeof r.title === "string" && r.title) s.title = r.title;
