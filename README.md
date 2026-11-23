@@ -26,60 +26,52 @@ The plugin itself is free and open source (MIT). You bring your own search-provi
 - **Pi import** — one command migrates API keys, endpoints, routing, and search mode from a local Pi agent setup (`always-search.ts` + `pi-web-access`).
 - **Subagent-aware enforcement** — subagent activity, system-trigger turns, and session cleanup are handled so the required-mode gate never misfires on background turns.
 
-## Requirements
+## Choose how to connect
 
-- Kimi Code CLI (recent version with plugin support).
-- Node.js ≥ 22.6 (LTS 22+ recommended; the dev/test scripts use `--experimental-strip-types`).
-- At least one search provider API key — or a self-hosted SearXNG instance. Keenable also works without a key (rate-limited).
-- Optional: a local Chrome/Chromium/Edge install for Xiaohongshu / X browser sessions.
+- **I already have a gateway and only need search and page reads:** use [direct HTTP MCP](#direct-http-mcp-no-local-gateway). No plugin install, Node.js, or local gateway is needed on the Kimi client.
+- **I want the full plugin and a gateway on this machine:** [build and install the plugin](#build-and-install-the-plugin), then follow [local gateway first run](#local-gateway-first-run).
+- **I want to keep the bundled MCP tools but send their requests elsewhere:** [build and install the plugin](#build-and-install-the-plugin), then [point the stdio bridge at a remote gateway](#stdio-bridge-to-a-remote-gateway). Read the [remote policy limitations](#remote-policy-limitations) before relying on Jev or required mode.
 
 ## Installation
 
-### Option A — install from GitHub (recommended)
+### Install a built ZIP
 
-In the Kimi Code TUI:
+Use the built `kimi-code-web-search-<version>.zip`, not GitHub's automatic **Source code** archive. The ZIP includes the gateway, dashboard, and npm runtime dependencies; no npm install or build is needed on the target. Node.js is still needed to run a local gateway.
 
-```
-/plugins install https://github.com/kim1232aa/kimi-code-web-search
-/reload
-```
+For a local ZIP, extract it and install the absolute path to the directory containing `kimi.plugin.json` using the TUI commands below. For a hosted ZIP, pass its direct download URL to `/plugins install`. To produce the ZIP yourself, run `npm ci --include=dev` and `npm run package:plugin` in the checkout with `python3` on `PATH`. The ZIP is written to `dist/release/`.
 
-Then start a **new session** (`/new`). Plugin changes only apply after `/reload` or in new sessions.
+### Build and install the plugin
 
-> Note: compiled output (`lib/`, `dist/`) is not committed. If the installed copy lacks `lib/`, the entry scripts fall back to running the TypeScript sources directly, which requires Node ≥ 22.6 with type stripping. If anything fails to start, use Option B.
+Use these steps when you don't have a built ZIP. Installing the raw GitHub repository URL copies source, not the built gateway or its dependencies.
 
-### Option B — build locally, then install from the local path
+On the machine that runs Kimi Code, use a recent Kimi Code CLI with plugin support, Git, and Node.js 22 LTS (22.6+). These are the plugin/gateway requirements, not requirements for a client that only connects over HTTP.
 
 ```bash
 git clone https://github.com/kim1232aa/kimi-code-web-search.git
 cd kimi-code-web-search
-npm install
+node --version
+npm ci --include=dev
 npm run build
 ```
 
-Then in the Kimi Code TUI:
+In the **Kimi Code TUI** (not your shell), replace `<absolute-path-to-clone>` with the directory containing `kimi.plugin.json`, then run:
 
-```
-/plugins install /absolute/path/to/kimi-code-web-search
+```text
+/plugins install <absolute-path-to-clone>
 /reload
 ```
 
-Local installs are copied to `$KIMI_CODE_HOME/plugins/managed/<id>/`; the CLI always runs from that managed copy. After editing the source you must rebuild and reinstall.
+Open a new session and check `/plugins info web` and `/mcp`. The plugin ID is `web`; the bundled stdio server is `s` (prefix `mcp__plugin-web_s__` in tool names). Desktop installation settings are under **Settings → Plugins**; for the local build, use the TUI install commands with the same Kimi data directory as Desktop, then open a new Desktop session. See [Kimi plugin installation](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/plugins.html) and [Desktop settings](https://www.kimi.com/code/docs/en/kimi-code-desktop/settings-and-extensions.html).
 
-### First run
+Kimi copies the prepared folder to `$KIMI_CODE_HOME/plugins/managed/web/`. After changes, rebuild and reinstall from the clone; `/reload` alone does not copy new files.
 
-1. Run `/web:dashboard` (or open `http://127.0.0.1:18492`). The gateway daemon starts automatically on first use.
-2. Add at least one provider API key in the dashboard, or export environment variables before starting Kimi Code:
+### Local gateway first run
 
-   ```bash
-   export WEB_TOOLS_EXA="..."        # also: WEB_TOOLS_TAVILY, WEB_TOOLS_BRAVE,
-   export WEB_TOOLS_KEENABLE="..."   # WEB_TOOLS_YOU, WEB_TOOLS_FIRECRAWL,
-                                     # WEB_TOOLS_PARALLEL, WEB_TOOLS_JINA, WEB_TOOLS_SEARXNG
-   ```
+1. From the built checkout or unpacked plugin, run `node ./bin/gateway-daemon.mjs ensure`, then open `http://127.0.0.1:18492`. With no remote URL configured, `web_search` and `web_fetch` can start the local gateway on demand. `web_status`, `web_mode`, and `/web:dashboard` do not start it.
+2. Configure a usable search source on that gateway: add a provider key (e.g. `WEB_TOOLS_EXA`) or configure a supported keyless source. For Xiaohongshu / X native browsing, configure a supported browser on the gateway host.
+3. Run `/web:status` in the new Kimi session, then try one real search. A healthy process or connected MCP server does not prove that a search provider works.
 
-3. Check everything with `/web:status`.
-
-Keys are stored in `$KIMI_CODE_HOME/web-tools/credentials.json` (mode `0600`) and are never printed in logs, status output, or import summaries.
+Provider keys configured in the dashboard are stored on the gateway host in `$KIMI_CODE_HOME/web-tools/credentials.json`, not in `mcp.json`.
 
 ### Import from Pi (optional)
 
@@ -107,17 +99,17 @@ Imports provider keys, base URLs, routing, classifier credentials (`auth.json`),
 
 - `/web:mode [auto|smart|required|off|toggle]` — view or switch the mode (`smart` also accepts `jev`, `自适应`, `智能判定`).
 - `/web:status` — gateway, mode, routing, quotas, platform login summary.
-- `/web:dashboard` — ensure the gateway is running and show the dashboard URL.
+- `/web:dashboard` — report the configured dashboard address without starting a gateway.
 
-A mid-turn mode switch takes effect from the next user turn; `off` blocks this plugin's web tools immediately.
+When plugin and gateway share the same data directory, a mid-turn mode switch takes effect from the next user turn; `off` immediately blocks the bundled retrieval tools. The [remote policy limitations](#remote-policy-limitations) apply when they do not share state.
 
 ### Skill
 
-The bundled `web-research` skill teaches the agent the research workflow: claim-focused queries, multi-angle sub-queries, provider switching instead of retrying, primary-source verification via `web_fetch`, and honest `未验证` reporting.
+Use `/skill:web:web-research` for deeper research (query design, cross-checks and primary sources). The Skill is optional; ordinary searches can call the available MCP tools directly. It is not provided by HTTP MCP alone.
 
 ## Configuration
 
-Everything is configurable in the dashboard; files live under `$KIMI_CODE_HOME/web-tools/` (`config.json`, `credentials.json`, `mode-state.json`, `gateway.json`).
+Gateway settings and credentials live under `$KIMI_CODE_HOME/web-tools/` on the gateway host. Configure the client connection separately as described in [Connect to a remote gateway](#connect-to-a-remote-gateway).
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -164,24 +156,56 @@ The **Jev smart classifier** adds one small LLM call per classified turn, billed
 
 A typical personal setup can run entirely on free tiers: e.g. Keenable keyless + Tavily's 1,000 monthly credits + Exa's $10 monthly credits.
 
-## Plugin and gateway are separate
+## Connect to a remote gateway
 
-The plugin (Search Mode hooks, skill, commands) decides *when* to search and runs on the machine running Kimi Code. The gateway holds the provider API keys and performs the searches, and it can run on a different machine. A local install with no extra configuration runs both on the same machine, which is only the default.
+The Kimi plugin runs hooks and loads skills on the **client**. The **gateway** runs search and page reads and holds the provider credentials. Configure search providers on the gateway host. For remote access, use a trusted HTTPS endpoint, keep the gateway bound to loopback behind a reverse proxy, and forward the original client address (`X-Forwarded-For`) so proxied requests are not treated as direct loopback calls. Set the gateway password on the server (`KIMI_WEB_TOOLS_PASSWORD` or the `web-tools/public-password` file). The client's `KIMI_WEB_TOOLS_GATEWAY_TOKEN` holds that password, not a search-provider key. It grants dashboard access too; only give it to trusted clients. Never put the value in the plugin manifest, a shared `mcp.json`, or a chat transcript.
 
-To use a gateway elsewhere, set these in the environment of the machine running Kimi Code:
+### Direct HTTP MCP (no local gateway)
 
-```bash
-export KIMI_WEB_TOOLS_GATEWAY_URL="http://your-gateway-host:18492"
-export KIMI_WEB_TOOLS_GATEWAY_TOKEN="the gateway password"
-```
-
-Tool calls then go to that gateway and no local gateway is started. The gateway must be reachable at that address and have a password set (`KIMI_WEB_TOOLS_PASSWORD`), and it exposes the same tools over MCP Streamable HTTP at `POST /mcp` (protocol 2025-06-18, stateless), so a remote Kimi Code can also point its own `mcpServers` entry straight at it:
+1. If plugin `web` is installed on the client, use `/plugins mcp disable web s` and `/reload` in the TUI to disable **only** its bundled stdio server. If the plugin is not installed, skip this step. Adding an HTTP server does not replace the bundled server automatically.
+2. Merge the example below into the client’s `mcp.json`; keep existing servers. The user-level file is `~/.kimi-code/mcp.json` (Windows: `%USERPROFILE%\.kimi-code\mcp.json`; with a custom data root: `$KIMI_CODE_HOME/mcp.json`). A project-only entry goes in `.kimi-code/mcp.json`; Kimi may require workspace trust. Replace `https://search.example.com` with the reachable gateway origin and **keep `/mcp`**. The same file format applies to [Desktop](https://www.kimi.com/code/docs/en/kimi-code-desktop/settings-and-extensions.html#mcp) and [CLI](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/mcp.html).
+3. Set `KIMI_WEB_TOOLS_GATEWAY_TOKEN` in the environment of the process running Kimi. `bearerTokenEnvVar` names the variable; it does not contain the password. If Kimi was running when the variable changed, fully quit and relaunch it from an environment that has the variable; reloading a conversation does not update the app's inherited environment. In PowerShell use `$env:NAME` for a shell-launched CLI; for Desktop launched separately, use a Windows user-level environment variable or launch it from an environment that already has it. Set it on the host running Kimi, not an unrelated terminal or the gateway host only.
 
 ```json
-{ "mcpServers": { "s": { "url": "http://your-gateway-host:18492/mcp", "bearerTokenEnvVar": "KIMI_WEB_TOOLS_GATEWAY_TOKEN" } } }
+{
+  "mcpServers": {
+    "web-remote": {
+      "url": "https://search.example.com/mcp",
+      "bearerTokenEnvVar": "KIMI_WEB_TOOLS_GATEWAY_TOKEN",
+      "enabledTools": ["web_search", "web_fetch"]
+    }
+  }
+}
 ```
 
-A plugin that does this drops the bundled stdio server; its hooks still run locally and count search completion by tool name, so required mode keeps working without any provider key on the remote machine.
+Open a **new** session. In the TUI, check `/mcp`: `web-remote` should be connected, and `plugin-web_s` should not be active. Test a search and a page read with that server. The gateway advertises `web_search`, `web_fetch`, `web_status`, and `web_mode`; the allowlist exposes only the retrieval tools. The other two describe or modify **gateway-side** state and are not needed for an MCP-only client.
+
+### Stdio bridge to a remote gateway
+
+Keep plugin `web` and its server `s` enabled; do not add a second copy of the search tools to `mcp.json`. Set `KIMI_WEB_TOOLS_GATEWAY_URL` to the **gateway origin, without `/mcp`**, and `KIMI_WEB_TOOLS_GATEWAY_TOKEN` in the Kimi process environment. Then relaunch Kimi and open a new session. In the following examples, supply the token separately as described above; the URL alone does not authenticate requests.
+
+```bash
+export KIMI_WEB_TOOLS_GATEWAY_URL="https://search.example.com"
+kimi
+```
+
+```powershell
+$env:KIMI_WEB_TOOLS_GATEWAY_URL = 'https://search.example.com'
+kimi
+```
+
+`/mcp` should show the bundled server (`plugin-web_s`). Test a search. The bridge calls `/web-tools/mcp/*`, not the public `/mcp` endpoint; the reverse proxy must expose those routes for this option. A configured remote request that fails does **not** fall back to local startup. If the URL is missing from the stdio process, it assumes a local gateway: retrieval can start it, but mode and status queries only check for an existing gateway. Launching Desktop independently of the shell does not give it that shell's variables.
+
+### Remote policy limitations
+
+- **Direct HTTP is a tools connection, not a plugin install.** It does not install the Skill, slash commands, or hooks. If you keep the plugin enabled for its hooks, `web-remote` can count as an external search when `recognizeExternalWebTools` is enabled and the receipt is recorded. The bundled `off` hook does not block this separate MCP entry.
+- **Neither connection shares the client's turn state with the gateway.** In both remote paths, a request carrying a client-only `turn_id` can fail with `Stale or unknown turn`; an unbound request can also be rejected if the gateway itself is in `required` mode. Status and mode queries describe the gateway, not the client's policy. Do not assume cross-host Jev, `required`, or `off` is equivalent to running both parts on one host. Leave the search-provider keys on the gateway.
+
+### MCP troubleshooting
+
+- **`Gateway exited before becoming healthy` / `Cannot find package 'linkedom'`:** the bundled stdio tool tried local startup. For HTTP-only use, check that `s` is disabled and retest in a new session. For intended local use, rebuild and reinstall from a prepared directory; inspect `$KIMI_CODE_HOME/web-tools/gateway.log` (default `~/.kimi-code/web-tools/gateway.log`). A missing runtime package is not fixed by installing a newer Node alone.
+- **HTTP `401` / `auth-not-configured`:** for `401`, check that the actual Kimi process has the gateway token without printing it; for `auth-not-configured`, set a password on the gateway. Check `GET /health` on the gateway origin to distinguish network reachability from authentication: a healthy response does not test the token, MCP initialization, or any search provider.
+- **Two sets of tools or `outside the tool choice`:** check `/mcp`, keep only your chosen connection, then start a new session and use the tool names it declares. If a remote status or dashboard reply shows `127.0.0.1:18492`, that is a listen address, not the URL to open on your client. Use the configured HTTPS origin for the remote dashboard.
 
 ## Standalone gateway
 

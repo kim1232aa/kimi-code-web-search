@@ -26,60 +26,52 @@
 - **Pi 导入** —— 一条命令从本地 Pi agent 配置（`always-search.ts` + `pi-web-access`）迁移 API key、端点、路由和搜索模式。
 - **子代理感知** —— 正确处理子代理活动、系统触发轮和会话清理，必搜门不会在后台轮上误伤。
 
-## 环境要求
+## 选择接入方式
 
-- Kimi Code CLI（支持插件的近期版本）。
-- Node.js ≥ 22.6（推荐 22 LTS+；开发/测试脚本使用 `--experimental-strip-types`）。
-- 至少一个搜索源 API key，或自建 SearXNG。Keenable 无 key 也能用（限流）。
-- 可选：本地 Chrome/Chromium/Edge，用于小红书 / X 浏览器会话。
+- **已有网关，只需要搜索和读网页**：用 [HTTP MCP 直连](#http-mcp-直连)。Kimi 客户端无需安装本插件、Node.js 或本地网关。
+- **要完整插件，网关也跑在这台机器**：[构建并安装插件](#构建并安装插件)，再按[本地网关首次使用](#本地网关首次使用)配置。
+- **要保留插件自带工具，但请求发往别处**：[构建并安装插件](#构建并安装插件)，再配置 [stdio 桥接远程网关](#stdio-桥接远程网关)。使用 Jev 或必搜前，请先看[远程模式的限制](#远程模式的限制)。
 
 ## 安装
 
-### 方式 A —— 从 GitHub 安装（推荐）
+### 安装预构建 ZIP
 
-在 Kimi Code TUI 中：
+使用构建好的 `kimi-code-web-search-<版本>.zip`，不要选 GitHub 自动生成的 **Source code** 压缩包。插件 ZIP 自带网关、仪表盘和 npm 运行依赖，目标机器不用再装依赖或构建。运行本地网关仍需要 Node.js。
 
-```
-/plugins install https://github.com/kim1232aa/kimi-code-web-search
-/reload
-```
+如果 ZIP 在本地，先解压，再用下方的 TUI 命令安装 `kimi.plugin.json` 所在目录的绝对路径。如果 ZIP 已托管，可以把直链交给 `/plugins install`。要自行打包，在源码目录执行 `npm ci --include=dev` 和 `npm run package:plugin`，确保 `python3` 在 `PATH` 上；ZIP 生成在 `dist/release/`。
 
-然后**新开会话**（`/new`）。插件变更只在 `/reload` 或新会话后生效。
+### 构建并安装插件
 
-> 注意：编译产物（`lib/`、`dist/`）不入库。若安装副本缺少 `lib/`，入口脚本会回退为直接运行 TypeScript 源码，需要 Node ≥ 22.6 的类型剥离能力。如启动异常，请改用方式 B。
+没有预构建 ZIP 时用这套步骤。直接安装 GitHub 仓库地址只会复制源码，不包含构建好的网关或它的运行依赖。
 
-### 方式 B —— 本地构建后按路径安装
+在运行 Kimi Code 的机器上准备支持插件的近期 Kimi Code CLI、Git 和 Node.js 22 LTS（22.6 或更高）。这是插件／网关侧的要求，不是纯 HTTP 客户端的要求。
 
 ```bash
 git clone https://github.com/kim1232aa/kimi-code-web-search.git
 cd kimi-code-web-search
-npm install
+node --version
+npm ci --include=dev
 npm run build
 ```
 
-然后在 Kimi Code TUI 中：
+在 **Kimi Code TUI**（不是 PowerShell 或 Bash）里，把 `<克隆目录的绝对路径>` 换成包含 `kimi.plugin.json` 的目录，再运行：
 
-```
-/plugins install /绝对路径/kimi-code-web-search
+```text
+/plugins install <克隆目录的绝对路径>
 /reload
 ```
 
-本地安装会被复制到 `$KIMI_CODE_HOME/plugins/managed/<id>/`，CLI 始终运行这份托管副本。修改源码后需要重新构建并重新安装。
+新开会话，用 `/plugins info web` 和 `/mcp` 检查。插件 ID 是 `web`；自带的 stdio 服务叫 `s`（工具名前缀为 `mcp__plugin-web_s__`）。桌面版插件入口在**设置 → 插件**；从本地构建安装时，可用共用同一 Kimi 数据目录的 TUI 执行上述安装命令，再新开桌面会话。参见 [Kimi 插件安装文档](https://www.kimi.com/code/docs/kimi-code-cli/customization/plugins.html)和[桌面版设置文档](https://www.kimi.com/code/docs/en/kimi-code-desktop/settings-and-extensions.html)。
 
-### 首次使用
+Kimi 会把准备好的目录复制到 `$KIMI_CODE_HOME/plugins/managed/web/`。更新时先重新构建再安装；只 `/reload` 不会把新文件复制过去。
 
-1. 运行 `/web:dashboard`（或直接打开 `http://127.0.0.1:18492`）。网关守护进程会在首次使用时自动启动。
-2. 在仪表盘里添加至少一个搜索源 API key，或在启动 Kimi Code 前导出环境变量：
+### 本地网关首次使用
 
-   ```bash
-   export WEB_TOOLS_EXA="..."        # 另有：WEB_TOOLS_TAVILY、WEB_TOOLS_BRAVE、
-   export WEB_TOOLS_KEENABLE="..."   # WEB_TOOLS_YOU、WEB_TOOLS_FIRECRAWL、
-                                     # WEB_TOOLS_PARALLEL、WEB_TOOLS_JINA、WEB_TOOLS_SEARXNG
-   ```
+1. 在构建好的仓库或解压后的插件目录执行 `node ./bin/gateway-daemon.mjs ensure`，再打开 `http://127.0.0.1:18492`。没配置远程地址时，只有 `web_search` 和 `web_fetch` 可按需启动本机网关；`web_status`、`web_mode` 和 `/web:dashboard` 都不启动它。
+2. 在网关上配置可用的搜索源：添加搜索 API key（如 `WEB_TOOLS_EXA`），或配置受支持的免 key 搜索源。小红书／X 原生检索所需的浏览器也配置在网关主机上。
+3. 在 Kimi 新会话运行 `/web:status`，再实际搜一次。进程健康或 MCP 已连接，不代表搜索源能用。
 
-3. 用 `/web:status` 检查一切就绪。
-
-Key 保存在 `$KIMI_CODE_HOME/web-tools/credentials.json`（权限 `0600`），日志、状态输出和导入摘要都不会打印明文。
+仪表盘配置的搜索源 key 保存在网关主机的 `$KIMI_CODE_HOME/web-tools/credentials.json`，不放在 `mcp.json`。
 
 ### 从 Pi 导入（可选）
 
@@ -107,17 +99,17 @@ node ./bin/import-pi.mjs --pi-dir /path/to/pi/agent
 
 - `/web:mode [auto|smart|required|off|toggle]` —— 查看或切换模式（`smart` 也接受 `jev`、`自适应`、`智能判定`）。
 - `/web:status` —— 网关、模式、路由、额度、平台登录摘要。
-- `/web:dashboard` —— 确保网关运行并给出仪表盘地址。
+- `/web:dashboard` —— 显示当前配置的仪表盘地址，不启动网关。
 
-轮中切换模式从下一个用户轮生效；`off` 立即屏蔽本插件的联网工具。
+插件与网关共用同一数据目录时，轮中切换模式从下一个用户轮生效；`off` 立即屏蔽自带的联网工具。不共享状态时，参见[远程模式的限制](#远程模式的限制)。
 
 ### Skill
 
-内置 `web-research` skill 教会代理研究工作流：围绕具体主张构造查询、多角度子查询、失败换源不重试、用 `web_fetch` 核验一手来源、如实报告 `未验证`。
+深度研究可通过 `/skill:web:web-research` 加载查询设计、交叉验证和核查一手来源的流程。普通搜索直接用可用的 MCP 工具，不需要先加载 Skill；只接 HTTP MCP 不提供这个 Skill。
 
 ## 配置
 
-所有配置都可在仪表盘完成；文件位于 `$KIMI_CODE_HOME/web-tools/`（`config.json`、`credentials.json`、`mode-state.json`、`gateway.json`）。
+网关设置和凭据位于网关主机的 `$KIMI_CODE_HOME/web-tools/`。客户端的连接方式单独配置，见[接入远程网关](#接入远程网关)。
 
 | 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -164,24 +156,56 @@ node ./bin/import-pi.mjs --pi-dir /path/to/pi/agent
 
 个人使用完全可以跑在免费额度上：例如 Keenable 免 key + Tavily 每月 1,000 credits + Exa 每月 $10 额度。
 
-## 插件和网关是分开的
+## 接入远程网关
 
-插件（搜索模式钩子、skill、命令）决定*什么时候*搜，跑在运行 Kimi Code 的机器上。网关持有搜索源 API key 并执行搜索，可以跑在另一台机器上。本地安装不做额外配置时两者在同一台机器，这只是默认情况。
+**客户端**上的 Kimi 插件加载 Skill、命令并运行钩子；**网关**执行搜索和网页读取，并持有搜索源凭据。搜索源配在网关主机上。远程访问用可信的 HTTPS 地址，网关继续只监听回环，由反代转发原始客户端地址（`X-Forwarded-For`），避免把反代请求当成回环直连。服务端通过 `KIMI_WEB_TOOLS_PASSWORD` 或 `web-tools/public-password` 配置网关密码；客户端的 `KIMI_WEB_TOOLS_GATEWAY_TOKEN` 填的是这个密码，不是搜索源 key。它也能访问仪表盘，只交给可信客户端，不要把值写进插件清单、共享的 `mcp.json` 或聊天记录。
 
-要用别处的网关，在运行 Kimi Code 的机器上设置：
+### HTTP MCP 直连
 
-```bash
-export KIMI_WEB_TOOLS_GATEWAY_URL="http://your-gateway-host:18492"
-export KIMI_WEB_TOOLS_GATEWAY_TOKEN="网关密码"
-```
-
-工具调用就发往那台网关，不再在本地起网关。网关必须在该地址可达并设了密码（`KIMI_WEB_TOOLS_PASSWORD`）。网关同时在 `POST /mcp` 提供 MCP Streamable HTTP（协议 2025-06-18，无状态），所以远端的 Kimi Code 也可以直接把自己的 `mcpServers` 指过去：
+1. 客户端如果已装 `web` 插件，在 TUI 执行 `/plugins mcp disable web s` 和 `/reload`，**只禁用自带的 stdio 服务**。没有安装插件就跳过。新增 HTTP 服务不会自动替换 `s`。
+2. 把下面的例子合并到客户端的 `mcp.json`，保留已有服务。用户级文件是 `~/.kimi-code/mcp.json`（Windows：`%USERPROFILE%\.kimi-code\mcp.json`；自定义数据目录：`$KIMI_CODE_HOME/mcp.json`）。只想在当前项目用，就配在 `.kimi-code/mcp.json`，Kimi 可能要求信任该工作区。把 `https://search.example.com` 换成网关可达的地址，**保留 `/mcp`**。[桌面版](https://www.kimi.com/code/docs/en/kimi-code-desktop/settings-and-extensions.html#mcp)和 [CLI](https://www.kimi.com/code/docs/kimi-code-cli/customization/mcp.html)使用同样的文件格式。
+3. 把 `KIMI_WEB_TOOLS_GATEWAY_TOKEN` 设到**启动 Kimi 的进程环境**里。`bearerTokenEnvVar` 填的是变量名，不是密码。改变量后若 Kimi 还在运行，完全退出，再从能读到变量的环境启动；只重载会话不会更新应用继承的环境。PowerShell 启动 CLI 时可用 `$env:变量名`；如果从桌面单独启动，请用 Windows 用户级环境变量，或从已经设置变量的环境启动 Desktop。不要只在网关主机或一扇不负责启动 Kimi 的终端里设置。
 
 ```json
-{ "mcpServers": { "s": { "url": "http://your-gateway-host:18492/mcp", "bearerTokenEnvVar": "KIMI_WEB_TOOLS_GATEWAY_TOKEN" } } }
+{
+  "mcpServers": {
+    "web-remote": {
+      "url": "https://search.example.com/mcp",
+      "bearerTokenEnvVar": "KIMI_WEB_TOOLS_GATEWAY_TOKEN",
+      "enabledTools": ["web_search", "web_fetch"]
+    }
+  }
+}
 ```
 
-这样配置的插件去掉自带的 stdio 服务；它的钩子仍在本地运行，按工具名统计搜索完成，所以必搜模式不需要远端机器上有任何搜索源 key。
+打开**新会话**。TUI 中用 `/mcp` 确认 `web-remote` 已连接、`plugin-web_s` 未启用，再用远程工具实际搜一次、读一次网页。网关登记了 `web_search`、`web_fetch`、`web_status`、`web_mode` 四个工具；例子仅启用前两个。后两个查看或更改的是**网关侧**状态，纯 MCP 客户端不需要它们。
+
+### stdio 桥接远程网关
+
+保留 `web` 插件及其 `s` 服务，不要在 `mcp.json` 再加一套重复的搜索工具。把 `KIMI_WEB_TOOLS_GATEWAY_URL` 设成**网关地址，不带 `/mcp`**，并让 Kimi 进程读到 `KIMI_WEB_TOOLS_GATEWAY_TOKEN`。然后重新启动 Kimi 并新开会话。以下只演示 URL，token 按上一步单独配置；只有地址不能通过认证。
+
+```bash
+export KIMI_WEB_TOOLS_GATEWAY_URL="https://search.example.com"
+kimi
+```
+
+```powershell
+$env:KIMI_WEB_TOOLS_GATEWAY_URL = 'https://search.example.com'
+kimi
+```
+
+`/mcp` 里仍然是自带的 `plugin-web_s`，再实际搜一次。桥接走的是 `/web-tools/mcp/*`，不是公开的 `/mcp`，反代也要转发这些路由。已经配置远程地址时，远程调用失败**不会**回退到本机启动；stdio 进程没读到地址时才走本地：搜索或读取可以按需启动网关，模式和状态查询只检查已运行的网关。从桌面单独启动的应用不会拿到某个 PowerShell 窗口里临时设置的变量。
+
+### 远程模式的限制
+
+- **HTTP 直连是接入工具，不是安装插件。** 不会自动安装 Skill、斜杠命令或钩子。保留并启用插件时，如果打开了 `recognizeExternalWebTools` 且收到回执，`web-remote` 的搜索可以作为外部搜索计入本轮；插件自带的 `off` 拦截不会阻止这条独立 MCP 连接。
+- **两种远程接法都不共享客户端轮次状态。** 带着只有客户端知道的 `turn_id` 调用，可能报 `Stale or unknown turn`；如果网关本身处于 `required`，不绑定轮次的请求也可能被拒绝。远程状态和模式查询反映的是网关，不是客户端策略。不要把跨主机 Jev、必搜或关闭模式当成同机部署的等价替代。搜索源 key 留在网关。
+
+### MCP 排错
+
+- **`Gateway exited before becoming healthy` / `Cannot find package 'linkedom'`：** 自带 stdio 工具尝试启动本地网关了。只用 HTTP 时，先确认 `s` 已禁用，再新开会话测试。确实要本地运行时，重新构建、按目录安装，查看 `$KIMI_CODE_HOME/web-tools/gateway.log`（默认 `~/.kimi-code/web-tools/gateway.log`）。缺 npm 依赖不是换个 Node 版本就能解决的。
+- **HTTP `401` / `auth-not-configured`：** `401` 先检查实际运行的 Kimi 进程有没有拿到网关 token，不要打印它；`auth-not-configured` 则去网关侧设置密码。可用网关地址的 `GET /health` 区分网络与鉴权问题；健康检查通过不代表 token、MCP 初始化或搜索源可用。
+- **工具重复 / `outside the tool choice`：** 在 `/mcp` 确认只保留选定的接入方式，再开新会话并使用它实际声明的工具名。远程状态或仪表盘回复里的 `127.0.0.1:18492` 是网关监听地址，不是客户端要打开的地址；客户端应使用配置的 HTTPS 网关地址。
 
 ## 独立网关
 

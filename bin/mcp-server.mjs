@@ -3,7 +3,7 @@
  * kimi-code-web-search — Stdio JSON-RPC 2.0 MCP Server for Kimi Code.
  *
  * Implements MCP protocol over stdin/stdout:
- *  - Auto-starts the standalone gateway daemon (`127.0.0.1:18492`) if not running.
+ *  - Connects to a configured remote gateway or starts the local daemon for search and fetch only.
  *  - Exposes 4 tools:
  *    1. `web_search` — Multi-provider web & social platform (Xiaohongshu / X) search
  *    2. `web_fetch`  — Full-page & social post/comment content extraction
@@ -11,7 +11,7 @@
  *    4. `web_status` — Inspect gateway, providers, quotas, and platform login state
  */
 import readline from "node:readline";
-import { ensureGatewayDaemon } from "./gateway-daemon.mjs";
+import { ensureGatewayDaemon, probeLocalGateway } from "./gateway-daemon.mjs";
 import { positiveInteger } from "../hooks/mode-state.mjs";
 
 const VERSION = "0.4.0";
@@ -133,7 +133,7 @@ const TOOLS = [
 /**
  * Where this plugin's tool calls go. `KIMI_WEB_TOOLS_GATEWAY_URL` points at a
  * gateway running somewhere else (this machine or another); when it is unset
- * the plugin uses, and if needed starts, the gateway on this machine.
+ * the plugin uses the local gateway and starts it only for retrieval.
  */
 function configuredGateway() {
   const raw = process.env.KIMI_WEB_TOOLS_GATEWAY_URL?.trim();
@@ -152,7 +152,11 @@ function configuredGateway() {
 
 async function callGatewayMcp(endpoint, payload, timeoutMs = 90_000) {
   const configured = configuredGateway();
-  const gw = configured ?? await ensureGatewayDaemon();
+  const retrieve = endpoint === "search" || endpoint === "fetch";
+  const gw = configured ?? await (retrieve ? ensureGatewayDaemon() : probeLocalGateway());
+  if (!gw) {
+    throw new Error("Local gateway is not running. Start it explicitly for local use, or set KIMI_WEB_TOOLS_GATEWAY_URL for remote use.");
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
@@ -160,13 +164,19 @@ async function callGatewayMcp(endpoint, payload, timeoutMs = 90_000) {
   try {
     const headers = { "content-type": "application/json" };
     if (configured?.token) headers.authorization = `Bearer ${configured.token}`;
-    const res = await fetch(`${gw.url}/web-tools/mcp/${endpoint}`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload ?? {}),
-      signal: controller.signal,
-    });
-    const text = await res.text();
+    let res, text;
+    try {
+      res = await fetch(`${gw.url}/web-tools/mcp/${endpoint}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload ?? {}),
+        signal: controller.signal,
+      });
+      text = await res.text();
+    } catch (error) {
+      const reason = controller.signal.aborted ? "request timed out" : "connection or response failed";
+      throw new Error(`${configured ? "Remote" : "Local"} gateway ${gw.url}: ${reason}.`, { cause: error });
+    }
     let parsed;
     try {
       parsed = JSON.parse(text);
@@ -176,7 +186,7 @@ async function callGatewayMcp(endpoint, payload, timeoutMs = 90_000) {
     if (!res.ok || parsed?.ok === false) {
       throw new Error(parsed?.error?.message || `Gateway HTTP ${res.status}`);
     }
-    return parsed.value;
+    return endpoint === "status" && parsed.value ? { ...parsed.value, clientGatewayUrl: gw.url } : parsed.value;
   } finally {
     clearTimeout(timer);
   }
@@ -230,8 +240,11 @@ function formatModeOutput(value) {
 function formatStatusOutput(value) {
   const lines = [];
   lines.push(`# Kimi Web Tools Status (v${value?.version ?? VERSION})`);
-  if (value?.gateway) {
-    lines.push(`- Dashboard & Gateway URL: ${value.gateway.url} (PID: ${value.gateway.pid})`);
+  const url = value?.clientGatewayUrl ?? value?.gateway?.url;
+  if (url) {
+    const pid = value?.gateway?.pid;
+    lines.push(`- Dashboard & Gateway URL: ${url}${pid === undefined ? "" : ` (PID: ${pid})`}`);
+    if (value?.gateway?.url && value.gateway.url !== url) lines.push(`- Gateway bind URL: ${value.gateway.url}`);
   }
   if (value?.mode) {
     lines.push(

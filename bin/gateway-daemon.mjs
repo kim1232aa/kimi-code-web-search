@@ -68,13 +68,17 @@ async function checkGatewayHealth(host = DEFAULT_HOST, port = DEFAULT_PORT, time
   }
 }
 
-async function loadGatewayModule() {
+function gatewayBuildPath() {
   const compiledPath = path.join(PROJECT_ROOT, "lib", "host", "gateway-server.js");
-  if (fs.existsSync(compiledPath)) {
-    return import(pathToFileURL(compiledPath).href);
+  if (!fs.existsSync(compiledPath)) {
+    throw new Error("Gateway build is missing lib/host/gateway-server.js. Install the prebuilt plugin ZIP, or run npm ci --include=dev and npm run build in the checkout, then reinstall from that directory.");
   }
-  const tsPath = path.join(PROJECT_ROOT, "src", "host", "gateway-server.ts");
-  return import(pathToFileURL(tsPath).href);
+  return compiledPath;
+}
+
+export async function probeLocalGateway(host = DEFAULT_HOST, port = DEFAULT_PORT) {
+  const saved = readGatewayJson();
+  return checkGatewayHealth(saved?.host || host, saved?.port || port);
 }
 
 async function runForeground(host = DEFAULT_HOST, port = DEFAULT_PORT) {
@@ -83,7 +87,7 @@ async function runForeground(host = DEFAULT_HOST, port = DEFAULT_PORT) {
     console.log(JSON.stringify({ status: "already-running", ...existing }));
     return;
   }
-  const { startGatewayServer } = await loadGatewayModule();
+  const { startGatewayServer } = await import(pathToFileURL(gatewayBuildPath()).href);
   const handle = await startGatewayServer({
     host,
     port,
@@ -130,15 +134,11 @@ function resolveNodeExecutable() {
 }
 
 export async function ensureGatewayDaemon(host = DEFAULT_HOST, port = DEFAULT_PORT) {
-  const saved = readGatewayJson();
-  const checkHost = saved?.host || host;
-  const checkPort = saved?.port || port;
+  const health = await probeLocalGateway(host, port);
+  if (health) return { status: "running", ...health };
 
-  const health = await checkGatewayHealth(checkHost, checkPort);
-  if (health) {
-    return { status: "running", pid: saved?.pid, ...health };
-  }
-
+  const nodeExecutable = resolveNodeExecutable();
+  gatewayBuildPath();
   const dataDir = getWebToolsDir();
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const logPath = path.join(dataDir, "gateway.log");
@@ -153,15 +153,10 @@ export async function ensureGatewayDaemon(host = DEFAULT_HOST, port = DEFAULT_PO
   }
   const outFd = fs.openSync(logPath, "a");
 
-  const compiledEntry = path.join(PROJECT_ROOT, "lib", "host", "gateway-server.js");
-  const nodeArgs = fs.existsSync(compiledEntry)
-    ? [fileURLToPath(import.meta.url), "--serve"]
-    : ["--experimental-strip-types", fileURLToPath(import.meta.url), "--serve"];
-
   let child;
   let spawnError;
   try {
-    child = spawn(resolveNodeExecutable(), nodeArgs, {
+    child = spawn(nodeExecutable, [fileURLToPath(import.meta.url), "--serve"], {
       cwd: PROJECT_ROOT,
       detached: true,
       stdio: ["ignore", outFd, outFd],

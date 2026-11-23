@@ -1,6 +1,6 @@
 # Kimi Web Tools (Plugin Instructions)
 
-You have access to the `kimi-code-web-search` MCP server (`web_search`, `web_fetch`, `web_mode`, `web_status`) backed by a local multi-provider search & extraction gateway (`http://127.0.0.1:18492`).
+Use the available web tools for search and extraction. The bundled `kimi-code-web-search` tools can target a local or remote gateway; do not assume a gateway address.
 
 ## Core Tools
 
@@ -12,7 +12,7 @@ You have access to the `kimi-code-web-search` MCP server (`web_search`, `web_fet
   - Use `web_fetch` when you already have a specific URL; use `web_search` for discovery. Fetch official documentation, source files, release notes, or other primary sources and cite key links before asserting detailed external facts.
   - Treat `web_search` snippets as discovery leads, not full page details or verified comments. Describe comments/replies as verified only when `web_fetch` returns their contents.
 - `web_mode`: View or change the active Search Mode (`auto`, `smart`, `required`, `off`). `/web:mode smart` (UI label `Jev 判定`) also accepts `jev`, `自适应`, and `智能判定`. A mid-turn switch takes effect from the next user turn — the current turn's Stop decision is frozen at turn start — while `off` immediately blocks this plugin's web tools.
-- `web_status`: Inspect gateway health, Web UI Dashboard URL (`http://127.0.0.1:18492`), Search Mode, provider routing order, API key pools, quotas, and social platform login status.
+- `web_status`: Inspect a running gateway without starting it. Use the returned `Dashboard & Gateway URL`, not its bind address.
 
 ## Search Mode Policy
 

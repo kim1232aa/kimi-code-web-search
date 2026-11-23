@@ -124,6 +124,76 @@ test("a configured gateway URL is used instead of starting a local gateway", asy
   assert.equal(fs.existsSync(path.join(home, "web-tools", "gateway.json")), false, "no local gateway is started");
 });
 
+test("read-only MCP queries do not launch a stopped local gateway", async (t) => {
+  const home = fixture(t);
+  const server = http.createServer((_, res) => res.writeHead(503).end());
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const port = (server.address() as { port: number }).port;
+  const env = {
+    ...process.env, KIMI_CODE_HOME: home, KIMI_WEB_TOOLS_HOST: "127.0.0.1",
+    KIMI_WEB_TOOLS_PORT: String(port), KIMI_WEB_TOOLS_GATEWAY_URL: "",
+  };
+  const result = await runNode(["bin/mcp-server.mjs"], env,
+    rpc(1, "tools/call", { name: "web_status" }) +
+    rpc(2, "tools/call", { name: "web_mode", arguments: { action: "get" } }));
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(fs.existsSync(path.join(home, "web-tools", "gateway.log")), false, result.stdout);
+  for (const reply of result.stdout.trim().split("\n").map(line => JSON.parse(line))) {
+    assert.equal(reply.result.isError, true);
+    assert.match(reply.result.content[0].text, /local gateway is not running.*KIMI_WEB_TOOLS_GATEWAY_URL/i);
+  }
+});
+
+test("read-only MCP queries use an already running local gateway", async (t) => {
+  const { env, requests } = await gatewayFixture(t);
+  const result = await runNode(["bin/mcp-server.mjs"], { ...env, KIMI_WEB_TOOLS_GATEWAY_URL: "" },
+    rpc(1, "tools/call", { name: "web_status" }) + rpc(2, "tools/call", { name: "web_mode" }));
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout.trim().split("\n").map(line => JSON.parse(line)).some(r => r.result.isError), false);
+  assert.ok(requests.some(r => r.url === "/web-tools/mcp/status"));
+  assert.ok(requests.some(r => r.url === "/web-tools/mcp/mode"));
+});
+
+test("remote status shows the client-facing URL instead of the gateway bind address", async (t) => {
+  const home = fixture(t);
+  const server = http.createServer((req, res) => {
+    assert.equal(req.url, "/web-tools/mcp/status");
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ ok: true, value: { gateway: { url: "http://127.0.0.1:18492", pid: 321 } } }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const result = await runNode(["bin/mcp-server.mjs"], { ...process.env, KIMI_CODE_HOME: home, KIMI_WEB_TOOLS_GATEWAY_URL: url },
+    rpc(1, "tools/call", { name: "web_status" }));
+  assert.equal(result.code, 0, result.stderr);
+  const text = JSON.parse(result.stdout).result.content[0].text;
+  assert.ok(text.includes(`Dashboard & Gateway URL: ${url}`), text);
+  assert.match(text, /Gateway bind URL: http:\/\/127\.0\.0\.1:18492/);
+  assert.equal(fs.existsSync(path.join(home, "web-tools", "gateway.log")), false);
+});
+
+test("daemon startup gives build instructions for a source-only install", async (t) => {
+  const home = fixture(t);
+  const isolated = path.join(home, "plugin");
+  fs.mkdirSync(path.join(isolated, "bin"), { recursive: true });
+  fs.copyFileSync(path.join(root, "bin/gateway-daemon.mjs"), path.join(isolated, "bin/gateway-daemon.mjs"));
+  const server = http.createServer((_, res) => res.writeHead(503).end());
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const result = await runNode([path.join(isolated, "bin/gateway-daemon.mjs"), "ensure"], {
+    ...process.env, KIMI_CODE_HOME: home, KIMI_WEB_TOOLS_HOST: "127.0.0.1",
+    KIMI_WEB_TOOLS_PORT: String((server.address() as { port: number }).port),
+  });
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(result.stderr, /missing lib\/host\/gateway-server\.js.*npm ci.*npm run build/);
+  assert.equal(fs.existsSync(path.join(home, "web-tools", "gateway.log")), false);
+});
+
 test("invalid numeric inputs fail without launching a gateway", async (t) => {
   const { env, requests } = await gatewayFixture(t);
   const invalid = ["", " ", "1e1", "0x10", "1.5", "0", "-1", true, [], null, 1.5, 9007199254740992];

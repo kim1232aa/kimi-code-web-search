@@ -19,6 +19,7 @@
     "build:host": "tsc -p tsconfig.build.json",
     "build:client": "node build-client.mjs",
     "build": "tsc -p tsconfig.build.json && node build-client.mjs",
+    "package:plugin": "npm run build && python3 scripts/package-plugin.py",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.ts test/*.test.mjs test/*.smoke.mjs"
   },
