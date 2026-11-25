@@ -108,30 +108,37 @@ async function evaluateTurnRemotely(remoteGateway, { sessionId, promptText, hasI
     const readyProviders = Array.isArray(statusVal.usable)
       ? statusVal.usable.filter((name) => typeof name === "string" && name.trim())
       : [];
-    const effectiveEvalMode = modeHint === "smart" ? "smart" : mode;
+    const gatewayOff = mode === "off";
+    const effectiveEvalMode = gatewayOff ? "off" : (modeHint === "smart" || modeHint === "required" ? modeHint : mode);
     const canEnforce = effectiveEvalMode === "required" || effectiveEvalMode === "smart";
-    const exempted = canEnforce && (
+    const exempted = (gatewayOff && Boolean(modeHint)) || (canEnforce && (
       remoteCfg.enabled === false ||
       (remoteCfg.exemptWhenNoProvider !== false && readyProviders.length === 0)
-    );
+    ));
+    const effectiveReadyProviders = gatewayOff && Boolean(modeHint) ? [] : readyProviders;
     const requiredEvidence = remoteCfg.requiredEvidence === "search-or-fetch" ? "search-or-fetch" : "search";
     const recognizeExternalWebTools = remoteCfg.recognizeExternalWebTools !== false;
 
     let decision;
-    if (!isSteer && effectiveEvalMode === "smart" && !exempted && (promptText.trim() || hasImages)) {
+    if (!isSteer && !gatewayOff && effectiveEvalMode === "smart" && !exempted && (promptText.trim() || hasImages)) {
       const testPrompt = promptText.trim() || "Image prompt";
-      const testRes = await postRemoteJson(
-        remoteGateway,
-        "/web-tools/api/smart-classifier/test",
-        { prompt: testPrompt, sessionId },
-        remainingMs(5_000),
-      );
       const failClosed = remoteCfg.smartSearch?.failOpen === false;
-      if (testRes.ok && testRes.parsed?.ok && testRes.parsed.value && typeof testRes.parsed.value === "object") {
+      let testRes;
+      try {
+        testRes = await postRemoteJson(
+          remoteGateway,
+          "/web-tools/api/smart-classifier/test",
+          { prompt: testPrompt, sessionId },
+          remainingMs(5_000),
+        );
+      } catch {
+        testRes = undefined;
+      }
+      if (testRes?.ok && testRes.parsed?.ok && testRes.parsed.value && typeof testRes.parsed.value === "object") {
         const val = testRes.parsed.value;
         // `/smart-classifier/test` catches exceptions and returns HTTP 200 `{ ok: false, escalated: false }`;
         // honor `failOpen: false` here so fail-closed gateways still escalate.
-        decision = val.ok === false && failClosed
+        decision = val.ok === false && failClosed && val.fallbackReason !== "disabled"
           ? { ...val, escalated: true }
           : val;
       } else {
@@ -156,7 +163,7 @@ async function evaluateTurnRemotely(remoteGateway, { sessionId, promptText, hasI
       exempted,
       requiredEvidence,
       recognizeExternalWebTools,
-      readyProviders,
+      readyProviders: effectiveReadyProviders,
       ...(decision ? { decision } : {}),
     };
   } catch {
@@ -204,17 +211,27 @@ async function main() {
   let decision;
   const syncMode = remoteGateway ? remoteGateway.syncMode !== false : false;
   const sendContext = remoteGateway ? remoteGateway.sendContext !== false : true;
-  const shouldCallRemote = Boolean(remoteGateway && (syncMode || (mode === "smart" && !exempted)));
+  const shouldCallRemote = Boolean(remoteGateway && (syncMode || (canEnforceMode(mode) && !exempted)));
 
   if (!turnState && shouldCallRemote) {
-    const sessionContext = sendContext ? extractKimiSessionContext(sessionId, kimiCodeHome) : {};
+    let sessionContext = {};
+    if (sendContext && (syncMode || mode === "smart")) {
+      const extracted = extractKimiSessionContext(sessionId, kimiCodeHome);
+      if (promptText.trim().length > 24 && extracted && Object.hasOwn(extracted, "prevUserText")) {
+        const { prevUserText: _omitted, ...rest } = extracted;
+        sessionContext = rest;
+      } else {
+        sessionContext = extracted;
+      }
+    }
     remoteEvaluation = await evaluateTurnRemotely(remoteGateway, {
       sessionId,
       promptText,
       hasImages,
-      isSteer,
+      // evaluateTurnRemotely only runs when `!turnState` (initializing a fresh turn).
+      isSteer: false,
       sessionContext,
-      ...(!syncMode && mode === "smart" ? { modeHint: "smart" } : {}),
+      ...(!syncMode && canEnforceMode(mode) ? { modeHint: mode } : {}),
     });
     if (remoteEvaluation) {
       if (syncMode && VALID_MODES.has(remoteEvaluation.mode)) mode = remoteEvaluation.mode;
@@ -284,6 +301,7 @@ async function main() {
   }
 
   const recognizeExternal = turnState.recognizeExternal ?? effectiveRecognizeExternal;
+  const isExempted = turnState.exempted ?? exempted;
   const searchOnly = turnState.requiredEvidence === "search";
   const turnBinding = recognizeExternal
     ? `Any search path counts. If you use this plugin's own tools, pass session_id="${sessionId}" and turn_id=${turnState.turn} (also include them in a subagent prompt when delegating); built-in WebSearch/FetchURL and other search MCP tools count without them.`
@@ -304,7 +322,7 @@ async function main() {
 
   if (mode === "off") {
     process.stdout.write(`${SEARCH_DISABLED_TEXT}\n`);
-  } else if (exempted) {
+  } else if (isExempted) {
     process.stdout.write(`${NO_WEB_ROUTE_INSTRUCTION}\n`);
   } else if (turnState.required) {
     const requiredText = requiredSearchText(searchOnly, recognizeExternal);

@@ -174,10 +174,11 @@ async function callGatewayMcp(endpoint, payload, timeoutMs = 90_000) {
     try {
       parsed = JSON.parse(text);
     } catch {
-      throw new Error(`Invalid JSON from gateway (${res.status}): ${text.slice(0, 200)}`);
+      throw new Error(`${configured ? "Remote" : "Local"} gateway ${gw.url} (HTTP ${res.status}): Invalid JSON response: ${text.slice(0, 200)}`);
     }
     if (!res.ok || parsed?.ok === false) {
-      throw new Error(parsed?.error?.message || `Gateway HTTP ${res.status}`);
+      const detail = parsed?.error?.message || `Gateway HTTP ${res.status}`;
+      throw new Error(configured ? `Remote gateway ${gw.url} (HTTP ${res.status}): ${detail}` : detail);
     }
     return parsed.value;
   } finally {
@@ -215,6 +216,13 @@ function formatFetchOutput(value) {
   return `${header}\n\n${content}`;
 }
 
+function pickSessionId(args) {
+  for (const candidate of [args?.session_id, args?.sessionId]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return "global";
+}
+
 function formatModeOutput(value) {
   const modeNames = {
     auto: "auto (智能联网 — model decides when to search)",
@@ -222,12 +230,17 @@ function formatModeOutput(value) {
     required: "required (始终联网 — at least one web_search required per turn)",
     off: "off (关闭联网 — web tools disabled and blocked)",
   };
-  return [
+  const lines = [
     `Session: ${value?.sessionId ?? "global"}`,
     `Effective Mode: ${modeNames[value?.mode] || value?.mode}`,
     `Global Default Mode: ${modeNames[value?.globalMode] || value?.globalMode}`,
-    `Search Provider Available: ${value?.available ? "yes" : "no"}`,
-  ].join("\n");
+  ];
+  if (typeof value?.available === "boolean") {
+    lines.push(`Search Provider Available: ${value.available ? "yes" : "no"}`);
+  } else {
+    lines.push("Search Provider Available: unknown (local mode override)");
+  }
+  return lines.join("\n");
 }
 
 function formatStatusOutput(value) {
@@ -252,6 +265,18 @@ function runLocalWebMode(targetSession, action, requestedMode) {
       }
       if (sid === "global" || sid === "default") {
         state.globalMode = next;
+        for (const key of ["global", "default"]) {
+          if (Object.hasOwn(state.sessions, key) && Object.hasOwn(state.sessions[key], "mode")) {
+            const nextEntry = { ...state.sessions[key], updatedAt: Date.now() };
+            delete nextEntry.mode;
+            Object.defineProperty(state.sessions, key, {
+              value: nextEntry,
+              writable: true,
+              enumerable: true,
+              configurable: true,
+            });
+          }
+        }
       } else {
         const entry = Object.hasOwn(state.sessions, sid) ? state.sessions[sid] : {};
         Object.defineProperty(state.sessions, sid, {
@@ -269,13 +294,13 @@ function runLocalWebMode(targetSession, action, requestedMode) {
     mode = effectiveMode(doc, sid);
     globalMode = doc.globalMode;
   }
-  return { sessionId: sid, mode, globalMode, available: true };
+  return { sessionId: sid, mode, globalMode };
 }
 
 async function runTool(params) {
   const name = params?.name;
   const args = params?.arguments ?? {};
-  const sessionId = requestSessionId(args.session_id ?? args.sessionId);
+  const sessionId = pickSessionId(args);
   try {
     const rawTurnId = Object.hasOwn(args, "turn_id") ? args.turn_id : args.turnId;
     const turnId = optionalPositiveInteger(rawTurnId);
@@ -296,8 +321,8 @@ async function runTool(params) {
     }
 
     if (name === "web_mode") {
-      const targetSession = args.session_id ?? args.sessionId ?? "global";
-      const action = args.action ?? (args.mode ? "set" : "get");
+      const targetSession = pickSessionId(args);
+      const action = args.action ?? (args.mode !== undefined ? "set" : "get");
       const configured = configuredGateway();
       if (configured && configured.syncMode === false) {
         const localResult = runLocalWebMode(targetSession, action, args.mode);
@@ -307,7 +332,7 @@ async function runTool(params) {
         sessionId: targetSession,
         action,
         mode: args.mode,
-        updateGlobal: targetSession === "global",
+        updateGlobal: targetSession === "global" || targetSession === "default",
       });
       if (configured) {
         syncRemoteModeToLocal(result);

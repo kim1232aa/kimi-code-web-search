@@ -204,7 +204,10 @@ export function buildSmartClassifierState(promptText, hasImages, sessionContext 
   if (reply) state.last_assistant_reply = clipMiddle(reply, 700);
   const tools = sessionContext?.recentTools;
   if (Array.isArray(tools) && tools.length) {
-    const recent = tools.filter((tool) => typeof tool === "string" && tool.trim()).slice(-6);
+    const recent = tools
+      .filter((tool) => typeof tool === "string" && tool.trim())
+      .slice(-6)
+      .map((tool) => tool.trim().slice(0, 120));
     if (recent.length) state.recent_tools = recent;
   }
   const previous = nonEmptyString(sessionContext?.prevUserText);

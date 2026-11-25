@@ -312,3 +312,182 @@ test("least-privilege client tokens allow MCP/evaluate-turn/session mode but blo
   assert.equal(evalJson.value.mode, "required");
   assert.deepEqual(evalJson.value.readyProviders, ["exa"]);
 });
+
+
+test("invalid bearer tokens never inherit loopback admin, and browser cross-site checks cover clients", async (t) => {
+  const previousRequireAuth = process.env.KIMI_WEB_TOOLS_REQUIRE_AUTH;
+  delete process.env.KIMI_WEB_TOOLS_REQUIRE_AUTH;
+  t.after(() => {
+    if (previousRequireAuth === undefined) delete process.env.KIMI_WEB_TOOLS_REQUIRE_AUTH;
+    else process.env.KIMI_WEB_TOOLS_REQUIRE_AUTH = previousRequireAuth;
+  });
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-wt-loopback-auth-"));
+  const handle = await startGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    baseDir,
+    projectRoot: ROOT,
+    password: PASSWORD,
+    clientTokens: ["guest-123456789012"],
+  });
+  t.after(async () => {
+    await handle.close();
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  });
+
+  for (const token of ["wrong-token", "revoked-client-token"]) {
+    const response = await post(`${handle.url}/web-tools/api/config/get`, {}, { authorization: `Bearer ${token}` });
+    assert.equal(response.status, 401, "an invalid bearer must not inherit direct-loopback admin");
+  }
+  const guest = { authorization: "Bearer guest-123456789012" };
+  const normal = await post(`${handle.url}/web-tools/mcp/status`, {}, guest);
+  assert.equal(normal.status, 200);
+  const crossOrigin = await post(`${handle.url}/web-tools/mcp/status`, {}, { ...guest, origin: "https://attacker.example" });
+  assert.equal(crossOrigin.status, 403);
+  const crossSite = await post(`${handle.url}/web-tools/mcp/status`, {}, { ...guest, "sec-fetch-site": "cross-site" });
+  assert.equal(crossSite.status, 403);
+});
+
+test("client mode namespaces, off ceiling, bounded state, and MCP parity", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-wt-client-isolation-"));
+  const handle = await startGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    baseDir,
+    projectRoot: ROOT,
+    password: PASSWORD,
+    clientTokens: ["guest-123456789012", "other-123456789012"],
+  });
+  t.after(async () => {
+    await handle.close();
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  });
+  handle.storage.setSessionMode("owner-session", "required");
+  handle.storage.setTurnState("guest-session", { turn: 7, required: true, corrections: 0, webSearchCompleted: false });
+  const guest = { authorization: "Bearer guest-123456789012" };
+  const other = { authorization: "Bearer other-123456789012" };
+
+  const ownerSessionRead = await post(`${handle.url}/web-tools/mcp/mode`, { sessionId: "owner-session" }, guest);
+  assert.equal(((await ownerSessionRead.json()) as { value: { mode: string } }).value.mode, "auto");
+  const setOwn = await post(`${handle.url}/web-tools/mcp/mode`, { mode: "required", sessionId: "guest-session" }, guest);
+  assert.equal(setOwn.status, 200, "mode alone must infer set for REST too");
+  const otherRead = await post(`${handle.url}/web-tools/mcp/mode`, { sessionId: "guest-session" }, other);
+  assert.equal(((await otherRead.json()) as { value: { mode: string } }).value.mode, "auto");
+  assert.equal(handle.storage.getEffectiveSessionMode("guest-session"), "auto", "guest override must not create owner session mode");
+  assert.equal(handle.storage.getEffectiveSessionMode("owner-session"), "required");
+  assert.equal(handle.storage.getTurnState("guest-session")?.turn, 7);
+
+  const noKeySearch = await post(`${handle.url}/web-tools/mcp/search`, { query: "test", sessionId: "guest-session", turnId: 7 }, guest);
+  assert.equal(noKeySearch.status, 500, "the unconfigured provider fails without starting a search");
+  assert.equal(handle.storage.getTurnState("guest-session")?.webSearchCompleted, false, "guest search must not mutate owner turn accounting");
+
+  const modeRpc = await post(`${handle.url}/mcp`, {
+    jsonrpc: "2.0", id: 20, method: "tools/call",
+    params: { name: "web_mode", arguments: { mode: "smart", session_id: "guest-session" } },
+  }, guest);
+  const modeRpcJson = (await modeRpc.json()) as { result: { isError?: boolean; content: Array<{ text: string }> } };
+  assert.notEqual(modeRpcJson.result.isError, true, "mode without action must infer set over MCP");
+  assert.match(modeRpcJson.result.content[0].text, /Effective Mode: smart/);
+  assert.match(modeRpcJson.result.content[0].text, /Search Provider Available: yes/);
+
+  for (const invalidSession of ["__proto__", "x".repeat(129)]) {
+    const invalid = await post(`${handle.url}/web-tools/mcp/mode`, { mode: "required", sessionId: invalidSession }, guest);
+    assert.equal(invalid.status, 400);
+  }
+  for (let index = 0; index < 201; index += 1) {
+    handle.storage.setClientSessionMode("load-test", `session-${index}`, "required");
+  }
+  const clientKeys = Object.keys(handle.storage.readModeState().sessions).filter((key) => key.startsWith("client:"));
+  assert.ok(clientKeys.length <= 200, "client overrides must be LRU-bounded");
+  const adminModes = await post(`${handle.url}/web-tools/mcp/mode`, {}, { authorization: `Bearer ${PASSWORD}` });
+  const adminModesJson = (await adminModes.json()) as { value: { sessions: Array<{ id: string }> } };
+  assert.equal(adminModesJson.value.sessions.some((entry) => entry.id.startsWith("client:")), false);
+
+  handle.storage.setSessionMode("global", "off");
+  const guestSearchOff = await post(`${handle.url}/web-tools/mcp/search`, { query: "test", sessionId: "guest-session" }, guest);
+  assert.equal(guestSearchOff.status, 403);
+  const guestEvalOff = await post(`${handle.url}/web-tools/mcp/evaluate-turn`, {
+    sessionId: "guest-session", modeHint: "smart", promptText: "latest news",
+  }, guest);
+  const guestEvalOffJson = (await guestEvalOff.json()) as { value: { exempted: boolean; readyProviders: string[]; decision?: unknown } };
+  assert.equal(guestEvalOffJson.value.exempted, true, "off gateway must exempt an independently required local client");
+  assert.deepEqual(guestEvalOffJson.value.readyProviders, []);
+  assert.equal(guestEvalOffJson.value.decision, undefined, "off gateway must never classify");
+  const syncedOff = await post(`${handle.url}/web-tools/mcp/evaluate-turn`, { promptText: "latest news" }, guest);
+  assert.equal(((await syncedOff.json()) as { value: { exempted: boolean } }).value.exempted, false);
+
+  handle.storage.setSessionMode("global", "auto");
+  const setSessionOff = await post(`${handle.url}/web-tools/mcp/mode`, { sessionId: "guest-session", mode: "off" }, guest);
+  assert.equal(setSessionOff.status, 200);
+  const sessionEvalOff = await post(`${handle.url}/web-tools/mcp/evaluate-turn`, {
+    sessionId: "guest-session", modeHint: "smart", promptText: "latest news",
+  }, guest);
+  const sessionEvalOffJson = (await sessionEvalOff.json()) as { value: { mode: string; exempted: boolean; decision?: unknown } };
+  assert.equal(sessionEvalOffJson.value.mode, "off");
+  assert.equal(sessionEvalOffJson.value.exempted, true);
+  assert.equal(sessionEvalOffJson.value.decision, undefined);
+  const sessionSearchOff = await post(`${handle.url}/web-tools/mcp/search`, {
+    query: "test", session_id: "guest-session",
+  }, guest);
+  assert.equal(sessionSearchOff.status, 403);
+});
+
+
+test("direct loopback survives password configuration, authorization schemes cannot bypass, and BOM config remains intact", async (t) => {
+  const previousRequireAuth = process.env.KIMI_WEB_TOOLS_REQUIRE_AUTH;
+  delete process.env.KIMI_WEB_TOOLS_REQUIRE_AUTH;
+  t.after(() => {
+    if (previousRequireAuth === undefined) delete process.env.KIMI_WEB_TOOLS_REQUIRE_AUTH;
+    else process.env.KIMI_WEB_TOOLS_REQUIRE_AUTH = previousRequireAuth;
+  });
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-wt-loopback-compat-"));
+  fs.writeFileSync(path.join(baseDir, "config.json"), "\uFEFF{\"enabled\":true,\"exemptWhenNoProvider\":false}", "utf8");
+  fs.writeFileSync(path.join(baseDir, "credentials.json"), "\uFEFF{\"WEB_TOOLS_EXA\":\"fixture-key\"}", "utf8");
+  const handle = await startGatewayServer({
+    host: "127.0.0.1", port: 0, baseDir, projectRoot: ROOT, password: PASSWORD,
+  });
+  t.after(async () => {
+    await handle.close();
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  });
+
+  const localStatus = await post(`${handle.url}/web-tools/mcp/status`, {});
+  assert.equal(localStatus.status, 200, "configured password must not break direct loopback admin");
+  assert.deepEqual(((await localStatus.json()) as { value: { usable: string[] } }).value.usable, ["exa"]);
+  assert.ok(fs.existsSync(path.join(baseDir, "config.json")), "BOM config must not be renamed to corrupt");
+  assert.ok(fs.existsSync(path.join(baseDir, "credentials.json")), "BOM credentials must not be renamed to corrupt");
+  assert.equal(fs.readdirSync(baseDir).some((file) => file.includes(".corrupt-")), false);
+  for (const authorization of ["Basic YWRtaW46YWRtaW4=", "Bearer revoked-token"]) {
+    const invalid = await post(`${handle.url}/web-tools/api/config/get`, {}, { authorization });
+    assert.equal(invalid.status, 401);
+  }
+
+  handle.storage.setSessionMode("global", "required");
+  handle.storage.setSessionMode("owner-pinned", "required");
+  const pinned = await post(`${handle.url}/web-tools/mcp/mode`, { sessionId: "owner-pinned" });
+  assert.equal(((await pinned.json()) as { value: { sessionModeOverride: string | null } }).value.sessionModeOverride, "required");
+  const aliasSet = await post(`${handle.url}/web-tools/mcp/mode`, { mode: "off", session_id: "s-alias" });
+  assert.equal(aliasSet.status, 200);
+  assert.equal(handle.storage.readModeState().globalMode, "required");
+  assert.equal(handle.storage.getEffectiveSessionMode("s-alias"), "off");
+  const aliasSearch = await post(`${handle.url}/web-tools/mcp/search`, { query: "test", session_id: "s-alias" });
+  assert.equal(aliasSearch.status, 403, "REST snake_case session_id must use the same target as MCP");
+});
+
+
+test("Streamable HTTP search validates explicit null max_results and non-string provider", async (t) => {
+  const handle = await authGateway(t);
+  const headers = { authorization: `Bearer ${PASSWORD}` };
+  for (const [id, args, expected] of [
+    [90, { query: "test", max_results: null }, /max_results must be a positive integer/],
+    [91, { query: "test", provider: 123 }, /provider must be a string/],
+  ] as const) {
+    const response = await post(`${handle.url}/mcp`, {
+      jsonrpc: "2.0", id, method: "tools/call", params: { name: "web_search", arguments: args },
+    }, headers);
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as { result: { isError: boolean; content: Array<{ text: string }> } };
+    assert.equal(body.result.isError, true);
+    assert.match(body.result.content[0].text, expected);
+  }
+});

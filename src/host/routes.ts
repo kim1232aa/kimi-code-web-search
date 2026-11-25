@@ -244,6 +244,14 @@ export function isDirectLoopbackRequest(req: WebToolsHttpRequest): boolean {
 const TEST_RUN_ARG = /(^|[\\/])tests?([\\/]|$)|\.test\.[cm]?[jt]s$/;
 
 /**
+ * Browser origin & cross-site check: validates Origin and Sec-Fetch-Site headers
+ * whenever present, allowing absent headers for non-browser / CLI / MCP clients.
+ */
+export function isAllowedBrowserOrigin(req: WebToolsHttpRequest): boolean {
+  return isSameOrigin(req) && isNotCrossSite(req);
+}
+
+/**
  * Whether this request may touch the configuration plane.
  *
  * @returns `"peer"` when the TCP peer is direct loopback or gateway-authenticated,
@@ -251,7 +259,7 @@ const TEST_RUN_ARG = /(^|[\\/])tests?([\\/]|$)|\.test\.[cm]?[jt]s$/;
  *          (weaker, kept so in-process harnesses and tests still work), or `false`.
  */
 export function configPlaneTrust(req: WebToolsHttpRequest): "peer" | "host" | false {
-  if (!isSameOrigin(req) || !isNotCrossSite(req)) return false;
+  if (!isAllowedBrowserOrigin(req)) return false;
   if (isGatewayAuthenticated(req)) return "peer";
   const peer = peerAddressOf(req);
   if (peer !== undefined) {

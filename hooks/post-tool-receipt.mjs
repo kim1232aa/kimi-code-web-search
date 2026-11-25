@@ -8,7 +8,7 @@ import {
   externalWebToolKind,
   hookPayload,
 } from "./mode-state.mjs";
-import { safeResolveRemoteGateway } from "./remote-gateway.mjs";
+import { safeResolveRemoteGateway, stripBom } from "./remote-gateway.mjs";
 
 // Kimi fires PostToolUseFailure only when the tool result sets isError; some
 // MCP servers return provider failures (HTTP 403, quota) as plain text. A
@@ -79,6 +79,7 @@ async function main() {
           : "";
     const hasExplicitSession = Boolean(inputSessionId && inputSessionId !== "global");
     if (!remoteGateway && hasExplicitSession) return;
+    if (remoteGateway && hasExplicitSession && inputSessionId !== sessionId) return;
     if (!fs.existsSync(modeStatePath)) return;
     updateModeState(modeStatePath, (doc) => {
       const entry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
@@ -102,7 +103,7 @@ async function main() {
   let cfg;
   if (!remoteGateway && fs.existsSync(configPath)) {
     try {
-      cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      cfg = JSON.parse(stripBom(fs.readFileSync(configPath, "utf8")));
     } catch {
       return;
     }

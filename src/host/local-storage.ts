@@ -168,7 +168,7 @@ export class LocalStorage {
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(text);
+      parsed = JSON.parse(text.replace(/^\uFEFF/, ""));
     } catch (err) {
       if (err instanceof SyntaxError) {
         backupCorruptFile(filePath);
@@ -283,10 +283,89 @@ export class LocalStorage {
     return Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId].mode ?? doc.globalMode : doc.globalMode;
   }
 
+  private normalizeSafeSessionId(sessionId: string, { allowGlobal = true }: { allowGlobal?: boolean } = {}): string {
+    const raw = typeof sessionId === "string" ? sessionId.trim() : "";
+    const normalized = !raw || raw === "default" ? "global" : raw;
+    if (
+      normalized === "__proto__" ||
+      normalized === "constructor" ||
+      normalized === "prototype" ||
+      normalized.length > 128
+    ) {
+      throw new Error("Invalid session_id");
+    }
+    if (!allowGlobal && normalized === "global") {
+      throw new Error("Client tokens cannot modify global search mode; specify a session_id");
+    }
+    return normalized;
+  }
+
+  private clientSessionKey(clientTokenId: string, sessionId: string): string {
+    const id = this.normalizeSafeSessionId(sessionId, { allowGlobal: false });
+    return `client:${clientTokenId}:${id}`;
+  }
+
+  getEffectiveSessionModeForClient(
+    clientTokenId: string,
+    sessionId: string,
+  ): { mode: SearchMode; globalMode: SearchMode; sessionModeOverride: SearchMode | null } {
+    const doc = this.readModeState();
+    // Owner global "off" acts as a hard ceiling for client tokens.
+    if (doc.globalMode === "off") {
+      return { mode: "off", globalMode: "off", sessionModeOverride: null };
+    }
+    const raw = typeof sessionId === "string" ? sessionId.trim() : "";
+    if (!raw || raw === "global" || raw === "default" || raw === "__proto__" || raw === "constructor" || raw === "prototype" || raw.length > 128) {
+      return { mode: doc.globalMode, globalMode: doc.globalMode, sessionModeOverride: null };
+    }
+    const key = `client:${clientTokenId}:${raw}`;
+    const rec = Object.hasOwn(doc.sessions, key) ? doc.sessions[key] : undefined;
+    const override = typeof rec?.mode === "string" ? rec.mode : null;
+    return {
+      mode: override ?? doc.globalMode,
+      globalMode: doc.globalMode,
+      sessionModeOverride: override,
+    };
+  }
+
+  setClientSessionMode(clientTokenId: string, sessionId: string, mode: SearchMode): SearchMode {
+    if (!isValidMode(mode)) throw new Error("Invalid search mode");
+    const key = this.clientSessionKey(clientTokenId, sessionId);
+    const now = Date.now();
+    const cutoff = now - 30 * 24 * 60 * 60 * 1000;
+    const MAX_CLIENT_SESSIONS = 200;
+    updateModeState(this.modeStatePath, (doc) => {
+      const clientEntries: Array<[string, number]> = [];
+      for (const [k, entry] of Object.entries(doc.sessions)) {
+        if (!k.startsWith("client:") || k === key) continue;
+        const at = Number(entry?.updatedAt ?? 0);
+        if (!Number.isFinite(at) || at < cutoff) {
+          delete doc.sessions[k];
+        } else {
+          clientEntries.push([k, at]);
+        }
+      }
+      if (clientEntries.length >= MAX_CLIENT_SESSIONS) {
+        clientEntries.sort((a, b) => a[1] - b[1]);
+        const excess = clientEntries.length - MAX_CLIENT_SESSIONS + 1;
+        for (let i = 0; i < excess; i++) {
+          delete doc.sessions[clientEntries[i][0]];
+        }
+      }
+      Object.defineProperty(doc.sessions, key, {
+        value: { mode, updatedAt: now },
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    });
+    return mode;
+  }
+
   setSessionMode(sessionId: string, mode: SearchMode): SearchMode {
     if (!isValidMode(mode)) throw new Error("Invalid search mode");
+    const id = this.normalizeSafeSessionId(sessionId, { allowGlobal: true });
     updateModeState(this.modeStatePath, (doc) => {
-      const id = !sessionId || sessionId === "default" ? "global" : sessionId;
       if (id === "global") doc.globalMode = mode;
       const entry = Object.hasOwn(doc.sessions, id) ? doc.sessions[id] : {};
       Object.defineProperty(doc.sessions, id, {

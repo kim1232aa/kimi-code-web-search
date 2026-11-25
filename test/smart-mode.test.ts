@@ -1709,3 +1709,146 @@ test("Windows BOM remote.json, syncMode=false, sendContext=false, legacy failOpe
   assert.equal(Object.hasOwn(afterDoc.sessions, "fresh-session"), true);
   assert.ok(Object.keys(afterDoc.sessions).length <= 503, `ephemeral sessions must stay bounded, got ${Object.keys(afterDoc.sessions).length}`);
 });
+
+
+test("syncMode=false honors remote policy, gateway-off exemption, and strips long-prompt transcript context", async (t) => {
+  const requests: CapturedRequest[] = [];
+  const remote = http.createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw || "{}") as Record<string, unknown>;
+    requests.push({ url: req.url ?? "", headers: req.headers, body });
+    res.writeHead(200, { "content-type": "application/json" });
+    if (body.promptText === "offline") {
+      res.end(JSON.stringify({ ok: true, value: {
+        mode: "off", globalMode: "off", exempted: true, readyProviders: [],
+        requiredEvidence: "search", recognizeExternalWebTools: true,
+      } }));
+      return;
+    }
+    res.end(JSON.stringify({ ok: true, value: {
+      mode: "auto", globalMode: "auto", exempted: false, readyProviders: ["exa"],
+      requiredEvidence: "search-or-fetch", recognizeExternalWebTools: true,
+      ...(body.modeHint === "smart" ? { decision: { ok: true, escalated: true } } : {}),
+    } }));
+  });
+  await new Promise<void>((resolve) => remote.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => remote.close(() => resolve())));
+  const port = (remote.address() as { port: number }).port;
+
+  const home = temporaryHome(t);
+  const storage = new LocalStorage(path.join(home, "web-tools"));
+  fs.mkdirSync(path.join(home, "web-tools"), { recursive: true });
+  fs.writeFileSync(path.join(home, "web-tools", "remote.json"), JSON.stringify({
+    url: `http://127.0.0.1:${port}`, syncMode: false,
+  }));
+  storage.setSessionMode("global", "required");
+  writeWireEntries(home, "independent-required", [
+    { type: "turn.prompt", input: "What did the previous official release change?" },
+    { type: "context.append_message", message: { role: "assistant", content: "The previous release updated routing." } },
+    { type: "turn.prompt", input: "search the current official documentation" },
+  ]);
+  const required = await runHook(home, "user-prompt-submit.mjs", {
+    session_id: "independent-required", prompt: "search the current official documentation",
+  });
+  assert.equal(required.status, 0, required.stderr);
+  assert.match(required.stdout, /page read/);
+  assert.match(required.stdout, /exa/);
+  assert.match(required.stdout, /Recognized external web tools/);
+  assert.equal(requests[0].body.modeHint, "required");
+  const requiredContext = requests[0].body.sessionContext as Record<string, unknown>;
+  assert.deepEqual(requiredContext, {}, "independent required turns must not read or send transcript context");
+  assert.equal(storedTurn(home, "independent-required").requiredEvidence, "search-or-fetch");
+  assert.equal(storedTurn(home, "independent-required").exempted, false);
+  assert.equal(storage.readModeState().globalMode, "required");
+
+  const offline = await runHook(home, "user-prompt-submit.mjs", {
+    session_id: "independent-required", prompt: "offline",
+  });
+  assert.equal(offline.status, 0, offline.stderr);
+  assert.match(offline.stdout, /No usable route/);
+  assert.doesNotMatch(offline.stdout, /Web Search is required/);
+  assert.equal(storedTurn(home, "independent-required").exempted, true);
+
+  const exemptedRequests = requests.length;
+  const steerFrozen = await runHook(home, "user-prompt-submit.mjs", {
+    session_id: "independent-required", prompt: "offline", is_steer: true,
+  });
+  assert.equal(steerFrozen.status, 0, steerFrozen.stderr);
+  assert.equal(requests.length, exemptedRequests, "steer must reuse the frozen turn rather than reclassify");
+  assert.match(steerFrozen.stdout, /No usable route/);
+
+  storage.setSessionMode("global", "smart");
+  writeWireEntries(home, "orphan-steer", [
+    { type: "turn.prompt", input: "What did the earlier documentation say?" },
+    { type: "context.append_message", message: { role: "assistant", content: "I will compare it with current sources." } },
+    { type: "turn.prompt", input: "new smart turn without frozen state" },
+  ]);
+  const orphanSteer = await runHook(home, "user-prompt-submit.mjs", {
+    session_id: "orphan-steer", prompt: "new smart turn without frozen state", is_steer: true,
+  });
+  assert.equal(orphanSteer.status, 0, orphanSteer.stderr);
+  const orphanRequest = requests.at(-1)!.body;
+  const orphanContext = orphanRequest.sessionContext as Record<string, unknown>;
+  assert.equal(orphanContext.prevUserText, undefined, "a long new prompt must not reveal the previous user message");
+  assert.equal(typeof orphanContext.lastAssistantReply, "string");
+  assert.equal(orphanRequest.isSteer, false, "a missing existing turn is still a new turn requiring classification");
+  assert.equal(orphanRequest.modeHint, "smart");
+  assert.match(orphanSteer.stdout, /\[Smart Mode: Escalated to Required Web Search\]/);
+});
+
+test("legacy remote classifier network failure honors failOpen=false", async (t) => {
+  const remote = http.createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw || "{}") as Record<string, unknown>;
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/web-tools/mcp/evaluate-turn") {
+      res.writeHead(404).end(JSON.stringify({ ok: false }));
+      return;
+    }
+    if (req.url === "/web-tools/mcp/status") {
+      res.writeHead(200).end(JSON.stringify({ ok: true, value: {
+        usable: ["exa"],
+        mode: { mode: "smart", globalMode: "smart" },
+        config: { enabled: true, smartSearch: { failOpen: false } },
+      } }));
+      return;
+    }
+    if (body.prompt === "classifier disabled") {
+      res.writeHead(200).end(JSON.stringify({ ok: true, value: { ok: false, escalated: false, fallbackReason: "disabled" } }));
+      return;
+    }
+    req.socket.destroy();
+  });
+  await new Promise<void>((resolve) => remote.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => remote.close(() => resolve())));
+  const port = (remote.address() as { port: number }).port;
+  const env = { KIMI_WEB_TOOLS_GATEWAY_URL: `http://127.0.0.1:${port}` };
+  const home = temporaryHome(t);
+  const result = await runHook(home, "user-prompt-submit.mjs", {
+    session_id: "legacy-network-failure", prompt: "latest official status",
+  }, env);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(storedTurn(home, "legacy-network-failure").required, true);
+  assert.equal(storedTurn(home, "legacy-network-failure").exempted, false);
+  assert.match(result.stdout, /\[Smart Mode: Escalated to Required Web Search\]/);
+
+  const disabledHome = temporaryHome(t);
+  const disabled = await runHook(disabledHome, "user-prompt-submit.mjs", {
+    session_id: "legacy-disabled", prompt: "classifier disabled",
+  }, env);
+  assert.equal(disabled.status, 0, disabled.stderr);
+  assert.equal(storedTurn(disabledHome, "legacy-disabled").required, false, "an explicitly disabled classifier is not a fail-closed outage");
+  assert.doesNotMatch(disabled.stdout, /Escalated to Required/);
+});
+
+
+test("smart classifier state bounds recent tool context", () => {
+  const state = buildSmartClassifierState("latest release", false, {
+    recentTools: ["", ...Array.from({ length: 9 }, (_, index) => ` web_search:${"x".repeat(150)}-${index} `)],
+  }) as { recent_tools: string[] };
+  assert.equal(state.recent_tools.length, 6);
+  assert.ok(state.recent_tools.every((tool) => tool.length <= 120));
+  assert.ok(state.recent_tools.every((tool) => tool.trim().length > 0));
+});

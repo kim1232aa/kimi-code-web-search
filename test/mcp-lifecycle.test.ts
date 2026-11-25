@@ -643,3 +643,78 @@ test("remote web_mode mirrors mode to local mode-state.json and remote.json work
   const modeDoc = JSON.parse(fs.readFileSync(path.join(home, "web-tools", "mode-state.json"), "utf8"));
   assert.equal(modeDoc.globalMode, "required");
 });
+
+
+test("web_mode normalizes empty sessions, reports local availability honestly, and labels remote HTTP failures", async (t) => {
+  const requests: Record<string, unknown>[] = [];
+  let failNext = false;
+  let plainNext = false;
+  const remote = http.createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw || "{}") as Record<string, unknown>;
+    requests.push(body);
+    if (plainNext) {
+      plainNext = false;
+      res.writeHead(502, { "content-type": "text/html" }).end("<html>Bad Gateway</html>");
+      return;
+    }
+    const failed = failNext;
+    failNext = false;
+    res.writeHead(failed ? 503 : 200, { "content-type": "application/json" });
+    res.end(JSON.stringify(failed ? { ok: false, error: { message: "temporarily unavailable" } } : {
+      ok: true,
+      value: { sessionId: body.sessionId ?? "global", mode: body.mode ?? "required", globalMode: "required", available: true },
+    }));
+  });
+  remote.listen(0, "127.0.0.1");
+  await once(remote, "listening");
+  t.after(async () => { remote.closeAllConnections(); await new Promise<void>((resolve) => remote.close(() => resolve())); });
+  const port = (remote.address() as { port: number }).port;
+  const url = `http://127.0.0.1:${port}`;
+  const home = fixture(t);
+  const env = { ...process.env, KIMI_CODE_HOME: home, KIMI_WEB_TOOLS_GATEWAY_URL: url, KIMI_WEB_TOOLS_GATEWAY_TOKEN: "test-token" };
+
+  for (const [id, sessionKey] of [[70, "session_id"], [71, "sessionId"]] as const) {
+    const response = await runNode(["bin/mcp-server.mjs"], env, rpc(id, "tools/call", {
+      name: "web_mode", arguments: { mode: "required", [sessionKey]: "   " },
+    }));
+    assert.equal(response.code, 0, response.stderr);
+    assert.equal(JSON.parse(response.stdout).result.isError, undefined);
+    const request = requests.at(-1)!;
+    assert.equal(request.sessionId, "global");
+    assert.equal(request.updateGlobal, true);
+  }
+
+  failNext = true;
+  const failed = await runNode(["bin/mcp-server.mjs"], env, rpc(72, "tools/call", {
+    name: "web_mode", arguments: { mode: "required" },
+  }));
+  const errorText = JSON.parse(failed.stdout).result.content[0].text as string;
+  assert.match(errorText, new RegExp(`Remote gateway ${url} \\(HTTP 503\\)`));
+  assert.doesNotMatch(errorText, /test-token/);
+
+  plainNext = true;
+  const htmlFailure = await runNode(["bin/mcp-server.mjs"], env, rpc(76, "tools/call", { name: "web_status" }));
+  const htmlErrorText = JSON.parse(htmlFailure.stdout).result.content[0].text as string;
+  assert.match(htmlErrorText, new RegExp(`Remote gateway ${url} \\(HTTP 502\\): Invalid JSON response`));
+  assert.doesNotMatch(htmlErrorText, /test-token/);
+
+  fs.mkdirSync(path.join(home, "web-tools"), { recursive: true });
+  fs.writeFileSync(path.join(home, "web-tools", "remote.json"), JSON.stringify({ url, syncMode: false }));
+  delete env.KIMI_WEB_TOOLS_GATEWAY_URL;
+  delete env.KIMI_WEB_TOOLS_GATEWAY_TOKEN;
+  for (const [id, mode] of [[74, ""], [75, null]] as const) {
+    const invalid = await runNode(["bin/mcp-server.mjs"], env, rpc(id, "tools/call", {
+      name: "web_mode", arguments: { mode },
+    }));
+    assert.equal(JSON.parse(invalid.stdout).result.isError, true, "explicit falsy mode is an invalid set, not a get");
+    assert.match(JSON.parse(invalid.stdout).result.content[0].text, /mode must be auto, smart, required, or off/);
+  }
+  const local = await runNode(["bin/mcp-server.mjs"], env, rpc(73, "tools/call", {
+    name: "web_mode", arguments: { action: "get", session_id: " " },
+  }));
+  assert.equal(local.code, 0, local.stderr);
+  assert.match(JSON.parse(local.stdout).result.content[0].text, /Search Provider Available: unknown \(local mode override\)/);
+  assert.doesNotMatch(JSON.parse(local.stdout).result.content[0].text, /Search Provider Available: yes/);
+});

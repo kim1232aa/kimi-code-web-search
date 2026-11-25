@@ -126,8 +126,9 @@ node ./bin/import-pi.mjs --pi-dir /path/to/pi/agent
 | --- | --- |
 | `WEB_TOOLS_<PROVIDER>` | 搜索源 API key（见上文列表） |
 | `KIMI_WEB_TOOLS_HOST` / `KIMI_WEB_TOOLS_PORT` | 网关监听地址（默认 `127.0.0.1:18492`） |
-| `KIMI_WEB_TOOLS_PASSWORD` | 非回环访问的仪表盘密码（也可用数据目录下的 `public-password` 文件） |
-| `KIMI_WEB_TOOLS_REQUIRE_AUTH=1` | 回环请求也要求密码 |
+| `KIMI_WEB_TOOLS_PASSWORD` | 仪表盘与 `/web-tools/api/*` 的管理员密码（也可用数据目录下的 `public-password` 文件） |
+| `KIMI_WEB_TOOLS_CLIENT_TOKEN` | 仅限 MCP 检索/分类的最小权限访客令牌（逗号分隔，或数据目录下的 `client-token` 文件） |
+| `KIMI_WEB_TOOLS_REQUIRE_AUTH=1` | 回环请求也要求认证 |
 | `KIMI_CODE_HOME` | Kimi Code 数据根目录（默认 `~/.kimi-code`） |
 
 **隐私提示（Smart/Jev）**：开启转录上下文后，每个被分类的轮次会把上一条助手回复和最近工具名（读自会话 `wire.jsonl`）发送给分类器端点；短追问（≤ 24 字符）还会附带上一轮用户输入。请按对话的隐私需求选择后端，或在 Smart/Jev 面板关闭转录上下文。
@@ -157,7 +158,7 @@ node ./bin/import-pi.mjs --pi-dir /path/to/pi/agent
 
 ## 接入远程网关
 
-**客户端**上的 Kimi 插件加载 Skill、命令并运行钩子；**网关**执行搜索和网页读取，并持有搜索源凭据。搜索源配在网关主机上。远程访问用可信的 HTTPS 地址，网关继续只监听回环，由反代转发原始客户端地址（`X-Forwarded-For`），避免把反代请求当成回环直连。服务端通过 `KIMI_WEB_TOOLS_PASSWORD` 或 `web-tools/public-password` 配置网关密码；客户端的 `KIMI_WEB_TOOLS_GATEWAY_TOKEN` 填的是这个密码，不是搜索源 key。它也能访问仪表盘，只交给可信客户端，不要把值写进插件清单、共享的 `mcp.json` 或聊天记录。
+**客户端**上的 Kimi 插件加载 Skill、命令并运行钩子；**网关**执行搜索和网页读取，并持有搜索源凭据。搜索源配在网关主机上。远程访问用可信的 HTTPS 地址，网关继续只监听回环，由反代转发原始客户端地址（`X-Forwarded-For`），避免把反代请求当成回环直连。服务端通过 `KIMI_WEB_TOOLS_PASSWORD` 或 `web-tools/public-password` 配置管理员密码（拥有仪表盘与 `/web-tools/api/*` 权限）；若要共享给他人，请另行配置最小权限访客令牌（`KIMI_WEB_TOOLS_CLIENT_TOKEN` 或 `web-tools/client-token`），不要直接发管理员密码。客户端的 `KIMI_WEB_TOOLS_GATEWAY_TOKEN`（或 `remote.json` 的 `token`）填写管理员密码（仅限本人设备）或访客令牌（仅 MCP 权限、无法进仪表盘），不是搜索源 key；切勿写入共享的 `mcp.json` 或聊天记录。
 
 ### HTTP MCP 直连
 
@@ -194,7 +195,7 @@ node ./bin/import-pi.mjs --pi-dir /path/to/pi/agent
 
 `remote.json` 支持两个可选客户端隔离项：
 - `"syncMode": false` — 搜索模式（`auto`/`smart`/`required`/`off`）仅由本机独立管理，不跟远端 `globalMode` 互相覆盖（多人共用网关推荐开启）。
-- `"sendContext": false` — 调用远端 Smart（Jev）分类时不附带本机 `wire.jsonl` 短追问上下文，保护隐私。
+- `"sendContext": false` — 调用远端网关时不上传本机 `wire.jsonl` 转录上下文（`lastAssistantReply`、`recentTools`，以及 ≤ 24 字符短追问时的 `prevUserText`），保护隐私。
 
 2. **环境变量：** 把 `KIMI_WEB_TOOLS_GATEWAY_URL`（网关地址，不带 `/mcp`）和 `KIMI_WEB_TOOLS_GATEWAY_TOKEN` 设到启动 Kimi 的进程环境中（环境变量优先于 `remote.json`；显式设 `KIMI_WEB_TOOLS_GATEWAY_URL=""` 可强制回退本地模式）：
 

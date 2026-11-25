@@ -45,7 +45,7 @@ export function readModeState(file = path.join(webToolsDir(), "mode-state.json")
     if (error.code === "ENOENT") return { globalMode: "auto", sessions: {}, updatedAt: Date.now() };
     throw error;
   }
-  const doc = JSON.parse(raw);
+  const doc = JSON.parse(raw.replace(/^\uFEFF/, ""));
   if (!doc || !modes.has(doc.globalMode) || !doc.sessions || typeof doc.sessions !== "object" || Array.isArray(doc.sessions)) {
     throw new Error(`Invalid mode-state document: ${file}`);
   }

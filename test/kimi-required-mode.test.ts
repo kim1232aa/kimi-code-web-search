@@ -355,3 +355,39 @@ test("kimi.plugin.json updated timeout, clean metadata, and robust PostToolUse m
     }
   }
 });
+
+
+test("BOM mode/config files parse and remote receipts reject explicit cross-session ids", (t) => {
+  const { home, storage, hook } = fixture(t);
+  storage.setSessionMode("global", "required");
+  const modePath = path.join(home, "web-tools", "mode-state.json");
+  fs.writeFileSync(modePath, `\uFEFF${fs.readFileSync(modePath, "utf8")}`, "utf8");
+  fs.writeFileSync(path.join(home, "web-tools", "config.json"), "\uFEFF{\"recognizeExternalWebTools\":true,\"exemptWhenNoProvider\":false}", "utf8");
+
+  const turn = hook("user-prompt-submit.mjs", { session_id: "s-bom-receipt" });
+  assert.equal(turn.status, 0, turn.stderr);
+  assert.equal(storage.getTurnState("s-bom-receipt")?.required, true, "BOM mode-state must still enforce required");
+
+  const environment = { ...process.env, KIMI_CODE_HOME: home };
+  const external = spawnSync(process.execPath, [path.join(root, "hooks", "post-tool-receipt.mjs")], {
+    input: JSON.stringify({
+      hook_event_name: "PostToolUse", session_id: "s-bom-receipt",
+      tool_name: "mcp__exa__web_search_exa", tool_input: { query: "q" },
+      tool_response: { content: [{ type: "text", text: "ok" }] },
+    }),
+    encoding: "utf8", env: environment,
+  });
+  assert.equal(external.status, 0, external.stderr);
+  assert.equal(storage.getTurnState("s-bom-receipt")?.externalSearchCompleted, true, "BOM config must still enable external recognition");
+
+  const mismatched = spawnSync(process.execPath, [path.join(root, "hooks", "post-tool-receipt.mjs")], {
+    input: JSON.stringify({
+      hook_event_name: "PostToolUse", session_id: "s-bom-receipt",
+      tool_name: ownSearch, tool_input: { query: "q", session_id: "another-session" },
+      tool_response: { content: [{ type: "text", text: "ok" }] },
+    }),
+    encoding: "utf8", env: { ...environment, KIMI_WEB_TOOLS_GATEWAY_URL: "https://gw.example.com" },
+  });
+  assert.equal(mismatched.status, 0, mismatched.stderr);
+  assert.equal(storage.getTurnState("s-bom-receipt")?.webSearchCompleted, false, "explicit other-session tool calls never credit this session");
+});

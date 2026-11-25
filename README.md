@@ -126,8 +126,9 @@ Environment variables:
 | --- | --- |
 | `WEB_TOOLS_<PROVIDER>` | Provider API key (see list above) |
 | `KIMI_WEB_TOOLS_HOST` / `KIMI_WEB_TOOLS_PORT` | Gateway bind address (default `127.0.0.1:18492`) |
-| `KIMI_WEB_TOOLS_PASSWORD` | Dashboard password for non-loopback access (or a `public-password` file in the data dir) |
-| `KIMI_WEB_TOOLS_REQUIRE_AUTH=1` | Require the password even for loopback requests |
+| `KIMI_WEB_TOOLS_PASSWORD` | Admin password for Dashboard & `/web-tools/api/*` (or a `public-password` file in the data dir) |
+| `KIMI_WEB_TOOLS_CLIENT_TOKEN` | Least-privilege client token(s) for shared MCP access only (comma-separated, or `client-token` file) |
+| `KIMI_WEB_TOOLS_REQUIRE_AUTH=1` | Require authentication even for loopback requests |
 | `KIMI_CODE_HOME` | Kimi Code data root (default `~/.kimi-code`) |
 
 **Privacy note (Smart/Jev):** with transcript context enabled, every classified turn sends the last assistant reply and recent tool names (read from the session's `wire.jsonl`) to the classifier endpoint; short follow-ups (≤ 24 chars) additionally include the previous user turn. Choose a backend appropriate for your conversation's privacy needs, or disable transcript context in the Smart/Jev panel.
@@ -157,7 +158,7 @@ A typical personal setup can run entirely on free tiers: e.g. Keenable keyless +
 
 ## Connect to a remote gateway
 
-The Kimi plugin runs hooks and loads skills on the **client**. The **gateway** runs search and page reads and holds the provider credentials. Configure search providers on the gateway host. For remote access, use a trusted HTTPS endpoint, keep the gateway bound to loopback behind a reverse proxy, and forward the original client address (`X-Forwarded-For`) so proxied requests are not treated as direct loopback calls. Set the gateway password on the server (`KIMI_WEB_TOOLS_PASSWORD` or the `web-tools/public-password` file). The client's `KIMI_WEB_TOOLS_GATEWAY_TOKEN` holds that password, not a search-provider key. It grants dashboard access too; only give it to trusted clients. Never put the value in the plugin manifest, a shared `mcp.json`, or a chat transcript.
+The Kimi plugin runs hooks and loads skills on the **client**. The **gateway** runs search and page reads and holds the provider credentials. Configure search providers on the gateway host. For remote access, use a trusted HTTPS endpoint, keep the gateway bound to loopback behind a reverse proxy, and forward the original client address (`X-Forwarded-For`) so proxied requests are not treated as direct loopback calls. On the server, set the admin password (`KIMI_WEB_TOOLS_PASSWORD` or `web-tools/public-password`) for Dashboard and `/web-tools/api/*` access; when sharing the gateway with others, issue separate least-privilege client tokens (`KIMI_WEB_TOOLS_CLIENT_TOKEN` or `web-tools/client-token`) instead of handing out the admin password. The client's `KIMI_WEB_TOOLS_GATEWAY_TOKEN` (or `remote.json` `token`) holds either your admin password (for your own trusted machines) or a client token (MCP-only, no Dashboard access), not a search-provider key. Never commit tokens or paste them into a shared `mcp.json` or chat transcript.
 
 ### Direct HTTP MCP (no local gateway)
 
@@ -194,7 +195,7 @@ Keep plugin `web` and its server `s` enabled; do not add a second copy of the se
 
 Optional per-client flags in `remote.json`:
 - `"syncMode": false` — keep Search Mode (`auto`/`smart`/`required`/`off`) local to this client instead of mirroring the gateway's global mode (recommended when sharing a gateway with other users).
-- `"sendContext": false` — do not send local `wire.jsonl` short-followup transcript context when delegating Smart (Jev) classification to a shared gateway.
+- `"sendContext": false` — do not send local `wire.jsonl` transcript context (`lastAssistantReply`, `recentTools`, and `prevUserText` for prompts ≤ 24 chars) when calling the remote gateway.
 
 2. **Environment variables:** set `KIMI_WEB_TOOLS_GATEWAY_URL` (the gateway origin, without `/mcp`) and `KIMI_WEB_TOOLS_GATEWAY_TOKEN` in the Kimi process environment (env vars take precedence over `remote.json`; setting `KIMI_WEB_TOOLS_GATEWAY_URL=""` forces local mode):
 
