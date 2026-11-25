@@ -286,6 +286,27 @@ test("post-tool-receipt credits own tools for remote gateway or omitted/global s
   }, { KIMI_WEB_TOOLS_GATEWAY_URL: "https://gw.example.com" }).status, 0);
   assert.equal(storage.getTurnState("s-remote")!.webSearchCompleted, true);
   assert.equal(storage.getTurnState("s-remote")!.webSearchSucceeded, false);
+
+  // 5. Remote gateway with active subagent -> unbound call must NOT credit parent turn; explicit parent session_id DOES
+  hook("user-prompt-submit.mjs", { session_id: "s-remote-sub" });
+  hook("subagent-activity.mjs", { hook_event_name: "SubagentStart", session_id: "s-remote-sub" });
+  assert.equal(runWithEnv("post-tool-receipt.mjs", {
+    hook_event_name: "PostToolUse",
+    session_id: "s-remote-sub",
+    tool_name: ownSearch,
+    tool_input: { query: "unbound subagent query" },
+    tool_response: { content: [{ type: "text", text: "ok" }] },
+  }, { KIMI_WEB_TOOLS_GATEWAY_URL: "https://gw.example.com" }).status, 0);
+  assert.equal(storage.getTurnState("s-remote-sub")!.webSearchCompleted, false, "unbound subagent search must not credit parent in remote mode");
+
+  assert.equal(runWithEnv("post-tool-receipt.mjs", {
+    hook_event_name: "PostToolUse",
+    session_id: "s-remote-sub",
+    tool_name: ownSearch,
+    tool_input: { query: "bound subagent query", session_id: "s-remote-sub" },
+    tool_response: { content: [{ type: "text", text: "ok" }] },
+  }, { KIMI_WEB_TOOLS_GATEWAY_URL: "https://gw.example.com" }).status, 0);
+  assert.equal(storage.getTurnState("s-remote-sub")!.webSearchCompleted, true, "explicitly bound subagent search must credit parent in remote mode");
 });
 
 test("stop-turn-gate fallback turn demands search and distinguishes no-attempt vs all-failed reminders", (t) => {

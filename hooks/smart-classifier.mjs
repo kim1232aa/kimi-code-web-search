@@ -395,7 +395,11 @@ export async function classifySmartTurn(input) {
       throw classifierError("missing-credential", "Smart classifier credential is not configured");
     }
     signal = AbortSignal.timeout(Math.round(clampedNumber(smart.timeoutMs, 300, 10000, DEFAULT_SMART_CONFIG.timeoutMs)));
-    const context = smart.enableTranscriptContext === false ? {} : extractKimiSessionContext(input.sessionId, input.kimiCodeHome);
+    const context = smart.enableTranscriptContext === false
+      ? {}
+      : (input.sessionContext !== undefined
+        ? input.sessionContext
+        : extractKimiSessionContext(input.sessionId, input.kimiCodeHome));
     const state = buildSmartClassifierState(input.promptText, input.hasImages, context);
     // System One is TypeSafe's protocol. OpenRouter and openai-compatible
     // backends speak the OpenAI Chat Completions schema (OpenRouter's API

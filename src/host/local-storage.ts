@@ -314,6 +314,39 @@ export class LocalStorage {
     });
   }
 
+  recordSmartDecision(sessionId: string, decision: Record<string, unknown>): void {
+    const raw = typeof sessionId === "string" ? sessionId.trim() : "";
+    const unsafeKey = raw === "__proto__" || raw === "constructor" || raw === "prototype";
+    const id = !raw || raw === "default" || unsafeKey || raw.length > 128 ? "global" : raw;
+    const now = Date.now();
+    const cutoff = now - 30 * 24 * 60 * 60 * 1000;
+    const MAX_EPHEMERAL_SESSIONS = 500;
+    updateModeState(this.modeStatePath, (doc) => {
+      const ephemeral: Array<[string, number]> = [];
+      for (const [key, entry] of Object.entries(doc.sessions)) {
+        if (key === id || key === "global" || typeof entry?.mode === "string") continue;
+        const at = Number(entry?.updatedAt ?? 0);
+        if (!Number.isFinite(at) || at < cutoff) {
+          delete doc.sessions[key];
+        } else {
+          ephemeral.push([key, at]);
+        }
+      }
+      if (ephemeral.length >= MAX_EPHEMERAL_SESSIONS) {
+        ephemeral.sort((a, b) => a[1] - b[1]);
+        const excess = ephemeral.length - MAX_EPHEMERAL_SESSIONS + 1;
+        for (let i = 0; i < excess; i++) {
+          delete doc.sessions[ephemeral[i][0]];
+        }
+      }
+      const existing = Object.hasOwn(doc.sessions, id) ? doc.sessions[id] : {};
+      Object.defineProperty(doc.sessions, id, {
+        value: { ...existing, lastSmartDecision: decision, updatedAt: now },
+        enumerable: true, writable: true, configurable: true,
+      });
+    });
+  }
+
   bindToolTurn(sessionId: string, turnId?: number): number | undefined {
     const doc = this.readModeState();
     const entry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;

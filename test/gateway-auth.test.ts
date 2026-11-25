@@ -228,3 +228,87 @@ test("web_status returns usable: [] when globally disabled and handle.close() dr
   agent.destroy();
   assert.ok(Date.now() - started < 1500, "handle.close() should close keep-alive connections promptly");
 });
+
+test("least-privilege client tokens allow MCP/evaluate-turn/session mode but block management APIs and global mode mutation", async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-wt-client-token-"));
+  // Write client-token file with UTF-8 BOM and comments to verify file loading too.
+  fs.writeFileSync(path.join(baseDir, "client-token"), "\uFEFF# guest token\nguest-token-123\n");
+  const handle = await startGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    baseDir,
+    projectRoot: ROOT,
+    password: PASSWORD,
+  });
+  t.after(async () => {
+    await handle.close();
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  });
+
+  handle.storage.setCredential("WEB_TOOLS_EXA", "owner-secret-key-999");
+  handle.storage.setSessionMode("owner-private-session", "required");
+
+  const guestHeaders = {
+    authorization: "Bearer guest-token-123",
+    "x-forwarded-for": "198.51.100.7",
+  };
+
+  // 1. Client token cannot log into Dashboard or hit /web-tools/api/* (prevents API key exfiltration via baseUrl poisoning)
+  const sessionView = await fetch(`${handle.url}/web-tools/auth/session`, { headers: guestHeaders });
+  assert.equal(((await sessionView.json()) as { value: { authenticated: boolean } }).value.authenticated, false);
+
+  const loginAttempt = await post(`${handle.url}/web-tools/auth/login`, { password: "guest-token-123" }, {
+    "x-forwarded-for": "198.51.100.7",
+  });
+  assert.equal(loginAttempt.status, 401);
+
+  for (const apiPath of ["/web-tools/api/config/get", "/web-tools/api/config/save", "/web-tools/api/sources/endpoint-set", "/web-tools/api/credentials/describe"]) {
+    const blocked = await post(`${handle.url}${apiPath}`, { providerBaseUrls: { exa: "https://attacker.example/v1" } }, guestHeaders);
+    assert.equal(blocked.status, 403, `client token must be blocked from ${apiPath}`);
+  }
+
+  // 2. Client token cannot mutate globalMode via REST or /mcp, and cannot list owner sessions
+  const globalSetRest = await post(`${handle.url}/web-tools/mcp/mode`, { action: "set", mode: "off", sessionId: "global" }, guestHeaders);
+  assert.equal(globalSetRest.status, 403);
+  const globalToggleRest = await post(`${handle.url}/web-tools/mcp/mode`, { action: "toggle", sessionId: "global" }, guestHeaders);
+  assert.equal(globalToggleRest.status, 403);
+  const globalSetMcp = await post(`${handle.url}/mcp`, {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "web_mode", arguments: { action: "set", mode: "off", session_id: "global" } },
+  }, guestHeaders);
+  assert.equal(globalSetMcp.status, 200);
+  const mcpErr = (await globalSetMcp.json()) as { result: { isError?: boolean; content: Array<{ text: string }> } };
+  assert.equal(mcpErr.result.isError, true);
+  assert.match(mcpErr.result.content[0].text, /Client tokens cannot modify global search mode/);
+  assert.equal(handle.storage.readModeState().globalMode, "auto");
+
+  // Session-scoped mode set & get work, without leaking owner session list
+  const ownSet = await post(`${handle.url}/web-tools/mcp/mode`, { action: "set", mode: "required", sessionId: "guest-s1" }, guestHeaders);
+  assert.equal(ownSet.status, 200);
+  const ownGet = await post(`${handle.url}/web-tools/mcp/mode`, { action: "get", sessionId: "guest-s1" }, guestHeaders);
+  assert.equal(ownGet.status, 200);
+  const ownGetJson = (await ownGet.json()) as { value: { mode: string; sessions?: unknown } };
+  assert.equal(ownGetJson.value.mode, "required");
+  assert.equal(ownGetJson.value.sessions, undefined, "client token must not see other sessions");
+
+  // 3. /web-tools/mcp/status for client token returns usable engines only (no gateway bind/PID, no providers key hints)
+  const statusRes = await post(`${handle.url}/web-tools/mcp/status`, { sessionId: "guest-s1" }, guestHeaders);
+  assert.equal(statusRes.status, 200);
+  const statusJson = (await statusRes.json()) as { value: Record<string, unknown> };
+  assert.deepEqual(statusJson.value.usable, ["exa"]);
+  assert.equal(statusJson.value.gateway, undefined);
+  assert.equal(statusJson.value.providers, undefined);
+  assert.equal(statusJson.value.config, undefined);
+
+  // 4. /web-tools/mcp/evaluate-turn works for client token
+  const evalRes = await post(`${handle.url}/web-tools/mcp/evaluate-turn`, {
+    sessionId: "guest-s1",
+    promptText: "hello",
+  }, guestHeaders);
+  assert.equal(evalRes.status, 200);
+  const evalJson = (await evalRes.json()) as { value: { mode: string; readyProviders: string[] } };
+  assert.equal(evalJson.value.mode, "required");
+  assert.deepEqual(evalJson.value.readyProviders, ["exa"]);
+});

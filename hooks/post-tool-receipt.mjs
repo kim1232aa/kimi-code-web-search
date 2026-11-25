@@ -8,6 +8,7 @@ import {
   externalWebToolKind,
   hookPayload,
 } from "./mode-state.mjs";
+import { safeResolveRemoteGateway } from "./remote-gateway.mjs";
 
 // Kimi fires PostToolUseFailure only when the tool result sets isError; some
 // MCP servers return provider failures (HTTP 403, quota) as plain text. A
@@ -56,7 +57,9 @@ async function main() {
   const sessionId =
     typeof payload.session_id === "string" && payload.session_id.trim() ? payload.session_id.trim() : "global";
   const baseDir = webToolsDir();
+  const kimiCodeHome = path.dirname(baseDir);
   const modeStatePath = path.join(baseDir, "mode-state.json");
+  const remoteGateway = Boolean(safeResolveRemoteGateway({ kimiCodeHome }));
   const input =
     payload.tool_input && typeof payload.tool_input === "object" && !Array.isArray(payload.tool_input)
       ? payload.tool_input
@@ -68,7 +71,6 @@ async function main() {
   // so credit those here unless a subagent is active on local mode.
   const ownKind = classifyOwnTool(payload.tool_name);
   if (ownKind) {
-    const remoteGateway = Boolean(process.env.KIMI_WEB_TOOLS_GATEWAY_URL?.trim());
     const inputSessionId =
       typeof input.session_id === "string" && input.session_id.trim()
         ? input.session_id.trim()
@@ -82,7 +84,7 @@ async function main() {
       const entry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
       if (!entry?.turn) return;
       const subagentActive = typeof entry.activeSubagents === "number" && entry.activeSubagents > 0;
-      if (!remoteGateway && subagentActive) return;
+      if (subagentActive && !(hasExplicitSession && inputSessionId === sessionId)) return;
       if (ownKind === "web_search") {
         recordOutcome(entry.turn, "webSearchCompleted", "webSearchSucceeded", failed);
       } else {
@@ -98,19 +100,20 @@ async function main() {
 
   const configPath = path.join(baseDir, "config.json");
   let cfg;
-  if (fs.existsSync(configPath)) {
+  if (!remoteGateway && fs.existsSync(configPath)) {
     try {
       cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
     } catch {
       return;
     }
   }
-  if (cfg?.recognizeExternalWebTools === false) return;
+  if (!remoteGateway && cfg?.recognizeExternalWebTools === false) return;
 
   if (!fs.existsSync(modeStatePath)) return;
   updateModeState(modeStatePath, (doc) => {
     const entry = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
     if (!entry?.turn) return;
+    if (entry.turn.recognizeExternal === false) return;
     recordOutcome(entry.turn, "externalWebCompleted", "externalWebSucceeded", failed);
     if (kind === "search") {
       recordOutcome(entry.turn, "externalSearchCompleted", "externalSearchSucceeded", failed);

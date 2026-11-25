@@ -181,7 +181,22 @@ Open a **new** session. In the TUI, check `/mcp`: `web-remote` should be connect
 
 ### Stdio bridge to a remote gateway
 
-Keep plugin `web` and its server `s` enabled; do not add a second copy of the search tools to `mcp.json`. Set `KIMI_WEB_TOOLS_GATEWAY_URL` to the **gateway origin, without `/mcp`**, and `KIMI_WEB_TOOLS_GATEWAY_TOKEN` in the Kimi process environment. Then relaunch Kimi and open a new session. In the following examples, supply the token separately as described above; the URL alone does not authenticate requests.
+Keep plugin `web` and its server `s` enabled; do not add a second copy of the search tools to `mcp.json`. Point both the stdio server and client hooks at the remote gateway in either of two ways:
+
+1. **Client config file (recommended for Kimi Desktop on Windows/macOS, survives plugin updates):** create `$KIMI_CODE_HOME/web-tools/remote.json` (default `~/.kimi-code/web-tools/remote.json` or `%USERPROFILE%\.kimi-code\web-tools\remote.json`) with permissions `0600`:
+
+```json
+{
+  "url": "https://search.example.com",
+  "token": "your-gateway-token"
+}
+```
+
+Optional per-client flags in `remote.json`:
+- `"syncMode": false` — keep Search Mode (`auto`/`smart`/`required`/`off`) local to this client instead of mirroring the gateway's global mode (recommended when sharing a gateway with other users).
+- `"sendContext": false` — do not send local `wire.jsonl` short-followup transcript context when delegating Smart (Jev) classification to a shared gateway.
+
+2. **Environment variables:** set `KIMI_WEB_TOOLS_GATEWAY_URL` (the gateway origin, without `/mcp`) and `KIMI_WEB_TOOLS_GATEWAY_TOKEN` in the Kimi process environment (env vars take precedence over `remote.json`; setting `KIMI_WEB_TOOLS_GATEWAY_URL=""` forces local mode):
 
 ```bash
 export KIMI_WEB_TOOLS_GATEWAY_URL="https://search.example.com"
@@ -193,12 +208,22 @@ $env:KIMI_WEB_TOOLS_GATEWAY_URL = 'https://search.example.com'
 kimi
 ```
 
-`/mcp` should show the bundled server (`plugin-web_s`). Test a search. The bridge calls `/web-tools/mcp/*`, not the public `/mcp` endpoint; the reverse proxy must expose those routes for this option. A configured remote request that fails does **not** fall back to local startup. If the URL is missing from the stdio process, it assumes a local gateway: retrieval can start it, but mode and status queries only check for an existing gateway. Launching Desktop independently of the shell does not give it that shell's variables.
+Relaunch Kimi and open a new session. `/mcp` should show the bundled server (`plugin-web_s`). The bridge and hooks call `/web-tools/mcp/*`, not the public `/mcp` endpoint; the reverse proxy must expose those routes for this option (dedicate a root origin such as `https://search.example.com` if you also serve the Web Dashboard). A configured remote request that fails does **not** fall back to local startup.
 
-### Remote policy limitations
+### Sharing a gateway with others (least-privilege client tokens)
 
-- **Direct HTTP is a tools connection, not a plugin install.** It does not install the Skill, slash commands, or hooks. If you keep the plugin enabled for its hooks, `web-remote` can count as an external search when `recognizeExternalWebTools` is enabled and the receipt is recorded. The bundled `off` hook does not block this separate MCP entry.
-- **Neither connection shares the client's turn state with the gateway.** Client-side turn tracking and hooks use the client's local `mode-state.json`, while status and mode queries over a remote bridge describe the gateway rather than the client's policy. Do not assume cross-host Jev, `required`, or `off` is equivalent to running both parts on one host. Leave the search-provider keys on the gateway.
+Never share the admin password (`KIMI_WEB_TOOLS_PASSWORD` / `public-password`) with untrusted users: admin auth grants full Dashboard and `/web-tools/api/*` access (including changing provider base URLs and credentials).
+
+Instead, configure one or more **client tokens** on the gateway host via `KIMI_WEB_TOOLS_CLIENT_TOKEN` (comma-separated) or `$KIMI_CODE_HOME/web-tools/client-token` (one token per line, `0600`). A client token:
+- **Can** run `web_search`, `web_fetch`, `web_status` (usable engine names only), `evaluate-turn` (Smart classification), and read or set its own non-global `session_id` mode.
+- **Cannot** access `/web-tools/api/*`, log in to the Dashboard, modify `globalMode`, or list other sessions' IDs or decisions.
+
+For shared gateways, put rate limiting in your reverse proxy (Nginx/Caddy/Cloudflare) and recommend guest clients set `"syncMode": false` and `"sendContext": false` in their `remote.json`.
+
+### Remote policy & Smart (Jev) sync
+
+- **Stdio bridge / `remote.json`:** on each user turn, `UserPromptSubmit` calls `POST /web-tools/mcp/evaluate-turn` on the remote gateway to sync Search Mode (`auto`/`smart`/`required`/`off`), `requiredEvidence`, `recognizeExternalWebTools`, `exemptWhenNoProvider`, and ready search engines into the client's local `mode-state.json`. When Search Mode is `smart`, the Jev/Smart classifier runs **on the remote gateway** using the gateway's credentials, settings, and network (avoiding client-side regional blocks such as TypeSafe HTTP 451 while forwarding only the client's short-followup transcript context when enabled). Calling `web_mode` / `/web:mode` also mirrors the updated mode locally right away.
+- **Direct HTTP MCP (`web-remote`):** connects only the tools and does not install the Skill, slash commands, or hooks. If you keep the plugin enabled for its hooks without `remote.json` or `KIMI_WEB_TOOLS_GATEWAY_URL`, `web-remote` searches count as external searches when `recognizeExternalWebTools` is enabled, while the bundled `off` hook does not block that separate MCP entry.
 
 ### MCP troubleshooting
 

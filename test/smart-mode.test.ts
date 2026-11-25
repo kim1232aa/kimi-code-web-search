@@ -1375,3 +1375,337 @@ test("smart classifier trims short follow-ups, extracts output_text, and parses 
   assert.equal(result.escalated, true);
   assert.deepEqual(result.probabilities, { needs_external_lookup: 0.85, involves_tool_or_config_claim: 0.2 });
 });
+
+test("remote gateway evaluates Smart (Jev) turn remotely, syncs mode & policy to clean client via remote.json, and credits remote search", async (t) => {
+  const classifier = await mockClassifier(t, {
+    probabilities: { needs_external_lookup: 0.96, involves_tool_or_config_claim: 0.1 },
+  });
+  const gatewayHome = temporaryHome(t);
+  const gatewayDir = path.join(gatewayHome, "web-tools");
+  writeJson(path.join(gatewayDir, "config.json"), {
+    enabled: true,
+    defaultProvider: "exa",
+    fallbackOrder: ["tavily"],
+    exemptWhenNoProvider: true,
+    recognizeExternalWebTools: false,
+    requiredEvidence: "search-or-fetch",
+    smartSearch: {
+      enabled: true,
+      provider: "typesafe",
+      model: "jev-latest",
+      baseUrl: classifier.baseUrl,
+      timeoutMs: 2000,
+      threshold: 0.5,
+      failOpen: true,
+      enableTranscriptContext: true,
+    },
+  });
+  writeJson(path.join(gatewayDir, "credentials.json"), {
+    WEB_TOOLS_EXA: "remote-exa-key",
+    WEB_TOOLS_TYPESAFE: "remote-jev-key",
+  });
+  const gatewayStorage = new LocalStorage(gatewayDir);
+  gatewayStorage.setSessionMode("global", "smart");
+
+  const handle = await startGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    baseDir: gatewayDir,
+    password: "remote-gw-password",
+  });
+  t.after(() => handle.close());
+
+  // Clean Windows-like client: NO local config.json, NO local keys, local mode defaults to "auto",
+  // connected via remote.json (no KIMI_WEB_TOOLS_GATEWAY_URL env var needed).
+  const clientHome = temporaryHome(t);
+  writeJson(path.join(clientHome, "web-tools", "remote.json"), {
+    url: handle.url,
+    token: "remote-gw-password",
+  });
+  const sessionId = "remote-smart-session";
+  writeWire(clientHome, sessionId);
+
+  const prompt = await runHook(clientHome, "user-prompt-submit.mjs", {
+    session_id: sessionId,
+    prompt: "真的吗",
+  });
+  assert.equal(prompt.status, 0, prompt.stderr);
+  assert.match(prompt.stdout, /\[Smart Mode: Escalated to Required Web Search\]/);
+  assert.match(prompt.stdout, /Ready search providers \(for web_search provider=\.\.\.\): exa\./);
+  assert.doesNotMatch(prompt.stdout, /WebSearch|another search MCP/, "remote recognizeExternalWebTools=false must sync to client");
+
+  // Verify the remote classifier actually received client wire.jsonl short-followup context
+  assert.equal(classifier.requests.length, 1);
+  assert.equal(classifier.requests[0].headers.authorization, "Bearer remote-jev-key");
+  const state = classifier.requests[0].body.state as Record<string, unknown>;
+  assert.equal(state.user_prompt, "真的吗");
+  assert.equal(typeof state.recent_user_context, "string");
+  assert.ok((state.recent_user_context as string).length > 0, "client wire context must reach remote classifier");
+
+  // Local mode-state.json must have synced globalMode=smart, required=true, requiredEvidence=search-or-fetch, recognizeExternal=false
+  const clientDoc = JSON.parse(fs.readFileSync(path.join(clientHome, "web-tools", "mode-state.json"), "utf8"));
+  assert.equal(clientDoc.globalMode, "smart");
+  assert.equal(clientDoc.sessions[sessionId].turn.required, true);
+  assert.equal(clientDoc.sessions[sessionId].turn.requiredEvidence, "search-or-fetch");
+  assert.equal(clientDoc.sessions[sessionId].turn.recognizeExternal, false);
+
+  // Gateway also recorded lastSmartDecision for dashboard/status visibility
+  const gatewayDoc = gatewayStorage.readModeState() as unknown as { sessions: Record<string, { lastSmartDecision?: { escalated?: boolean } }> };
+  assert.equal(gatewayDoc.sessions[sessionId]?.lastSmartDecision?.escalated, true);
+
+  // External tool must be ignored because remote recognizeExternalWebTools=false synced onto turn
+  const extReceipt = await runHook(clientHome, "post-tool-receipt.mjs", {
+    hook_event_name: "PostToolUse",
+    session_id: sessionId,
+    tool_name: "mcp__exa__web_search_exa",
+    tool_input: { query: "菜价" },
+    tool_response: { content: [{ type: "text", text: "ok" }] },
+  });
+  assert.equal(extReceipt.status, 0, extReceipt.stderr);
+  assert.equal(storedTurn(clientHome, sessionId).externalSearchCompleted, false);
+
+  // Own tool receipt (even with explicit session_id and without env vars, resolved via remote.json) must credit turn
+  const ownReceipt = await runHook(clientHome, "post-tool-receipt.mjs", {
+    hook_event_name: "PostToolUse",
+    session_id: sessionId,
+    tool_name: "mcp__plugin-web_s__web_search",
+    tool_input: { query: "菜价", session_id: sessionId },
+    tool_response: { content: [{ type: "text", text: "Query: 菜价 | Results: 3" }] },
+  });
+  assert.equal(ownReceipt.status, 0, ownReceipt.stderr);
+  assert.equal(storedTurn(clientHome, sessionId).webSearchCompleted, true);
+  assert.equal(storedTurn(clientHome, sessionId).webSearchSucceeded, true);
+
+  const stop = await runHook(clientHome, "stop-turn-gate.mjs", { session_id: sessionId });
+  assert.equal(stop.status, 0, stop.stderr);
+});
+
+test("remote gateway manifest env fallback and legacy 404 fallback work for Smart mode and failOpen=false", async (t) => {
+  // 1. Remote gateway with failOpen=false and failing classifier -> escalates via evaluate-turn,
+  //    configured via plugin manifest mcpServers.s.env (Windows Desktop compatibility).
+  const brokenClassifier = await mockClassifier(t, { status: 500 });
+  const gwHome = temporaryHome(t);
+  const gwDir = path.join(gwHome, "web-tools");
+  writeJson(path.join(gwDir, "config.json"), {
+    enabled: true,
+    defaultProvider: "exa",
+    smartSearch: {
+      enabled: true,
+      provider: "typesafe",
+      model: "jev-latest",
+      baseUrl: brokenClassifier.baseUrl,
+      timeoutMs: 1000,
+      threshold: 0.5,
+      failOpen: false,
+    },
+  });
+  writeJson(path.join(gwDir, "credentials.json"), {
+    WEB_TOOLS_EXA: "exa-key",
+    WEB_TOOLS_TYPESAFE: "jev-key",
+  });
+  new LocalStorage(gwDir).setSessionMode("global", "smart");
+  const handle = await startGatewayServer({ host: "127.0.0.1", port: 0, baseDir: gwDir, password: "pw" });
+  t.after(() => handle.close());
+
+  const fakePluginRoot = temporaryHome(t);
+  writeJson(path.join(fakePluginRoot, "kimi.plugin.json"), {
+    name: "web",
+    mcpServers: {
+      s: {
+        command: "node",
+        args: ["./bin/mcp-server.mjs"],
+        env: {
+          KIMI_WEB_TOOLS_GATEWAY_URL: handle.url,
+          KIMI_WEB_TOOLS_GATEWAY_TOKEN: "pw",
+        },
+      },
+    },
+  });
+  const clientHome = temporaryHome(t);
+  const res = await runHook(
+    clientHome,
+    "user-prompt-submit.mjs",
+    { session_id: "manifest-s1", prompt: "今天菜价多少" },
+    { KIMI_PLUGIN_ROOT: fakePluginRoot },
+  );
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /\[Smart Mode: Escalated to Required Web Search\]/);
+  assert.equal(storedTurn(clientHome, "manifest-s1").required, true);
+
+  // 2. Legacy remote gateway returning 404 on /web-tools/mcp/evaluate-turn falls back to /status + /smart-classifier/test
+  const hits: string[] = [];
+  const legacyServer = http.createServer(async (req, res) => {
+    for await (const _ of req) {}
+    hits.push(req.url ?? "");
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/web-tools/mcp/evaluate-turn") {
+      res.writeHead(404);
+      res.end(JSON.stringify({ ok: false, error: { code: "not-found", message: "Unknown MCP endpoint: evaluate-turn" } }));
+      return;
+    }
+    if (req.url === "/web-tools/mcp/status") {
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        ok: true,
+        value: {
+          usable: ["exa"],
+          mode: { sessionId: "legacy-s1", mode: "smart", globalMode: "smart", available: true },
+          config: { enabled: true, exemptWhenNoProvider: true, recognizeExternalWebTools: true, requiredEvidence: "search" },
+        },
+      }));
+      return;
+    }
+    if (req.url === "/web-tools/api/smart-classifier/test") {
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        ok: true,
+        value: { ok: true, escalated: true, provider: "typesafe", model: "jev-latest", latencyMs: 50, threshold: 0.5 },
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end("{}");
+  });
+  await new Promise<void>((resolve) => legacyServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => legacyServer.close(() => resolve())));
+  const addr = legacyServer.address();
+  assert.ok(addr && typeof addr !== "string");
+
+  const legacyClientHome = temporaryHome(t);
+  const legacyRes = await runHook(
+    legacyClientHome,
+    "user-prompt-submit.mjs",
+    { session_id: "legacy-s1", prompt: "今天菜价多少？" },
+    { KIMI_WEB_TOOLS_GATEWAY_URL: `http://127.0.0.1:${addr.port}` },
+  );
+  assert.equal(legacyRes.status, 0, legacyRes.stderr);
+  assert.deepEqual(hits, ["/web-tools/mcp/evaluate-turn", "/web-tools/mcp/status", "/web-tools/api/smart-classifier/test"]);
+  assert.match(legacyRes.stdout, /\[Smart Mode: Escalated to Required Web Search\]/);
+  assert.equal(storedTurn(legacyClientHome, "legacy-s1").required, true);
+});
+
+test("Windows BOM remote.json, syncMode=false, sendContext=false, legacy failOpen=false, and recordSmartDecision cap", async (t) => {
+  // 1. BOM remote.json + syncMode=false + sendContext=false against a shared gateway
+  const classifier = await mockClassifier(t, {
+    probabilities: { needs_external_lookup: 0.92, involves_tool_or_config_claim: 0.05 },
+  });
+  const gwHome = temporaryHome(t);
+  const gwDir = path.join(gwHome, "web-tools");
+  writeJson(path.join(gwDir, "config.json"), {
+    enabled: true,
+    defaultProvider: "exa",
+    smartSearch: {
+      enabled: true,
+      provider: "typesafe",
+      model: "jev-latest",
+      baseUrl: classifier.baseUrl,
+      timeoutMs: 2000,
+      threshold: 0.5,
+      failOpen: true,
+      enableTranscriptContext: true,
+    },
+  });
+  writeJson(path.join(gwDir, "credentials.json"), {
+    WEB_TOOLS_EXA: "exa-key",
+    WEB_TOOLS_TYPESAFE: "jev-key",
+  });
+  // Owner gateway is in "auto" mode; guest keeps local "smart" mode with syncMode=false & sendContext=false
+  const gwStorage = new LocalStorage(gwDir);
+  gwStorage.setSessionMode("global", "auto");
+  const handle = await startGatewayServer({
+    host: "127.0.0.1",
+    port: 0,
+    baseDir: gwDir,
+    password: "owner-password",
+    clientTokens: ["guest-shared-token"],
+  });
+  t.after(() => handle.close());
+
+  const guestHome = temporaryHome(t);
+  fs.mkdirSync(path.join(guestHome, "web-tools"), { recursive: true });
+  // Write UTF-8 BOM (as Windows PowerShell 5.1 does by default)
+  fs.writeFileSync(
+    path.join(guestHome, "web-tools", "remote.json"),
+    `\uFEFF${JSON.stringify({ url: handle.url, token: "guest-shared-token", syncMode: false, sendContext: false })}\n`,
+    "utf8",
+  );
+  new LocalStorage(path.join(guestHome, "web-tools")).setSessionMode("global", "smart");
+  writeWire(guestHome, "guest-priv-s1");
+
+  const guestRes = await runHook(guestHome, "user-prompt-submit.mjs", {
+    session_id: "guest-priv-s1",
+    prompt: "真的吗",
+  });
+  assert.equal(guestRes.status, 0, guestRes.stderr);
+  assert.match(guestRes.stdout, /\[Smart Mode: Escalated to Required Web Search\]/);
+  // Guest local mode stays "smart" (not overwritten by gateway's "auto")
+  assert.equal(new LocalStorage(path.join(guestHome, "web-tools")).readModeState().globalMode, "smart");
+  // sendContext=false ensures client wire.jsonl transcript context was NOT sent to shared gateway
+  assert.equal(classifier.requests.length, 1);
+  const sentState = classifier.requests[0].body.state as Record<string, unknown>;
+  assert.equal(sentState.recent_user_context, undefined);
+  assert.equal(sentState.last_assistant_reply, undefined);
+  // Guest evaluation must not pollute owner's mode-state.json
+  assert.equal(Object.hasOwn(gwStorage.readModeState().sessions, "guest-priv-s1"), false);
+
+  // 2. Legacy 404 fallback honors failOpen=false even when /smart-classifier/test returns HTTP 200 { ok: false, escalated: false }
+  const legacyFailServer = http.createServer(async (req, res) => {
+    for await (const _ of req) {}
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/web-tools/mcp/evaluate-turn") {
+      res.writeHead(404);
+      res.end(JSON.stringify({ ok: false, error: { code: "not-found" } }));
+      return;
+    }
+    if (req.url === "/web-tools/mcp/status") {
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        ok: true,
+        value: {
+          usable: ["exa"],
+          mode: { sessionId: "legacy-fc", mode: "smart", globalMode: "smart", available: true },
+          config: { enabled: true, smartSearch: { failOpen: false } },
+        },
+      }));
+      return;
+    }
+    if (req.url === "/web-tools/api/smart-classifier/test") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true, value: { ok: false, escalated: false, error: "Smart classifier test failed" } }));
+      return;
+    }
+    res.writeHead(404);
+    res.end("{}");
+  });
+  await new Promise<void>((resolve) => legacyFailServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => legacyFailServer.close(() => resolve())));
+  const failAddr = legacyFailServer.address();
+  assert.ok(failAddr && typeof failAddr !== "string");
+
+  const fcHome = temporaryHome(t);
+  const fcRes = await runHook(
+    fcHome,
+    "user-prompt-submit.mjs",
+    { session_id: "legacy-fc", prompt: "test fail closed" },
+    { KIMI_WEB_TOOLS_GATEWAY_URL: `http://127.0.0.1:${failAddr.port}` },
+  );
+  assert.equal(fcRes.status, 0, fcRes.stderr);
+  assert.equal(storedTurn(fcHome, "legacy-fc").required, true, "legacy 404 fallback must honor failOpen=false");
+
+  // 3. recordSmartDecision caps ephemeral sessions and rejects unsafe prototype keys
+  const capDir = path.join(temporaryHome(t), "web-tools");
+  const capStorage = new LocalStorage(capDir);
+  capStorage.setSessionMode("keep-override", "required");
+  // Pre-seed 505 ephemeral sessions directly, then record one new decision to trigger pruning
+  const preDoc = capStorage.readModeState();
+  for (let i = 0; i < 505; i++) {
+    preDoc.sessions[`ephemeral-${i}`] = { updatedAt: 1_000_000 + i };
+  }
+  capStorage.writeModeState(preDoc);
+  capStorage.recordSmartDecision("fresh-session", { escalated: true });
+  capStorage.recordSmartDecision("__proto__", { escalated: false });
+  const afterDoc = capStorage.readModeState();
+  assert.equal(Object.hasOwn(afterDoc.sessions, "keep-override"), true, "explicit mode override must be preserved");
+  assert.equal(Object.hasOwn(afterDoc.sessions, "fresh-session"), true);
+  assert.ok(Object.keys(afterDoc.sessions).length <= 503, `ephemeral sessions must stay bounded, got ${Object.keys(afterDoc.sessions).length}`);
+});

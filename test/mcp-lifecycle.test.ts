@@ -552,3 +552,94 @@ test("daemon connectHostFor, resolveNodeExecutable directory guard, and LocalSto
   `], { ...process.env, KIMI_CODE_HOME: home });
   assert.equal(storageRes.code, 0, storageRes.stderr);
 });
+
+test("remote web_mode mirrors mode to local mode-state.json and remote.json works without env vars", async (t) => {
+  const requests: { url: string; auth: string | undefined }[] = [];
+  const remote = http.createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    requests.push({ url: req.url ?? "", auth: req.headers.authorization });
+    const parsed = JSON.parse(body || "{}");
+    const mode = parsed.mode ?? "off";
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      value: {
+        sessionId: parsed.sessionId ?? "global",
+        mode,
+        globalMode: parsed.sessionId === "global" ? mode : "auto",
+        sessionModeOverride: parsed.sessionId && parsed.sessionId !== "global" ? mode : null,
+        available: true,
+      },
+    }));
+  });
+  remote.listen(0, "127.0.0.1");
+  await once(remote, "listening");
+  t.after(async () => { remote.closeAllConnections(); await new Promise<void>((resolve) => remote.close(() => resolve())); });
+  const port = (remote.address() as { port: number }).port;
+
+  const home = fixture(t);
+  fs.mkdirSync(path.join(home, "web-tools"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, "web-tools", "remote.json"),
+    JSON.stringify({ url: `http://127.0.0.1:${port}`, token: "file-token" }),
+  );
+
+  // Strip KIMI_WEB_TOOLS_GATEWAY_URL so bin/mcp-server.mjs must pick up remote.json
+  const envWithoutGw: Record<string, string | undefined> = { ...process.env, KIMI_CODE_HOME: home };
+  delete envWithoutGw.KIMI_WEB_TOOLS_GATEWAY_URL;
+  delete envWithoutGw.KIMI_WEB_TOOLS_GATEWAY_TOKEN;
+
+  const setOff = await runNode(["bin/mcp-server.mjs"], envWithoutGw,
+    rpc(1, "tools/call", { name: "web_mode", arguments: { action: "set", mode: "off", session_id: "global" } }));
+  assert.equal(setOff.code, 0, setOff.stderr);
+  assert.equal(requests[0].auth, "Bearer file-token");
+
+  // Local pre-tool-gate.mjs must immediately see the mirrored "off" mode and block
+  const gateBlocked = await runNode(["hooks/pre-tool-gate.mjs"], envWithoutGw, JSON.stringify({
+    session_id: "s-sync",
+    tool_name: "mcp__plugin-web_s__web_search",
+    tool_input: { query: "test" },
+  }));
+  assert.equal(gateBlocked.code, 2, "pre-tool-gate must block after remote web_mode set off");
+
+  // Switching back to auto mirrors locally and unblocks pre-tool-gate.mjs
+  const setAuto = await runNode(["bin/mcp-server.mjs"], envWithoutGw,
+    rpc(2, "tools/call", { name: "web_mode", arguments: { action: "set", mode: "auto", session_id: "global" } }));
+  assert.equal(setAuto.code, 0, setAuto.stderr);
+  const gateAllowed = await runNode(["hooks/pre-tool-gate.mjs"], envWithoutGw, JSON.stringify({
+    session_id: "s-sync",
+    tool_name: "mcp__plugin-web_s__web_search",
+    tool_input: { query: "test" },
+  }));
+  assert.equal(gateAllowed.code, 0, gateAllowed.stderr);
+
+  // Explicit empty KIMI_WEB_TOOLS_GATEWAY_URL="" must override remote.json back to local mode
+  const closedServer = http.createServer((_, res) => res.writeHead(503).end());
+  closedServer.listen(0, "127.0.0.1");
+  await once(closedServer, "listening");
+  const unusedPort = (closedServer.address() as { port: number }).port;
+  await new Promise<void>((resolve) => closedServer.close(() => resolve()));
+  const forceLocal = await runNode(["bin/mcp-server.mjs"], {
+    ...envWithoutGw,
+    KIMI_WEB_TOOLS_PORT: String(unusedPort),
+    KIMI_WEB_TOOLS_GATEWAY_URL: "",
+  }, rpc(3, "tools/call", { name: "web_status" }));
+  assert.equal(forceLocal.code, 0, forceLocal.stderr);
+  const reply = JSON.parse(forceLocal.stdout.trim());
+  assert.equal(reply.result.isError, true);
+  assert.match(reply.result.content[0].text, /Local gateway is not running/);
+
+  // syncMode: false keeps web_mode strictly local without calling the remote gateway
+  const beforeCalls = requests.length;
+  fs.writeFileSync(
+    path.join(home, "web-tools", "remote.json"),
+    `\uFEFF${JSON.stringify({ url: `http://127.0.0.1:${port}`, token: "file-token", syncMode: false })}`,
+  );
+  const localOnly = await runNode(["bin/mcp-server.mjs"], envWithoutGw,
+    rpc(4, "tools/call", { name: "web_mode", arguments: { action: "set", mode: "required", session_id: "global" } }));
+  assert.equal(localOnly.code, 0, localOnly.stderr);
+  assert.equal(requests.length, beforeCalls, "syncMode: false must not send web_mode mutations to shared remote gateway");
+  const modeDoc = JSON.parse(fs.readFileSync(path.join(home, "web-tools", "mode-state.json"), "utf8"));
+  assert.equal(modeDoc.globalMode, "required");
+});

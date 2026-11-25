@@ -29,7 +29,9 @@ import {
   API_PREFIX,
 } from "./routes.ts";
 import { LocalStorage, type ModeSessionRecord, type ModeStateDocument } from "./local-storage.ts";
+import { DEFAULT_SETTINGS, validateWebToolsSettings } from "./config.ts";
 import { positiveInteger } from "../../hooks/mode-state.mjs";
+import { classifySmartTurn } from "../../hooks/smart-classifier.mjs";
 import { CURRENT_VERSION } from "../shared/version.ts";
 import { nextSearchMode, type SearchMode, type SmartTurnDecision } from "../shared/api-types.ts";
 import {
@@ -52,6 +54,7 @@ export interface GatewayServerOptions {
   baseDir?: string;
   projectRoot?: string;
   password?: string;
+  clientTokens?: string[];
 }
 
 export interface GatewayServerHandle {
@@ -393,22 +396,64 @@ function resolveGatewayPassword(explicit: string | undefined, baseDir: string): 
   const pwFile = path.join(baseDir, "public-password");
   if (fs.existsSync(pwFile)) {
     try {
-      const filePw = fs.readFileSync(pwFile, "utf8").trim();
+      const filePw = fs.readFileSync(pwFile, "utf8").replace(/^\uFEFF/, "").trim();
       if (filePw) return filePw;
     } catch {}
   }
   return undefined;
 }
 
-function hasValidPasswordAuth(req: http.IncomingMessage, password: string, sessions: GatewaySessions): boolean {
+function splitTokens(raw: string): string[] {
+  return raw
+    .split(/[\r\n,]+/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
+function resolveClientTokens(explicit: string[] | undefined, baseDir: string): string[] {
+  const tokens: string[] = [];
+  if (Array.isArray(explicit)) {
+    for (const token of explicit) {
+      if (typeof token === "string" && token.trim()) tokens.push(token.trim());
+    }
+  }
+  const envRaw = process.env.KIMI_WEB_TOOLS_CLIENT_TOKEN;
+  if (typeof envRaw === "string" && envRaw.trim()) {
+    tokens.push(...splitTokens(envRaw));
+  }
+  const tokenFile = path.join(baseDir, "client-token");
+  if (fs.existsSync(tokenFile)) {
+    try {
+      const raw = fs.readFileSync(tokenFile, "utf8").replace(/^\uFEFF/, "");
+      tokens.push(...splitTokens(raw));
+    } catch {}
+  }
+  return tokens;
+}
+
+function bearerTokenOf(req: http.IncomingMessage): string {
   const auth = req.headers.authorization;
   if (typeof auth === "string" && auth.slice(0, 7).toLowerCase() === "bearer ") {
-    const token = auth.slice(7).trim();
-    if (token && safeEqual(token, password)) return true;
+    return auth.slice(7).trim();
   }
+  return "";
+}
+
+function hasValidPasswordAuth(req: http.IncomingMessage, password: string, sessions: GatewaySessions): boolean {
+  const token = bearerTokenOf(req);
+  if (token && safeEqual(token, password)) return true;
   const cookies = parseCookies(req.headers.cookie);
   return sessions.isValid(cookies[AUTH_COOKIE_NAME]);
 }
+
+function hasValidClientToken(req: http.IncomingMessage, clientTokens: string[]): boolean {
+  if (clientTokens.length === 0) return false;
+  const token = bearerTokenOf(req);
+  if (!token) return false;
+  return clientTokens.some((candidate) => safeEqual(token, candidate));
+}
+
+type GatewayAuthRole = "admin" | "client" | "none";
 
 function optionalPositiveInteger(value: unknown): number | undefined {
   try {
@@ -580,12 +625,15 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
 
   // Shared by the private `/web-tools/mcp/*` routes and the public MCP
   // endpoint. Throws on caller error or tool failure; returns the value body.
-  async function runMcpTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  async function runMcpTool(name: string, args: Record<string, unknown>, authRole: GatewayAuthRole = "admin"): Promise<unknown> {
     const sessionId = typeof args.session_id === "string" && args.session_id.trim() ? args.session_id.trim()
       : typeof args.sessionId === "string" && args.sessionId.trim() ? args.sessionId.trim() : "global";
     if (name === "web_mode") {
       const action = typeof args.action === "string" ? args.action : "get";
       if (action === "set" || action === "toggle") {
+        if (authRole === "client" && (sessionId === "global" || sessionId === "default")) {
+          throw new Error("Client tokens cannot modify global search mode; specify a session_id");
+        }
         const current = storage.getEffectiveSessionMode(sessionId);
         const nextMode = action === "toggle" ? nextSearchMode(current) : args.mode;
         if (nextMode !== "auto" && nextMode !== "smart" && nextMode !== "required" && nextMode !== "off") {
@@ -740,15 +788,21 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
 
       // 2. Authentication state & login/logout endpoints (`/web-tools/auth/*`)
       const password = resolveGatewayPassword(options.password, storage.baseDir);
+      const clientTokens = resolveClientTokens(options.clientTokens, storage.baseDir);
       const directLocal = isDirectLoopbackRequest(wtReq) && process.env.KIMI_WEB_TOOLS_REQUIRE_AUTH !== "1";
-      const passwordAuthed = password ? hasValidPasswordAuth(req, password, gatewaySessions) : false;
-      const isAuthed = directLocal || passwordAuthed;
+      const bearer = bearerTokenOf(req);
+      const matchesAdminBearer = Boolean(password && bearer && safeEqual(bearer, password));
+      // An explicit client token always scopes the request down to "client",
+      // even over direct loopback (defense-in-depth if a local proxy omits XFF).
+      const matchesClientBearer = Boolean(!matchesAdminBearer && hasValidClientToken(req, clientTokens));
+      const adminAuthed = !matchesClientBearer && (directLocal || (password ? hasValidPasswordAuth(req, password, gatewaySessions) : false));
+      const authRole: GatewayAuthRole = adminAuthed ? "admin" : matchesClientBearer ? "client" : "none";
 
       if (pathname === "/web-tools/auth/session" && (req.method === "GET" || req.method === "POST")) {
         writeJson(res, 200, {
           ok: true,
           value: {
-            authenticated: isAuthed,
+            authenticated: authRole === "admin",
             required: !directLocal,
             passwordConfigured: Boolean(password),
           },
@@ -805,8 +859,8 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
       }
 
       // 3. Enforce authentication for all API, MCP, and health endpoints
-      if (!isAuthed) {
-        if (!password) {
+      if (authRole === "none") {
+        if (!password && clientTokens.length === 0) {
           writeJson(res, 503, {
             ok: false,
             error: { code: "auth-not-configured", message: "Set KIMI_WEB_TOOLS_PASSWORD or public-password to enable public access" },
@@ -822,10 +876,12 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
         return;
       }
 
-      markGatewayAuthenticated(wtReq);
+      if (authRole === "admin") {
+        markGatewayAuthenticated(wtReq);
+      }
 
       // Enforce same-origin & non-cross-site browser protection
-      if (configPlaneTrust(wtReq) === false) {
+      if (authRole === "admin" && configPlaneTrust(wtReq) === false) {
         writeJson(res, 403, { ok: false, error: { code: "forbidden", message: "Cross-origin access denied" } });
         return;
       }
@@ -842,7 +898,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           writeJson(res, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: error instanceof Error ? error.message : "Parse error" } });
           return;
         }
-        const rpc = await mcpRpcResult(message, (name, args) => runMcpTool(name, args));
+        const rpc = await mcpRpcResult(message, (name, args) => runMcpTool(name, args, authRole));
         if (rpc.body === undefined) {
           res.writeHead(rpc.status);
           res.end();
@@ -989,15 +1045,27 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           const sessionId = typeof payload.sessionId === "string" && payload.sessionId.trim() ? payload.sessionId.trim() : "global";
           const action = typeof payload.action === "string" ? payload.action : payload.mode !== undefined ? "set" : "get";
           const available = searchProvider?.available() ?? false;
+          const sessionOverrideOf = (doc: ModeStateDocument): SearchMode | null => {
+            if (sessionId === "global" || sessionId === "default") return null;
+            const rec = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
+            return typeof rec?.mode === "string" ? rec.mode : null;
+          };
 
           if (action === "set") {
+            if (authRole === "client" && (sessionId === "global" || sessionId === "default" || payload.updateGlobal === true)) {
+              writeJson(res, 403, {
+                ok: false,
+                error: { code: "forbidden", message: "Client tokens cannot modify global search mode; specify a session_id" },
+              });
+              return;
+            }
             const nextMode = payload.mode;
             if (nextMode !== "auto" && nextMode !== "smart" && nextMode !== "required" && nextMode !== "off") {
               writeJson(res, 400, { ok: false, error: { code: "bad-request", message: "mode must be auto, smart, required, or off" } });
               return;
             }
             storage.setSessionMode(sessionId, nextMode);
-            if (payload.updateGlobal === true && sessionId !== "global") {
+            if (authRole === "admin" && payload.updateGlobal === true && sessionId !== "global") {
               storage.setSessionMode("global", nextMode);
             }
             const doc = storage.readModeState();
@@ -1007,6 +1075,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
                 sessionId,
                 mode: storage.getEffectiveSessionMode(sessionId),
                 globalMode: doc.globalMode,
+                sessionModeOverride: sessionOverrideOf(doc),
                 available,
               },
             });
@@ -1014,6 +1083,13 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           }
 
           if (action === "toggle") {
+            if (authRole === "client" && (sessionId === "global" || sessionId === "default")) {
+              writeJson(res, 403, {
+                ok: false,
+                error: { code: "forbidden", message: "Client tokens cannot modify global search mode; specify a session_id" },
+              });
+              return;
+            }
             const current = storage.getEffectiveSessionMode(sessionId);
             const next: SearchMode = nextSearchMode(current);
             storage.setSessionMode(sessionId, next);
@@ -1024,6 +1100,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
                 sessionId,
                 mode: next,
                 globalMode: doc.globalMode,
+                sessionModeOverride: sessionOverrideOf(doc),
                 available,
               },
             });
@@ -1031,26 +1108,135 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           }
 
           const doc = storage.readModeState();
-          const smartDecision = smartDecisionOf(doc, sessionId);
+          const smartDecision = authRole === "admin" ? smartDecisionOf(doc, sessionId) : undefined;
           // Only sessions with an explicit per-session override are meaningful
           // scope choices. Listing every session that merely has turn state
           // turns the selector into an unbounded wall of raw ids.
-          const sessions = Object.entries(doc.sessions)
-            .filter(([, rec]) => typeof rec.mode === "string")
-            .map(([id, rec]) => ({
-              id,
-              mode: rec.mode ?? doc.globalMode,
-              updatedAt: rec.updatedAt,
-            }));
+          const sessions = authRole === "admin"
+            ? Object.entries(doc.sessions)
+                .filter(([, rec]) => typeof rec.mode === "string")
+                .map(([id, rec]) => ({
+                  id,
+                  mode: rec.mode ?? doc.globalMode,
+                  updatedAt: rec.updatedAt,
+                }))
+            : undefined;
           writeJson(res, 200, {
             ok: true,
             value: {
               sessionId,
               mode: storage.getEffectiveSessionMode(sessionId),
               globalMode: doc.globalMode,
+              sessionModeOverride: sessionOverrideOf(doc),
               available,
-              sessions,
+              ...(sessions ? { sessions } : {}),
               ...(smartDecision ? { smartDecision } : {}),
+            },
+          });
+          return;
+        }
+
+        if (mcpAction === "evaluate-turn") {
+          const sessionId =
+            typeof payload.sessionId === "string" && payload.sessionId.trim()
+              ? payload.sessionId.trim()
+              : typeof payload.session_id === "string" && payload.session_id.trim()
+                ? payload.session_id.trim()
+                : "global";
+          const promptText = typeof payload.promptText === "string" ? payload.promptText : "";
+          const hasImages = payload.hasImages === true;
+          const isSteer = payload.isSteer === true;
+          const modeHint = payload.modeHint === "smart" ? "smart" : undefined;
+          const rawContext =
+            payload.sessionContext && typeof payload.sessionContext === "object" && !Array.isArray(payload.sessionContext)
+              ? (payload.sessionContext as Record<string, unknown>)
+              : undefined;
+          const sessionContext = rawContext
+            ? {
+                lastAssistantReply: typeof rawContext.lastAssistantReply === "string" ? rawContext.lastAssistantReply : undefined,
+                prevUserText: typeof rawContext.prevUserText === "string" ? rawContext.prevUserText : undefined,
+                recentTools: Array.isArray(rawContext.recentTools)
+                  ? rawContext.recentTools.filter((item): item is string => typeof item === "string")
+                  : undefined,
+              }
+            : {};
+
+          const doc = storage.readModeState();
+          const sessionRec = Object.hasOwn(doc.sessions, sessionId) ? doc.sessions[sessionId] : undefined;
+          const sessionModeOverride =
+            sessionId !== "global" && sessionId !== "default" && typeof sessionRec?.mode === "string"
+              ? sessionRec.mode
+              : null;
+          const mode = storage.getEffectiveSessionMode(sessionId);
+          const globalMode = doc.globalMode;
+
+          let cfg = validateWebToolsSettings(DEFAULT_SETTINGS);
+          try {
+            cfg = validateWebToolsSettings(storage.readConfig());
+          } catch {}
+          let readyProviders: string[] = [];
+          try {
+            readyProviders = await usableSearchEngineNames();
+          } catch {}
+          const effectiveEvalMode = modeHint ?? mode;
+          const canEnforce = effectiveEvalMode === "required" || effectiveEvalMode === "smart";
+          const exempted = canEnforce && (cfg.enabled === false || (cfg.exemptWhenNoProvider !== false && readyProviders.length === 0));
+          const requiredEvidence = cfg.requiredEvidence === "search-or-fetch" ? "search-or-fetch" : "search";
+          const recognizeExternalWebTools = cfg.recognizeExternalWebTools !== false;
+
+          let decision: Record<string, unknown> | undefined;
+          if (!isSteer && effectiveEvalMode === "smart" && !exempted) {
+            const creds = storage.readAllCredentials();
+            try {
+              decision = (await classifySmartTurn({
+                promptText,
+                hasImages,
+                sessionId,
+                sessionContext,
+                config: cfg,
+                credentials: creds,
+              })) as unknown as Record<string, unknown>;
+            } catch (err) {
+              const failClosed = cfg.smartSearch?.failOpen === false;
+              const reason =
+                err && typeof err === "object" && "reason" in err && typeof (err as { reason?: unknown }).reason === "string"
+                  ? (err as { reason: string }).reason
+                  : "network-error";
+              decision = {
+                ok: false,
+                escalated: failClosed,
+                provider: cfg.smartSearch.provider,
+                model: cfg.smartSearch.model,
+                threshold: cfg.smartSearch.threshold,
+                fallbackReason: reason,
+                error: failClosed
+                  ? "Smart classifier unavailable; failing closed to required web search for this turn."
+                  : "Smart classifier unavailable; continuing in auto mode.",
+              };
+            }
+            if (authRole === "admin") {
+              storage.recordSmartDecision(sessionId, {
+                ...decision,
+                mode: decision.escalated ? "required" : "auto",
+                at: Date.now(),
+              });
+            }
+          }
+
+          writeJson(res, 200, {
+            ok: true,
+            value: {
+              sessionId,
+              mode,
+              globalMode,
+              sessionModeOverride,
+              enabled: cfg.enabled !== false,
+              exemptWhenNoProvider: cfg.exemptWhenNoProvider !== false,
+              exempted,
+              requiredEvidence,
+              recognizeExternalWebTools,
+              readyProviders,
+              ...(decision ? { decision } : {}),
             },
           });
           return;
@@ -1058,12 +1244,31 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
 
         if (mcpAction === "status") {
           const sessionId = typeof payload.sessionId === "string" && payload.sessionId.trim() ? payload.sessionId.trim() : "global";
+          const usable = await usableSearchEngineNames();
+          const doc = storage.readModeState();
+
+          if (authRole === "client") {
+            writeJson(res, 200, {
+              ok: true,
+              value: {
+                usable,
+                version: CURRENT_VERSION,
+                mode: {
+                  sessionId,
+                  mode: storage.getEffectiveSessionMode(sessionId),
+                  globalMode: doc.globalMode,
+                  available: searchProvider?.available() ?? false,
+                },
+              },
+            });
+            return;
+          }
+
           const configView = (await callInternalApi("config/get")) as Record<string, unknown>;
           const quotaView =
             payload.includeQuotas === true
               ? ((await callInternalApi("quota/describe").catch(() => ({ quotas: {} }))) as { quotas?: Record<string, unknown> })
               : undefined;
-          const doc = storage.readModeState();
           const smartDecision = smartDecisionOf(doc, sessionId);
           const addr = server.address();
           const boundPort = typeof addr === "object" && addr ? addr.port : requestedPort;
@@ -1073,7 +1278,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           writeJson(res, 200, {
             ok: true,
             value: {
-              usable: await usableSearchEngineNames(),
+              usable,
               version: CURRENT_VERSION,
               gateway: {
                 pid: process.pid,
@@ -1113,7 +1318,16 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
         return;
       }
 
-      // 5. Management API routes (`/web-tools/api/*`)
+      // 5. Management API routes (`/web-tools/api/*`) — strictly admin-only
+      if (pathname === API_PREFIX || pathname.startsWith(`${API_PREFIX}/`)) {
+        if (authRole !== "admin") {
+          writeJson(res, 403, {
+            ok: false,
+            error: { code: "forbidden", message: "Admin authentication is required for management APIs" },
+          });
+          return;
+        }
+      }
       for (const route of routes) {
         const matches =
           route.kind === "exact"

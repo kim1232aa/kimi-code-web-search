@@ -12,9 +12,17 @@ import {
 } from "./mode-state.mjs";
 import {
   extractPromptInput,
+  extractKimiSessionContext,
   classifySmartTurn,
   usableSearchRoutes,
 } from "./smart-classifier.mjs";
+import {
+  safeResolveRemoteGateway,
+  applyRemoteModeToDoc,
+  stripBom,
+} from "./remote-gateway.mjs";
+
+const VALID_MODES = new Set(["auto", "smart", "required", "off"]);
 
 function requiredSearchText(searchOnly, recognizeExternal = true) {
   if (!recognizeExternal) {
@@ -36,10 +44,123 @@ const NO_WEB_ROUTE_INSTRUCTION =
 function readJsonFile(filePath, fallback) {
   if (!fs.existsSync(filePath)) return fallback;
   try {
-    const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const value = JSON.parse(stripBom(fs.readFileSync(filePath, "utf8")));
     return value && typeof value === "object" && !Array.isArray(value) ? value : fallback;
   } catch {
     return fallback;
+  }
+}
+
+async function postRemoteJson(remoteGateway, endpointPath, body, timeoutMs) {
+  if (timeoutMs <= 0) {
+    throw new Error("Remote gateway evaluation budget exhausted");
+  }
+  const headers = { "content-type": "application/json" };
+  if (remoteGateway.token) headers.authorization = `Bearer ${remoteGateway.token}`;
+  const res = await fetch(`${remoteGateway.url}${endpointPath}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body ?? {}),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  let parsed;
+  try {
+    parsed = await res.json();
+  } catch {
+    parsed = undefined;
+  }
+  return { status: res.status, ok: res.ok, parsed };
+}
+
+/**
+ * Evaluate turn mode, policy flags, and (when in `smart` mode) Jev/Smart
+ * classification on the remote gateway in a single round trip. Shares one
+ * 9.5s total budget across primary + legacy 404 fallback so the hook always
+ * finishes cleanly inside Kimi's 15s `UserPromptSubmit` timeout.
+ */
+async function evaluateTurnRemotely(remoteGateway, { sessionId, promptText, hasImages, isSteer, sessionContext, modeHint }) {
+  const deadline = Date.now() + 9_500;
+  const remainingMs = (capMs) => Math.min(capMs, deadline - Date.now());
+  try {
+    const primary = await postRemoteJson(
+      remoteGateway,
+      "/web-tools/mcp/evaluate-turn",
+      { sessionId, promptText, hasImages, isSteer, sessionContext, ...(modeHint ? { modeHint } : {}) },
+      remainingMs(8_500),
+    );
+    if (primary.ok && primary.parsed?.ok && primary.parsed.value && typeof primary.parsed.value === "object") {
+      return primary.parsed.value;
+    }
+    if (primary.status !== 404) {
+      return undefined;
+    }
+
+    // Backwards-compatible fallback for older remote gateways (pre evaluate-turn).
+    const statusRes = await postRemoteJson(remoteGateway, "/web-tools/mcp/status", { sessionId }, remainingMs(2_500));
+    if (!statusRes.ok || !statusRes.parsed?.ok || !statusRes.parsed.value) {
+      return undefined;
+    }
+    const statusVal = statusRes.parsed.value;
+    const modeInfo = statusVal.mode && typeof statusVal.mode === "object" ? statusVal.mode : {};
+    const remoteCfg = statusVal.config && typeof statusVal.config === "object" ? statusVal.config : {};
+    const mode = VALID_MODES.has(modeInfo.mode) ? modeInfo.mode : "auto";
+    const globalMode = VALID_MODES.has(modeInfo.globalMode) ? modeInfo.globalMode : mode;
+    const readyProviders = Array.isArray(statusVal.usable)
+      ? statusVal.usable.filter((name) => typeof name === "string" && name.trim())
+      : [];
+    const effectiveEvalMode = modeHint === "smart" ? "smart" : mode;
+    const canEnforce = effectiveEvalMode === "required" || effectiveEvalMode === "smart";
+    const exempted = canEnforce && (
+      remoteCfg.enabled === false ||
+      (remoteCfg.exemptWhenNoProvider !== false && readyProviders.length === 0)
+    );
+    const requiredEvidence = remoteCfg.requiredEvidence === "search-or-fetch" ? "search-or-fetch" : "search";
+    const recognizeExternalWebTools = remoteCfg.recognizeExternalWebTools !== false;
+
+    let decision;
+    if (!isSteer && effectiveEvalMode === "smart" && !exempted && (promptText.trim() || hasImages)) {
+      const testPrompt = promptText.trim() || "Image prompt";
+      const testRes = await postRemoteJson(
+        remoteGateway,
+        "/web-tools/api/smart-classifier/test",
+        { prompt: testPrompt, sessionId },
+        remainingMs(5_000),
+      );
+      const failClosed = remoteCfg.smartSearch?.failOpen === false;
+      if (testRes.ok && testRes.parsed?.ok && testRes.parsed.value && typeof testRes.parsed.value === "object") {
+        const val = testRes.parsed.value;
+        // `/smart-classifier/test` catches exceptions and returns HTTP 200 `{ ok: false, escalated: false }`;
+        // honor `failOpen: false` here so fail-closed gateways still escalate.
+        decision = val.ok === false && failClosed
+          ? { ...val, escalated: true }
+          : val;
+      } else {
+        decision = {
+          ok: false,
+          escalated: failClosed,
+          fallbackReason: "remote-gateway-error",
+          error: failClosed
+            ? "Remote smart classifier failed; failing closed to required web search for this turn."
+            : "Remote smart classifier failed; continuing in auto mode.",
+        };
+      }
+    }
+
+    return {
+      sessionId,
+      mode,
+      globalMode,
+      ...(Object.hasOwn(modeInfo, "sessionModeOverride") ? { sessionModeOverride: modeInfo.sessionModeOverride } : {}),
+      enabled: remoteCfg.enabled !== false,
+      exemptWhenNoProvider: remoteCfg.exemptWhenNoProvider !== false,
+      exempted,
+      requiredEvidence,
+      recognizeExternalWebTools,
+      readyProviders,
+      ...(decision ? { decision } : {}),
+    };
+  } catch {
+    return undefined;
   }
 }
 
@@ -56,7 +177,7 @@ async function main() {
   const configExists = fs.existsSync(configPath);
   const cfg = configExists ? readJsonFile(configPath, {}) : {};
   const creds = readJsonFile(path.join(baseDir, "credentials.json"), {});
-  const remoteGateway = Boolean(process.env.KIMI_WEB_TOOLS_GATEWAY_URL?.trim());
+  const remoteGateway = safeResolveRemoteGateway({ kimiCodeHome });
   const recognizeExternalDefault = !configExists || cfg.recognizeExternalWebTools !== false;
 
   let mode = effectiveMode(readModeState(modeStatePath), sessionId);
@@ -79,8 +200,42 @@ async function main() {
     }
   }
 
+  let remoteEvaluation;
   let decision;
-  if (!turnState && mode === "smart" && !exempted) {
+  const syncMode = remoteGateway ? remoteGateway.syncMode !== false : false;
+  const sendContext = remoteGateway ? remoteGateway.sendContext !== false : true;
+  const shouldCallRemote = Boolean(remoteGateway && (syncMode || (mode === "smart" && !exempted)));
+
+  if (!turnState && shouldCallRemote) {
+    const sessionContext = sendContext ? extractKimiSessionContext(sessionId, kimiCodeHome) : {};
+    remoteEvaluation = await evaluateTurnRemotely(remoteGateway, {
+      sessionId,
+      promptText,
+      hasImages,
+      isSteer,
+      sessionContext,
+      ...(!syncMode && mode === "smart" ? { modeHint: "smart" } : {}),
+    });
+    if (remoteEvaluation) {
+      if (syncMode && VALID_MODES.has(remoteEvaluation.mode)) mode = remoteEvaluation.mode;
+      exempted = Boolean(remoteEvaluation.exempted);
+      if (remoteEvaluation.decision && typeof remoteEvaluation.decision === "object") {
+        decision = remoteEvaluation.decision;
+      }
+    } else if (mode === "smart" && !exempted) {
+      // Do not fall back to local direct classification in remote mode: the
+      // client typically lacks classifier credentials or hits regional blocks.
+      const failClosed = cfg.smartSearch?.failOpen === false;
+      decision = {
+        ok: false,
+        escalated: failClosed,
+        fallbackReason: "remote-gateway-error",
+        error: failClosed
+          ? "Remote gateway unavailable for Smart classification; failing closed to required web search for this turn."
+          : "Remote gateway unavailable for Smart classification; continuing in auto mode.",
+      };
+    }
+  } else if (!turnState && !remoteGateway && mode === "smart" && !exempted) {
     try {
       decision = await classifySmartTurn({ promptText, hasImages, sessionId, kimiCodeHome, config: cfg, credentials: creds });
     } catch (err) {
@@ -98,17 +253,27 @@ async function main() {
     }
   }
 
+  const effectiveRequiredEvidence = remoteEvaluation
+    ? (remoteEvaluation.requiredEvidence === "search-or-fetch" ? "search-or-fetch" : "search")
+    : (cfg.requiredEvidence === "search-or-fetch" ? "search-or-fetch" : "search");
+  const effectiveRecognizeExternal = remoteEvaluation
+    ? remoteEvaluation.recognizeExternalWebTools !== false
+    : recognizeExternalDefault;
+
   if (!turnState) {
     updateModeState(modeStatePath, (doc) => {
+      if (remoteEvaluation && syncMode) {
+        applyRemoteModeToDoc(doc, remoteEvaluation);
+      }
       mode = effectiveMode(doc, sessionId);
-      exempted = isExemptedForMode(mode);
+      exempted = remoteEvaluation ? Boolean(remoteEvaluation.exempted) : isExemptedForMode(mode);
       const smartDecision = mode === "smart" && decision
         ? { ...decision, mode: decision.escalated ? "required" : "auto", at: Date.now() }
         : undefined;
       turnState = newTurn(doc, sessionId, {
         required: !exempted && (mode === "required" || (mode === "smart" && Boolean(smartDecision?.escalated))),
-        requiredEvidence: cfg.requiredEvidence === "search-or-fetch" ? "search-or-fetch" : "search",
-        recognizeExternal: recognizeExternalDefault,
+        requiredEvidence: effectiveRequiredEvidence,
+        recognizeExternal: effectiveRecognizeExternal,
         exempted,
         smartEscalated: Boolean(smartDecision?.escalated),
         smartDecision,
@@ -118,14 +283,17 @@ async function main() {
     });
   }
 
-  const recognizeExternal = turnState.recognizeExternal ?? recognizeExternalDefault;
+  const recognizeExternal = turnState.recognizeExternal ?? effectiveRecognizeExternal;
   const searchOnly = turnState.requiredEvidence === "search";
   const turnBinding = recognizeExternal
     ? `Any search path counts. If you use this plugin's own tools, pass session_id="${sessionId}" and turn_id=${turnState.turn} (also include them in a subagent prompt when delegating); built-in WebSearch/FetchURL and other search MCP tools count without them.`
     : `Pass session_id="${sessionId}" and turn_id=${turnState.turn} to this plugin's tools (also include them in a subagent prompt when delegating).`;
+  const readyProviders = remoteEvaluation
+    ? (Array.isArray(remoteEvaluation.readyProviders) ? remoteEvaluation.readyProviders.filter((n) => typeof n === "string" && n.trim()) : [])
+    : (!remoteGateway && configExists ? routes.webProviders : []);
   const hintParts = [];
-  if (!remoteGateway && configExists && routes.webProviders.length > 0) {
-    hintParts.push(`Ready search providers (for web_search provider=...): ${routes.webProviders.join(", ")}.`);
+  if (readyProviders.length > 0) {
+    hintParts.push(`Ready search providers (for web_search provider=...): ${readyProviders.join(", ")}.`);
   }
   if (recognizeExternal) {
     hintParts.push(searchOnly

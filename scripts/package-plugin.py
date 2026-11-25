@@ -17,6 +17,7 @@ output = root / "dist" / "release" / f"kimi-code-web-search-{manifest['version']
 required = (
     "lib/host/index.js",
     "lib/host/gateway-server.js",
+    "hooks/remote-gateway.mjs",
     "hooks/usable-engines.mjs",
     "dist/client/index.html",
     "dist/client/app.js",

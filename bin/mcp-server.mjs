@@ -10,10 +10,12 @@
  *    3. `web_mode`   — View or switch Search Mode (`auto`, `smart`, `required`, `off`)
  *    4. `web_status` — List search engines that can actually run a query
  */
+import path from "node:path";
 import readline from "node:readline";
 import { ensureGatewayDaemon, probeLocalGateway } from "./gateway-daemon.mjs";
-import { positiveInteger } from "../hooks/mode-state.mjs";
+import { positiveInteger, webToolsDir, readModeState, updateModeState, effectiveMode } from "../hooks/mode-state.mjs";
 import { formatUsableEngines } from "../hooks/usable-engines.mjs";
+import { resolveRemoteGateway, syncRemoteModeToLocal } from "../hooks/remote-gateway.mjs";
 
 const VERSION = "0.4.0";
 const PROTOCOL_VERSION = "2025-06-18";
@@ -133,30 +135,12 @@ const TOOLS = [
 ];
 
 /**
- * Where this plugin's tool calls go. `KIMI_WEB_TOOLS_GATEWAY_URL` points at a
- * gateway running somewhere else (this machine or another); when it is unset
- * the plugin uses the local gateway and starts it only for retrieval.
+ * Where this plugin's tool calls go. Uses `KIMI_WEB_TOOLS_GATEWAY_URL`,
+ * `$KIMI_CODE_HOME/web-tools/remote.json`, or `kimi.plugin.json` `mcpServers.s.env`;
+ * when unset, uses the local gateway and starts it only for retrieval.
  */
 function configuredGateway() {
-  const raw = process.env.KIMI_WEB_TOOLS_GATEWAY_URL?.trim();
-  if (!raw) return undefined;
-  let url;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error("KIMI_WEB_TOOLS_GATEWAY_URL is not a valid URL");
-  }
-  if (!["http:", "https:"].includes(url.protocol)) {
-    throw new Error("KIMI_WEB_TOOLS_GATEWAY_URL must be an http(s) URL");
-  }
-  if (url.username || url.password) {
-    throw new Error("KIMI_WEB_TOOLS_GATEWAY_URL must not embed credentials");
-  }
-  if (url.search || url.hash) {
-    throw new Error("KIMI_WEB_TOOLS_GATEWAY_URL must not contain a query string or fragment");
-  }
-  const basePath = url.pathname.replace(/\/+$/, "").replace(/\/mcp$/, "");
-  return { url: `${url.origin}${basePath}`, token: process.env.KIMI_WEB_TOOLS_GATEWAY_TOKEN?.trim() || "" };
+  return resolveRemoteGateway();
 }
 
 async function callGatewayMcp(endpoint, payload, timeoutMs = 90_000) {
@@ -250,6 +234,44 @@ function formatStatusOutput(value) {
   return formatUsableEngines(value);
 }
 
+const SEARCH_MODES = ["auto", "smart", "required", "off"];
+
+function runLocalWebMode(targetSession, action, requestedMode) {
+  const sid = typeof targetSession === "string" && targetSession.trim() ? targetSession.trim() : "global";
+  const modeStatePath = path.join(webToolsDir(), "mode-state.json");
+  let mode;
+  let globalMode;
+  if (action === "set" || action === "toggle") {
+    const doc = updateModeState(modeStatePath, (state) => {
+      const current = effectiveMode(state, sid);
+      const next = action === "toggle"
+        ? SEARCH_MODES[(SEARCH_MODES.indexOf(current) + 1) % SEARCH_MODES.length]
+        : requestedMode;
+      if (!SEARCH_MODES.includes(next)) {
+        throw new Error("mode must be auto, smart, required, or off");
+      }
+      if (sid === "global" || sid === "default") {
+        state.globalMode = next;
+      } else {
+        const entry = Object.hasOwn(state.sessions, sid) ? state.sessions[sid] : {};
+        Object.defineProperty(state.sessions, sid, {
+          value: { ...entry, mode: next, updatedAt: Date.now() },
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+    });
+    mode = effectiveMode(doc, sid);
+    globalMode = doc.globalMode;
+  } else {
+    const doc = readModeState(modeStatePath);
+    mode = effectiveMode(doc, sid);
+    globalMode = doc.globalMode;
+  }
+  return { sessionId: sid, mode, globalMode, available: true };
+}
+
 async function runTool(params) {
   const name = params?.name;
   const args = params?.arguments ?? {};
@@ -276,12 +298,20 @@ async function runTool(params) {
     if (name === "web_mode") {
       const targetSession = args.session_id ?? args.sessionId ?? "global";
       const action = args.action ?? (args.mode ? "set" : "get");
+      const configured = configuredGateway();
+      if (configured && configured.syncMode === false) {
+        const localResult = runLocalWebMode(targetSession, action, args.mode);
+        return { content: [{ type: "text", text: formatModeOutput(localResult) }] };
+      }
       const result = await callGatewayMcp("mode", {
         sessionId: targetSession,
         action,
         mode: args.mode,
         updateGlobal: targetSession === "global",
       });
+      if (configured) {
+        syncRemoteModeToLocal(result);
+      }
       return { content: [{ type: "text", text: formatModeOutput(result) }] };
     }
 

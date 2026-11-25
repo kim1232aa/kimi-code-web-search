@@ -87,6 +87,7 @@ export interface SmartClassifierInput {
   promptText: string;
   hasImages?: boolean;
   sessionId?: string;
+  sessionContext?: KimiSessionContext;
   kimiCodeHome?: string;
   config?: { smartSearch?: Partial<SmartSearchConfig> };
   credentials?: SmartCredentials;

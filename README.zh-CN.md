@@ -181,7 +181,22 @@ node ./bin/import-pi.mjs --pi-dir /path/to/pi/agent
 
 ### stdio 桥接远程网关
 
-保留 `web` 插件及其 `s` 服务，不要在 `mcp.json` 再加一套重复的搜索工具。把 `KIMI_WEB_TOOLS_GATEWAY_URL` 设成**网关地址，不带 `/mcp`**，并让 Kimi 进程读到 `KIMI_WEB_TOOLS_GATEWAY_TOKEN`。然后重新启动 Kimi 并新开会话。以下只演示 URL，token 按上一步单独配置；只有地址不能通过认证。
+保留 `web` 插件及其 `s` 服务，不要在 `mcp.json` 再加一套重复的搜索工具。支持以下两种方式同时把 stdio 桥接和客户端钩子指向远程网关：
+
+1. **客户端配置文件（推荐给 Windows / macOS 桌面端，插件重装或升级不会丢失）：** 创建 `$KIMI_CODE_HOME/web-tools/remote.json`（默认 `~/.kimi-code/web-tools/remote.json` 或 `%USERPROFILE%\.kimi-code\web-tools\remote.json`），权限建议 `0600`：
+
+```json
+{
+  "url": "https://search.example.com",
+  "token": "你的网关访问令牌"
+}
+```
+
+`remote.json` 支持两个可选客户端隔离项：
+- `"syncMode": false` — 搜索模式（`auto`/`smart`/`required`/`off`）仅由本机独立管理，不跟远端 `globalMode` 互相覆盖（多人共用网关推荐开启）。
+- `"sendContext": false` — 调用远端 Smart（Jev）分类时不附带本机 `wire.jsonl` 短追问上下文，保护隐私。
+
+2. **环境变量：** 把 `KIMI_WEB_TOOLS_GATEWAY_URL`（网关地址，不带 `/mcp`）和 `KIMI_WEB_TOOLS_GATEWAY_TOKEN` 设到启动 Kimi 的进程环境中（环境变量优先于 `remote.json`；显式设 `KIMI_WEB_TOOLS_GATEWAY_URL=""` 可强制回退本地模式）：
 
 ```bash
 export KIMI_WEB_TOOLS_GATEWAY_URL="https://search.example.com"
@@ -193,12 +208,22 @@ $env:KIMI_WEB_TOOLS_GATEWAY_URL = 'https://search.example.com'
 kimi
 ```
 
-`/mcp` 里仍然是自带的 `plugin-web_s`，再实际搜一次。桥接走的是 `/web-tools/mcp/*`，不是公开的 `/mcp`，反代也要转发这些路由。已经配置远程地址时，远程调用失败**不会**回退到本机启动；stdio 进程没读到地址时才走本地：搜索或读取可以按需启动网关，模式和状态查询只检查已运行的网关。从桌面单独启动的应用不会拿到某个 PowerShell 窗口里临时设置的变量。
+重启 Kimi 并新开会话，`/mcp` 中应显示自带的 `plugin-web_s`。桥接与钩子走 `/web-tools/mcp/*`，反代需放行该路径（若同时开放仪表盘，请分配独立域名根路径如 `https://search.example.com`）。已配置远程地址时，远程请求失败**不会**回退到本机启动网关。
 
-### 远程模式的限制
+### 多人共享网关（最小权限访客令牌）
 
-- **HTTP 直连是接入工具，不是安装插件。** 不会自动安装 Skill、斜杠命令或钩子。保留并启用插件时，如果打开了 `recognizeExternalWebTools` 且收到回执，`web-remote` 的搜索可以作为外部搜索计入本轮；插件自带的 `off` 拦截不会阻止这条独立 MCP 连接。
-- **两种远程接法都不共享客户端轮次状态。** 客户端侧的轮次跟踪和钩子读写客户端本地的 `mode-state.json`，而远程桥接返回的模式和状态反映的是网关侧，不是客户端策略。不要把跨主机 Jev、必搜或关闭模式当成同机部署的等价替代。搜索源 key 留在网关。
+**不要把管理员密码（`KIMI_WEB_TOOLS_PASSWORD` / `public-password`）直接发给他人**：管理员密码拥有仪表盘与全部 `/web-tools/api/*` 权限（可改搜索源地址、凭据与全局模式）。
+
+在网关主机上通过环境变量 `KIMI_WEB_TOOLS_CLIENT_TOKEN`（逗号分隔）或文件 `$KIMI_CODE_HOME/web-tools/client-token`（每行一个 token，建议 `0600`）签发**访客客户端令牌**，该令牌：
+- **允许**：`web_search`、`web_fetch`、`web_status`（仅返回可用引擎名）、`evaluate-turn`（Smart 分类），以及读写自己会话的 `session_id` 模式。
+- **禁止**：访问任何 `/web-tools/api/*`、登录仪表盘、修改 `globalMode`，以及查看其他用户的会话列表或历史决策。
+
+共享网关建议在反代层（Nginx/Caddy/Cloudflare）配置频控，并让访客在各自 `remote.json` 中加上 `"syncMode": false` 与 `"sendContext": false`。
+
+### 远程模式与 Smart（Jev 判定）同步
+
+- **stdio 桥接 / `remote.json`：** 每轮用户发言时，`UserPromptSubmit` 会向远程网关调用一次 `POST /web-tools/mcp/evaluate-turn`，自动把远程网关的搜索模式（`auto`/`smart`/`required`/`off`）、`requiredEvidence`、`recognizeExternalWebTools`、`exemptWhenNoProvider` 与可用搜索源同步到客户端本地 `mode-state.json`。当处于 `smart` 模式时，Jev / Smart 分类器直接在**远程网关侧**使用网关配置、密钥和网络执行（避免客户端直连受地区限制返回 HTTP 451，同时保留客户端短追问上下文）。调用 `web_mode` / `/web:mode` 也会立即把最新模式镜像到本地。
+- **HTTP MCP 直连（`web-remote`）：** 只接入工具，不会自动安装 Skill、斜杠命令或钩子。如果同时启用了插件但未配置 `remote.json` / `KIMI_WEB_TOOLS_GATEWAY_URL`，`web-remote` 在开启 `recognizeExternalWebTools` 时可作为外部搜索计入本轮，而插件自带的 `off` 拦截不会阻止这条独立 MCP 连接。
 
 ### MCP 排错
 
