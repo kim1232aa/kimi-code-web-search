@@ -1186,7 +1186,7 @@ export async function startGatewayServer(options: GatewayServerOptions = {}): Pr
           // owner's dashboard session selector.
           const sessions = authRole === "admin"
             ? Object.entries(doc.sessions)
-                .filter(([id, rec]) => !id.startsWith("client:") && typeof rec.mode === "string")
+                .filter(([id, rec]) => !/^client:[0-9a-f]{12}:/.test(id) && typeof rec.mode === "string")
                 .map(([id, rec]) => ({
                   id,
                   mode: rec.mode ?? doc.globalMode,

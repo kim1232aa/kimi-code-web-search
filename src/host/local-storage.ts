@@ -335,15 +335,19 @@ export class LocalStorage {
     const cutoff = now - 30 * 24 * 60 * 60 * 1000;
     const MAX_CLIENT_SESSIONS = 200;
     updateModeState(this.modeStatePath, (doc) => {
+      // 30-day TTL cleanup is global: it only removes expired junk. The
+      // count-based LRU must be per-token, or one guest could flood entries
+      // and silently evict another guest's (or an owner's client:-prefixed)
+      // session modes.
+      const ownPrefix = `client:${clientTokenId}:`;
       const clientEntries: Array<[string, number]> = [];
       for (const [k, entry] of Object.entries(doc.sessions)) {
-        if (!k.startsWith("client:") || k === key) continue;
         const at = Number(entry?.updatedAt ?? 0);
         if (!Number.isFinite(at) || at < cutoff) {
-          delete doc.sessions[k];
-        } else {
-          clientEntries.push([k, at]);
+          if (k.startsWith("client:")) delete doc.sessions[k];
+          continue;
         }
+        if (k.startsWith(ownPrefix) && k !== key) clientEntries.push([k, at]);
       }
       if (clientEntries.length >= MAX_CLIENT_SESSIONS) {
         clientEntries.sort((a, b) => a[1] - b[1]);

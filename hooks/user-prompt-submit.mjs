@@ -215,7 +215,9 @@ async function main() {
 
   if (!turnState && shouldCallRemote) {
     let sessionContext = {};
-    if (sendContext && (syncMode || mode === "smart")) {
+    // The classifier never runs on an empty, imageless prompt — never read
+    // or transmit transcript context for one.
+    if (sendContext && (promptText.trim() || hasImages) && (syncMode || mode === "smart")) {
       const extracted = extractKimiSessionContext(sessionId, kimiCodeHome);
       if (promptText.trim().length > 24 && extracted && Object.hasOwn(extracted, "prevUserText")) {
         const { prevUserText: _omitted, ...rest } = extracted;

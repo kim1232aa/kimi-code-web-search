@@ -394,14 +394,25 @@ test("client mode namespaces, off ceiling, bounded state, and MCP parity", async
     const invalid = await post(`${handle.url}/web-tools/mcp/mode`, { mode: "required", sessionId: invalidSession }, guest);
     assert.equal(invalid.status, 400);
   }
+  // Per-token LRU: one guest flooding 201 entries must not evict another
+  // guest's modes, and the owner "client:ops" session is not a client key.
+  const beforeFlood = await post(`${handle.url}/web-tools/mcp/mode`, { mode: "required", sessionId: "victim-session" }, other);
+  assert.equal(beforeFlood.status, 200);
+  handle.storage.setSessionMode("client:ops", "required");
   for (let index = 0; index < 201; index += 1) {
     handle.storage.setClientSessionMode("load-test", `session-${index}`, "required");
   }
-  const clientKeys = Object.keys(handle.storage.readModeState().sessions).filter((key) => key.startsWith("client:"));
-  assert.ok(clientKeys.length <= 200, "client overrides must be LRU-bounded");
+  const docAfterFlood = handle.storage.readModeState();
+  const floodTokenKeys = Object.keys(docAfterFlood.sessions).filter((key) => key.startsWith("client:load-test:"));
+  assert.ok(floodTokenKeys.length <= 200, "per-token client overrides must be LRU-bounded");
+  assert.ok(Object.keys(docAfterFlood.sessions).some((key) => key.includes(":victim-session")), "flood from one guest must not evict another guest's sessions");
+  assert.equal(docAfterFlood.sessions["client:ops"]?.mode, "required", "owner client:-prefixed session is not evictable client state");
+  const victimRead = await post(`${handle.url}/web-tools/mcp/mode`, { sessionId: "victim-session" }, other);
+  assert.equal(((await victimRead.json()) as { value: { mode: string } }).value.mode, "required");
   const adminModes = await post(`${handle.url}/web-tools/mcp/mode`, {}, { authorization: `Bearer ${PASSWORD}` });
   const adminModesJson = (await adminModes.json()) as { value: { sessions: Array<{ id: string }> } };
-  assert.equal(adminModesJson.value.sessions.some((entry) => entry.id.startsWith("client:")), false);
+  assert.equal(adminModesJson.value.sessions.some((entry) => /^client:[0-9a-f]{12}:/.test(entry.id)), false, "dashboard hides real client keys");
+  assert.ok(adminModesJson.value.sessions.some((entry) => entry.id === "client:ops"), "owner client:-prefixed session stays visible");
 
   handle.storage.setSessionMode("global", "off");
   const guestSearchOff = await post(`${handle.url}/web-tools/mcp/search`, { query: "test", sessionId: "guest-session" }, guest);

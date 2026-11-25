@@ -1852,3 +1852,30 @@ test("smart classifier state bounds recent tool context", () => {
   assert.ok(state.recent_tools.every((tool) => tool.length <= 120));
   assert.ok(state.recent_tools.every((tool) => tool.trim().length > 0));
 });
+
+
+test("empty prompts never send transcript context to the remote gateway", async (t) => {
+  const requests: CapturedRequest[] = [];
+  const remote = http.createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    requests.push({ url: req.url ?? "", headers: req.headers, body: JSON.parse(raw || "{}") as Record<string, unknown> });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, value: {
+      mode: "smart", globalMode: "smart", exempted: false, readyProviders: ["exa"],
+      requiredEvidence: "search", recognizeExternalWebTools: true,
+      decision: { ok: true, escalated: false },
+    } }));
+  });
+  await new Promise<void>((resolve) => remote.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve) => remote.close(() => resolve())));
+  const port = (remote.address() as { port: number }).port;
+  const home = temporaryHome(t);
+  writeWire(home, "empty-prompt-session");
+  const res = await runHook(home, "user-prompt-submit.mjs", {
+    session_id: "empty-prompt-session", prompt: "   ",
+  }, { KIMI_WEB_TOOLS_GATEWAY_URL: `http://127.0.0.1:${port}` });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(requests.length, 1, "syncMode still evaluates the turn remotely");
+  assert.deepEqual(requests[0].body.sessionContext, {}, "empty prompt must not read or send transcript context");
+});
